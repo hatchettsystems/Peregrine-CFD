@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/project", "crates/geom", "crates/voxel", "crates/solver", "crates/post", "crates/cli", "crates/app"]
+members = ["crates/core", "crates/project", "crates/geom", "crates/voxel", "crates/solver", "crates/post", "crates/cli", "crates/app", "crates/occt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,7 @@ peregrine-geom = { path = "crates/geom" }
 peregrine-voxel = { path = "crates/voxel" }
 peregrine-solver = { path = "crates/solver" }
 peregrine-post = { path = "crates/post" }
+peregrine-occt = { path = "crates/occt" }
 
 [profile.dev]
 opt-level = 1

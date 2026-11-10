@@ -8,4 +8,5 @@ license.workspace = true
 peregrine-core.workspace = true
 peregrine-project.workspace = true
 peregrine-voxel.workspace = true
+peregrine-occt.workspace = true
 anyhow.workspace = true

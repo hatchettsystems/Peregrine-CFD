@@ -1,0 +1,10 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libocct-data-exchange-dev libocct-modeling-algorithms-dev libocct-ocaf-dev mesa-vulkan-drivers
+      - run: cargo test --release --workspace

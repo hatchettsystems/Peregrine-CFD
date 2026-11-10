@@ -1,0 +1,13 @@
+[package]
+name = "peregrine-occt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+peregrine-core.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"

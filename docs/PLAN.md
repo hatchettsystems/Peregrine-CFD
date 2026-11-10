@@ -12,8 +12,8 @@ lattice-Boltzmann solver and inspect velocity and pressure. Heat transfer is out
 | Physics | Incompressible, isothermal air. Velocity and pressure only. |
 | Target | Windows, RTX 3070 (8 GB). wgpu compute (DX12/Vulkan), shaders in WGSL. |
 | Solver | D3Q19 LBM, BGK + Smagorinsky LES, half-way bounce-back walls, equilibrium velocity/pressure ports. |
-| CAD | OpenCASCADE for STEP. A small C++/cxx shim (`crates/occt`, planned) reads names + per-solid meshes. STL is accepted as a fallback. |
-| UI | egui/eframe on wgpu (milestone 6). A CLI drives the same project file. |
+| CAD | OpenCASCADE for STEP via a small C++ shim (`crates/occt`) that reads names, transforms and per-body meshes. STL is accepted too. |
+| UI | egui/eframe, Photoshop-style dark theme. A CLI drives the same project file. |
 | Language | Rust. C++ only for the OCCT shim, WGSL for GPU kernels. |
 
 ## UI look and layout (Adobe / Photoshop style)
@@ -46,17 +46,19 @@ STEP -> bodies (name, mesh) -> role by name rules -> planar-face hole detection 
 ## Milestones
 
 1. [x] Workspace, project file, mesh core, port detection, voxelizer, CPU LBM, VTK, CLI, tests.
-2. [ ] STEP import through OCCT shim: assembly tree, names, units, per-solid meshes.
-3. [ ] wgpu LBM backend (D3Q19, single-buffer AA pattern, ~8 GB budget -> ~25M cells), parity-tested against CPU.
-4. [ ] egui app (Photoshop-style theme, see above): 3D viewport, body tree + role overrides, port picking, BC panel, live run view.
-5. [ ] Results: slice planes, streamlines, per-port report, screenshots.
-6. [ ] Local grid refinement near nozzle, Bouzidi walls, validation against OpenFOAM.
+2. [x] STEP import through an OpenCASCADE C++ shim (`crates/occt`): assembly tree, names, transforms, per-body meshes.
+3. [x] wgpu D3Q19 backend, parity-tested against the CPU solver (also runs on software Vulkan).
+4. [x] egui app with Photoshop-style theme: viewport, bodies/ports/results panels, live run, slice view.
+5. [ ] Streamlines, probes, screenshot export, per-port flow history plot.
+6. [ ] Accuracy: non-equilibrium-extrapolation inlets, Bouzidi walls, cumulant/regularized collision, local refinement; validate against OpenFOAM or measurement.
+7. [ ] Performance: AA-pattern single-buffer streaming, f16 storage, multi-buffer grids beyond the per-buffer limit.
 
-## Status (end of first session)
+## Status
 
-Working and tested on the CPU: mesh core, planar-hole port detection, project file, parity voxelizer with
+Working and tested: mesh core, planar-hole port detection, project file, parity voxelizer with
 port caps, D3Q19 solver (validated against laminar square-duct pressure drop, mass flux conserved),
-VTK export, and a CLI (`demo`, `ports`, `set-port`, `run`). Input today is STL; STEP waits on the OCCT shim.
+VTK export, a CLI, the GPU backend, STEP import and the GUI. STEP import needs OpenCASCADE at build time (docs/BUILD.md);
+without it STL still works. The GUI was exercised under Xvfb with software rendering only; it has not been run on Windows or on the RTX 3070.
 
 Known accuracy limit: at 0.5 mm cells and 8-12 m/s the physical viscosity gives tau ~ 0.5004, which BGK cannot
 run stably. The solver raises tau to 0.55 (extra viscosity) and says so; flow patterns are usable, absolute

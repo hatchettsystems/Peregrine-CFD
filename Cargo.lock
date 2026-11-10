@@ -2394,8 +2394,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "peregrine-core",
+ "peregrine-occt",
  "peregrine-project",
  "peregrine-voxel",
+]
+
+[[package]]
+name = "peregrine-occt"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "peregrine-core",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -12,14 +12,22 @@ pub struct Body {
     pub mesh: TriMesh,
 }
 
+/// CAD exporters append instance counters such as `duct:1`; drop them so name rules match.
+fn clean_name(n: &str) -> String {
+    match n.rsplit_once(':') {
+        Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
+        _ => n.to_string(),
+    }
+}
+
 /// Load bodies. A `.stl` file is one body named after the file; a directory loads every `.stl` in it.
-/// STEP import (`.step`/`.stp`) needs the OCCT backend and is not built yet.
+/// STEP files (`.step`/`.stp`) are read through OpenCASCADE: every leaf body of the assembly is returned.
 pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
     let mut files = vec![];
     if path.is_dir() {
         for e in std::fs::read_dir(path)? {
             let p = e?.path();
-            if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("stl")) {
+            if p.extension().map_or(false, |x| ["stl", "step", "stp"].iter().any(|e| x.eq_ignore_ascii_case(e))) {
                 files.push(p);
             }
         }
@@ -37,7 +45,14 @@ pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
                 let role = project.geometry.classify(&name);
                 bodies.push(Body { name, role, mesh });
             }
-            "step" | "stp" => bail!("STEP import is not available in this build yet (OCCT backend is milestone 2). Export bodies as STL for now."),
+            "step" | "stp" => {
+                let defl = (project.solver.cell_size_mm * 0.2).clamp(0.01, 0.1);
+                for b in peregrine_occt::read_step(&f, defl).with_context(|| format!("reading {}", f.display()))? {
+                    let name = clean_name(&b.name);
+                    let role = project.geometry.classify(&name);
+                    bodies.push(Body { name, role, mesh: b.mesh });
+                }
+            }
             _ => bail!("unsupported geometry file: {}", f.display()),
         }
     }
@@ -81,4 +96,28 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
         }
     }
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn step_names_are_cleaned_and_classified() {
+        assert_eq!(clean_name("duct:1"), "duct");
+        assert_eq!(clean_name("duct_L:12"), "duct_L");
+        assert_eq!(clean_name("a:b"), "a:b");
+        let p = Project::new("t");
+        assert_eq!(p.geometry.classify(&clean_name("duct_R:2")), BodyRole::Duct);
+    }
+
+    #[test]
+    fn loads_step_assembly() {
+        if !peregrine_occt::AVAILABLE { return; }
+        let f = std::env::temp_dir().join("peregrine_geom_test.step");
+        peregrine_occt::write_demo_step(&f).unwrap();
+        let bodies = load_bodies(&f, &Project::new("t")).unwrap();
+        let duct = bodies.iter().find(|b| b.name == "duct").unwrap();
+        assert_eq!(duct.role, BodyRole::Duct);
+        assert_eq!(duct_port_candidates(&bodies, 1.0).len(), 2);
+    }
 }
