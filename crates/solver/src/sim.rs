@@ -1,4 +1,4 @@
-use crate::lbm::{Lbm, LbmConfig, PortBc, PortInfo};
+use crate::lbm::{port_cell_list, Engine, Lbm, LbmConfig, PortBc, PortInfo};
 use crate::units::Units;
 use peregrine_project::{FaceBc, PortKind, Project};
 use peregrine_voxel::Domain;
@@ -14,16 +14,28 @@ pub struct PortReport {
     pub cells: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Cpu,
+    Gpu,
+    /// GPU if one is available, otherwise CPU.
+    Auto,
+}
+
 const RAMP_STEPS: usize = 1500;
+const CHUNK: usize = 25;
 
 pub struct Simulation {
-    pub lbm: Lbm,
+    engine: Box<dyn Engine>,
     pub units: Units,
+    pub dims: [usize; 3],
+    cells: Vec<u8>,
+    ports: Vec<PortInfo>,
+    port_cells: Vec<(usize, usize, usize)>,
     project_ports: Vec<(String, PortKind, f64)>, // name, kind, cap area m^2
     port_dir: Vec<[f64; 3]>,
-    /// Fixed inlet velocity vectors (lattice) that are ramped in over `RAMP_STEPS`.
+    /// Fixed inlet velocity vectors (lattice) ramped in over `RAMP_STEPS`.
     ramp_base: Vec<Option<[f32; 3]>>,
-    pub domain_dims: [usize; 3],
 }
 
 fn snap(v: [f64; 3]) -> [i32; 3] {
@@ -46,10 +58,15 @@ fn curve_at(curve: &[(f64, f64)], q: f64) -> f64 {
     curve[curve.len() - 1].1
 }
 
+fn dir_vel(d: [f64; 3], speed_lat: f64) -> [f32; 3] {
+    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12);
+    [(d[0] / l * speed_lat) as f32, (d[1] / l * speed_lat) as f32, (d[2] / l * speed_lat) as f32]
+}
+
 impl Simulation {
-    pub fn new(project: &Project, domain: &Domain) -> anyhow::Result<Simulation> {
+    pub fn new(project: &Project, domain: &Domain, backend: Backend) -> anyhow::Result<Simulation> {
         let g = &domain.grid;
-        let units = Units::new(g.dx * 1e-3, project.solver.reference_speed, 0.05, project.fluid.density, project.fluid.kinematic_viscosity);
+        let units = Units::new(g.dx * 1e-3, project.solver.reference_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity);
         let mut infos = vec![];
         let mut meta = vec![];
         let mut dirs = vec![];
@@ -63,7 +80,6 @@ impl Simulation {
                     PortBc::Velocity(dir_vel(inward_f, units.vel_to_lat(u)))
                 }
                 PortKind::FanInlet { curve } => {
-                    // start from the free-delivery end of the curve, the controller adjusts it
                     let q0 = curve.last().map_or(1.0, |c| c.0) * 0.5;
                     let u = q0 / 60000.0 / area;
                     PortBc::Velocity(dir_vel(inward_f, units.vel_to_lat(u)))
@@ -74,53 +90,89 @@ impl Simulation {
             meta.push((p.name.clone(), p.kind.clone(), area));
             dirs.push(inward_f);
         }
-        let open_faces = project.domain.faces.map(|f| f == FaceBc::Open);
         let cfg = LbmConfig {
             dims: g.dims,
             cells: domain.cells.clone(),
             tau0: units.tau_used() as f32,
             smagorinsky: project.solver.smagorinsky as f32,
-            open_faces,
+            open_faces: project.domain.faces.map(|f| f == FaceBc::Open),
             body_force: [0.0; 3],
-            ports: infos,
+            ports: infos.clone(),
         };
-        let ramp_base = cfg.ports.iter().zip(&meta).map(|(p, m)| match (p.bc, &m.1) {
+        let ramp_base = infos.iter().zip(&meta).map(|(p, m)| match (p.bc, &m.1) {
             (PortBc::Velocity(u), PortKind::VelocityInlet { .. } | PortKind::FlowInlet { .. }) => Some(u),
             _ => None,
         }).collect();
-        let mut sim = Simulation { lbm: Lbm::new(cfg), units, project_ports: meta, port_dir: dirs, ramp_base, domain_dims: g.dims };
+        let port_cells = port_cell_list(&cfg);
+        let engine: Box<dyn Engine> = match backend {
+            Backend::Cpu => Box::new(Lbm::new(cfg)),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu => Box::new(crate::gpu::GpuLbm::new(&cfg)?),
+            #[cfg(feature = "gpu")]
+            Backend::Auto => match crate::gpu::GpuLbm::new(&cfg) {
+                Ok(g) => Box::new(g),
+                Err(_) => Box::new(Lbm::new(cfg.clone())),
+            },
+            #[cfg(not(feature = "gpu"))]
+            Backend::Gpu => anyhow::bail!("built without the gpu feature"),
+            #[cfg(not(feature = "gpu"))]
+            Backend::Auto => Box::new(Lbm::new(cfg)),
+        };
+        let mut sim = Simulation { engine, units, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base };
         sim.apply_ramp();
         Ok(sim)
     }
 
+    pub fn engine_name(&self) -> String { self.engine.name() }
+    pub fn steps(&self) -> usize { self.engine.steps() }
+    pub fn cells(&self) -> &[u8] { &self.cells }
+    pub fn mac(&mut self) -> &[[f32; 4]] { self.engine.mac() }
+
     fn apply_ramp(&mut self) {
-        let t = (self.lbm.step_count as f32 / RAMP_STEPS as f32).min(1.0);
+        let t = (self.engine.steps() as f32 / RAMP_STEPS as f32).min(1.0);
         let f = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
         for k in 0..self.ramp_base.len() {
             if let Some(u) = self.ramp_base[k] {
-                self.lbm.set_port_bc(k, PortBc::Velocity([u[0] * f, u[1] * f, u[2] * f]));
+                self.engine.set_port_bc(k, PortBc::Velocity([u[0] * f, u[1] * f, u[2] * f]));
             }
         }
     }
 
-    /// Advance `n` steps, updating fan-curve ports every 100 steps.
+    /// Advance `n` steps (inlet ramp and fan-curve control are applied between chunks of 25).
     pub fn advance(&mut self, n: usize) {
-        for s in 0..n {
-            if self.lbm.step_count % 25 == 0 && self.lbm.step_count <= RAMP_STEPS {
+        let mut left = n;
+        while left > 0 {
+            let c = CHUNK.min(left);
+            if self.engine.steps() <= RAMP_STEPS {
                 self.apply_ramp();
             }
-            self.lbm.step();
-            if self.lbm.step_count % 100 == 0 && s + 1 < n + 1 {
+            if self.engine.steps() % 100 == 0 && self.engine.steps() > 0 {
                 self.update_fans();
             }
+            self.engine.step_n(c);
+            left -= c;
         }
+    }
+
+    fn port_stats(&mut self, k: usize) -> (f32, f32, usize) {
+        let inw = self.ports[k].inward;
+        let list: Vec<usize> = self.port_cells.iter().filter(|c| c.1 == k).map(|c| c.2).collect();
+        let mac = self.engine.mac();
+        let (mut r, mut u) = (0.0, 0.0);
+        for &nb in &list {
+            let m = mac[nb];
+            r += m[0];
+            u += m[1] * inw[0] as f32 + m[2] * inw[1] as f32 + m[3] * inw[2] as f32;
+        }
+        let d = list.len().max(1) as f32;
+        (r / d, u / d, list.len())
     }
 
     fn update_fans(&mut self) {
         for k in 0..self.project_ports.len() {
             if let PortKind::FanInlet { curve } = self.project_ports[k].1.clone() {
                 let area = self.project_ports[k].2;
-                let (rho, u_in, _) = self.lbm.port_stats(k);
+                let (rho, u_in, _) = self.port_stats(k);
                 let u_phys = self.units.vel_to_phys(u_in as f64);
                 let q = u_phys * area * 60000.0;
                 let p_in = self.units.pressure(rho as f64);
@@ -129,15 +181,25 @@ impl Simulation {
                 let factor = 1.0 + 0.1 * ((target - p_in) / scale).clamp(-1.0, 1.0);
                 let new_u = (u_phys * factor).max(1e-3);
                 let d = self.port_dir[k];
-                self.lbm.set_port_bc(k, PortBc::Velocity(dir_vel(d, self.units.vel_to_lat(new_u))));
+                self.engine.set_port_bc(k, PortBc::Velocity(dir_vel(d, self.units.vel_to_lat(new_u))));
             }
         }
     }
 
-    pub fn report(&self) -> Vec<PortReport> {
+    pub fn max_speed(&mut self) -> f32 {
+        let cells = &self.cells;
+        let mac = self.engine.mac();
+        mac.iter().zip(cells).filter(|(_, &c)| c == 0).map(|(m, _)| (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt()).fold(0.0, f32::max)
+    }
+
+    pub fn is_finite(&mut self) -> bool {
+        self.engine.mac().iter().all(|m| m[0].is_finite() && m[1].is_finite())
+    }
+
+    pub fn report(&mut self) -> Vec<PortReport> {
         (0..self.project_ports.len())
             .map(|k| {
-                let (rho, u_in, n) = self.lbm.port_stats(k);
+                let (rho, u_in, n) = self.port_stats(k);
                 let dx2 = self.units.dx * self.units.dx;
                 let flow = self.units.vel_to_phys(u_in as f64) * n as f64 * dx2 * 60000.0;
                 PortReport {
@@ -150,9 +212,4 @@ impl Simulation {
             })
             .collect()
     }
-}
-
-fn dir_vel(d: [f64; 3], speed_lat: f64) -> [f32; 3] {
-    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12);
-    [(d[0] / l * speed_lat) as f32, (d[1] / l * speed_lat) as f32, (d[2] / l * speed_lat) as f32]
 }

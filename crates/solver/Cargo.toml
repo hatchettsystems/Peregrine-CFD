@@ -10,3 +10,10 @@ peregrine-project.workspace = true
 peregrine-voxel.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

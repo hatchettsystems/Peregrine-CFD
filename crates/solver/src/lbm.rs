@@ -46,6 +46,36 @@ pub struct PortInfo {
     pub inward: [i32; 3],
 }
 
+/// Common interface of the CPU and GPU solvers.
+pub trait Engine {
+    fn step_n(&mut self, n: usize);
+    fn set_port_bc(&mut self, k: usize, bc: PortBc);
+    /// rho, ux, uy, uz per cell (lattice units). The GPU engine reads back on demand.
+    fn mac(&mut self) -> &[[f32; 4]];
+    fn steps(&self) -> usize;
+    fn name(&self) -> String;
+}
+
+/// (cell index, port k, inward-neighbour index) for every port cell.
+pub fn port_cell_list(cfg: &LbmConfig) -> Vec<(usize, usize, usize)> {
+    let [nx, ny, _] = cfg.dims;
+    let mut out = vec![];
+    for idx in 0..cfg.cells.len() {
+        let code = cfg.cells[idx];
+        if code >= 2 {
+            let k = (code - 2) as usize;
+            let (x, y, z) = ((idx % nx) as i32, ((idx / nx) % ny) as i32, (idx / (nx * ny)) as i32);
+            let inw = cfg.ports[k].inward;
+            let (xx, yy, zz) = (x + inw[0], y + inw[1], z + inw[2]);
+            let ok = xx >= 0 && yy >= 0 && zz >= 0 && (xx as usize) < cfg.dims[0] && (yy as usize) < cfg.dims[1] && (zz as usize) < cfg.dims[2];
+            let nb = if ok { xx as usize + nx * (yy as usize + ny * zz as usize) } else { idx };
+            out.push((idx, k, nb));
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
 pub struct LbmConfig {
     pub dims: [usize; 3],
     /// 0 = fluid, 1 = solid, 2+k = port k.
@@ -82,20 +112,7 @@ impl Lbm {
             }
         }
         let mac = vec![[1.0, 0.0, 0.0, 0.0]; n];
-        let [nx, ny, _] = cfg.dims;
-        let mut port_cells = vec![];
-        for idx in 0..n {
-            let code = cfg.cells[idx];
-            if code >= 2 {
-                let k = (code - 2) as usize;
-                let (x, y, z) = ((idx % nx) as i32, ((idx / nx) % ny) as i32, (idx / (nx * ny)) as i32);
-                let inw = cfg.ports[k].inward;
-                let (xx, yy, zz) = (x + inw[0], y + inw[1], z + inw[2]);
-                let ok = xx >= 0 && yy >= 0 && zz >= 0 && (xx as usize) < cfg.dims[0] && (yy as usize) < cfg.dims[1] && (zz as usize) < cfg.dims[2];
-                let nb = if ok { xx as usize + nx * (yy as usize + ny * zz as usize) } else { idx };
-                port_cells.push((idx, k, nb));
-            }
-        }
+        let port_cells = port_cell_list(&cfg);
         Lbm { fnew: f.clone(), f, mac_new: mac.clone(), mac, cfg, port_cells, step_count: 0 }
     }
 
@@ -107,7 +124,6 @@ impl Lbm {
         let [nx, ny, nz] = self.cfg.dims;
         let cells = &self.cfg.cells;
         let f = &self.f;
-        let mac_old = &self.mac;
         let tau0 = self.cfg.tau0;
         let cs = self.cfg.smagorinsky;
         let force = self.cfg.body_force;
@@ -128,8 +144,13 @@ impl Lbm {
                 fi[i] = match face {
                     Some(fc) => {
                         if open[fc] {
-                            let m = mac_old[idx];
-                            feq(i, 1.0, [m[1], m[2], m[3]])
+                            // zero-gradient: copy the population of the neighbour one cell inside
+                            let mut inner = [x, y, z];
+                            let ax = fc / 2;
+                            inner[ax] += if fc % 2 == 0 { 1 } else { -1 };
+                            let ok = inner[ax] >= 0 && inner[ax] < [nx, ny, nz][ax] as i32;
+                            let j = if ok { inner[0] as usize + nx * (inner[1] as usize + ny * inner[2] as usize) } else { idx };
+                            if cells[j] == 0 { f[j * Q + i] } else { f[idx * Q + opp(i)] }
                         } else {
                             f[idx * Q + opp(i)]
                         }
@@ -179,8 +200,22 @@ impl Lbm {
                     uphys[a] += 0.5 * force[a] * inv;
                 }
             }
+            // Two-relaxation-time collision (magic parameter 3/16): odd moments relax with a rate
+            // chosen so walls stay accurate and tau can approach 0.5 without blowing up.
+            let tau_m = 0.5 + 0.1875 / (tau - 0.5);
+            let omega_m = 1.0 / tau_m;
+            let mut fe = [0f32; Q];
             for i in 0..Q {
-                out[i] = fi[i] - omega * (fi[i] - feq(i, rho, ueq));
+                fe[i] = feq(i, rho, ueq);
+            }
+            out[0] = fi[0] - omega * (fi[0] - fe[0]);
+            for i in 1..Q {
+                let o = opp(i);
+                let fp = 0.5 * (fi[i] + fi[o]);
+                let fm = 0.5 * (fi[i] - fi[o]);
+                let ep = 0.5 * (fe[i] + fe[o]);
+                let em = 0.5 * (fe[i] - fe[o]);
+                out[i] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
             }
             mout[0] = [rho, uphys[0], uphys[1], uphys[2]];
         });
@@ -245,4 +280,12 @@ impl Lbm {
         let d = n.max(1) as f32;
         (r / d, u / d, n)
     }
+}
+
+impl Engine for Lbm {
+    fn step_n(&mut self, n: usize) { for _ in 0..n { self.step(); } }
+    fn set_port_bc(&mut self, k: usize, bc: PortBc) { self.cfg.ports[k].bc = bc; }
+    fn mac(&mut self) -> &[[f32; 4]] { &self.mac }
+    fn steps(&self) -> usize { self.step_count }
+    fn name(&self) -> String { "CPU".into() }
 }

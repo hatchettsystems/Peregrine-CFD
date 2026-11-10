@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use peregrine_core::{shapes, stl};
 use peregrine_geom::{build_project_domain, duct_port_candidates, load_bodies};
 use peregrine_project::{Port, PortKind, Project};
-use peregrine_solver::Simulation;
+use peregrine_solver::{Backend, Simulation};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "peregrine <command>
@@ -10,7 +10,7 @@ const USAGE: &str = "peregrine <command>
   ports <project.toml>             list port candidates (planar openings) of the duct bodies
   set-port <project.toml> <#> <name> <kind>
                                    define a port from candidate #; kind = velocity=<m/s> | flow=<L/min> | outlet=<Pa>
-  run <project.toml> [--steps N] [--out DIR]
+  run <project.toml> [--steps N] [--out DIR] [--cpu|--gpu]
                                    voxelize, solve, print the port report, write VTK";
 
 fn main() {
@@ -33,15 +33,18 @@ fn real_main() -> Result<()> {
             let proj = PathBuf::from(args.get(1).context("run <project>")?);
             let mut steps = None;
             let mut out = PathBuf::from("out");
+            let mut backend = Backend::Auto;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "--steps" => { steps = Some(args.get(i + 1).context("--steps N")?.parse()?); i += 2; }
+                    "--cpu" => { backend = Backend::Cpu; i += 1; }
+                    "--gpu" => { backend = Backend::Gpu; i += 1; }
                     "--out" => { out = PathBuf::from(args.get(i + 1).context("--out DIR")?); i += 2; }
                     other => bail!("unknown option {other}"),
                 }
             }
-            run(&proj, steps, &out)
+            run(&proj, steps, &out, backend)
         }
         _ => {
             println!("{USAGE}");
@@ -112,7 +115,7 @@ fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result
     Ok(())
 }
 
-fn run(project_path: &Path, steps: Option<usize>, out: &Path) -> Result<()> {
+fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) -> Result<()> {
     let (project, bodies) = load(project_path)?;
     let domain = build_project_domain(&project, &bodies)?;
     let g = &domain.grid;
@@ -124,8 +127,9 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path) -> Result<()> {
     if domain.sealed_cells_removed > 0 {
         println!("note: {} enclosed fluid cells not connected to any port were closed off", domain.sealed_cells_removed);
     }
-    let mut sim = Simulation::new(&project, &domain)?;
+    let mut sim = Simulation::new(&project, &domain, backend)?;
     for w in sim.units.warnings() { println!("warning: {w}"); }
+    println!("engine: {}", sim.engine_name());
     println!("dt = {:.3e} s, tau = {:.3}", sim.units.dt, sim.units.tau_used());
     let total = steps.unwrap_or(project.solver.max_steps);
     let chunk = 500;
@@ -134,9 +138,9 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path) -> Result<()> {
         let n = chunk.min(total - done);
         sim.advance(n);
         done += n;
-        if !sim.lbm.is_finite() { bail!("solution diverged at step {done}; use a coarser cell or lower reference speed"); }
+        if !sim.is_finite() { bail!("solution diverged at step {done}; use a coarser cell or lower reference speed"); }
         let net: f64 = sim.report().iter().map(|r| r.flow_l_min).sum();
-        println!("step {done:>6}/{total}  net flow imbalance {net:+.3} L/min  max speed {:.2} m/s", sim.units.vel_to_phys(sim.lbm.max_speed() as f64));
+        println!("step {done:>6}/{total}  net flow imbalance {net:+.3} L/min  max speed {:.2} m/s", { let ms = sim.max_speed() as f64; sim.units.vel_to_phys(ms) });
     }
     print!("{}", peregrine_post::format_report(&sim.report()));
     let infl = sim.units.viscosity_inflation();
@@ -145,7 +149,7 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(out)?;
     let vtk = out.join("result.vtk");
-    peregrine_post::write_vtk(&sim, g, &vtk)?;
+    peregrine_post::write_vtk(&mut sim, g, &vtk)?;
     println!("wrote {}", vtk.display());
     Ok(())
 }

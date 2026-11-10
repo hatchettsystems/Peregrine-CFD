@@ -1,5 +1,5 @@
 /// Lowest relaxation time used; under-resolved cases get extra (implicit LES) viscosity.
-pub const TAU_FLOOR: f64 = 0.55;
+pub const TAU_FLOOR: f64 = 0.52;
 
 /// Conversion between SI and lattice units.
 #[derive(Clone, Copy, Debug)]
