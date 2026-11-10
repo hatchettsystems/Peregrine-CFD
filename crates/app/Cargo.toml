@@ -1,0 +1,20 @@
+[package]
+name = "peregrine-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peregrine-app"
+path = "src/main.rs"
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-project.workspace = true
+peregrine-geom.workspace = true
+peregrine-voxel.workspace = true
+peregrine-solver.workspace = true
+peregrine-post.workspace = true
+anyhow.workspace = true
+eframe = "0.31"
+rfd = "0.15"
