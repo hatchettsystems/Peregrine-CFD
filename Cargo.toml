@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/project", "crates/geom", "crates/voxel", "crates/solver", "crates/post", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+rayon = "1"
+regex = "1"
+peregrine-core = { path = "crates/core" }
+peregrine-project = { path = "crates/project" }
+peregrine-geom = { path = "crates/geom" }
+peregrine-voxel = { path = "crates/voxel" }
+peregrine-solver = { path = "crates/solver" }
+peregrine-post = { path = "crates/post" }
+
+[profile.dev]
+opt-level = 1
+[profile.test]
+opt-level = 3

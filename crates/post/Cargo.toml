@@ -1,0 +1,9 @@
+[package]
+name = "peregrine-post"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peregrine-solver.workspace = true
+peregrine-voxel.workspace = true

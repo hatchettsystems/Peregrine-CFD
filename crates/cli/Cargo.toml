@@ -1,0 +1,18 @@
+[package]
+name = "peregrine-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peregrine"
+path = "src/main.rs"
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-project.workspace = true
+peregrine-geom.workspace = true
+peregrine-voxel.workspace = true
+peregrine-solver.workspace = true
+peregrine-post.workspace = true
+anyhow.workspace = true
