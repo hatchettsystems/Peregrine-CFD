@@ -252,6 +252,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             }
         }
     }
+    restore_thin_walls(&grid, &mut cells, &label, solids);
     if seam_tol_mm > 0.0 && groups.iter().any(|g| g.len() >= 2) {
         let reach = ((seam_tol_mm / dx).ceil() as usize).max(1);
         let mut group_of = vec![usize::MAX; solids.len()];
@@ -370,6 +371,79 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool, 
         seal_rim(grid, cells, cap, &poly, true, collar_mm, collar_mm);
     }
     count
+}
+
+/// Bring back walls thinner than a cell. The inside/outside test samples only cell centres, so a sheet thinner than
+/// one cell is missed wherever no centre falls inside it, and the duct is then open there. Wherever a surface passes
+/// through a cell and that cell and both of its neighbours across the surface are fluid, the sheet was lost: that one
+/// cell is closed. Walls that were captured (a solid cell on at least one side) are left exactly as they are.
+fn restore_thin_walls(grid: &Grid, cells: &mut [u8], label: &[u16], solids: &[&TriMesh]) {
+    if probing() || std::env::var_os("PG_NO_THIN_WALLS").is_some() {
+        return;
+    }
+    let dx = grid.dx;
+    let [nx, ny, nz] = grid.dims;
+    let cell_of = |p: V3| -> Option<[usize; 3]> {
+        let f = [(p[0] - grid.origin[0]) / dx, (p[1] - grid.origin[1]) / dx, (p[2] - grid.origin[2]) / dx];
+        if f.iter().any(|v| *v < 0.0) { return None; }
+        let c = [f[0] as usize, f[1] as usize, f[2] as usize];
+        (c[0] < nx && c[1] < ny && c[2] < nz).then_some(c)
+    };
+    let mut add: Vec<usize> = vec![];
+    for m in solids {
+        for t in 0..m.triangles.len() {
+            let [a, b, c] = m.tri(t);
+            let n = cross(sub(b, a), sub(c, a));
+            let area2 = len(n);
+            if area2 < 1e-12 { continue; }
+            let nn = scale(n, 1.0 / area2);
+            let axis = (0..3).max_by(|&i, &j| nn[i].abs().partial_cmp(&nn[j].abs()).unwrap()).unwrap();
+            // samples across the triangle, about two per cell
+            let longest = len(sub(b, a)).max(len(sub(c, b))).max(len(sub(a, c)));
+            let steps = ((longest / (0.5 * dx)).ceil() as usize).clamp(1, 400);
+            // interior samples only: a sample on a triangle's edge can land in the cell beside the wall (outside the
+            // part) and wrongly look like a lost sheet
+            let (i0, n_div) = if steps >= 3 { (1usize, steps) } else { (0usize, 0usize) };
+            let samples: Vec<(f64, f64)> = if n_div == 0 {
+                vec![(1.0 / 3.0, 1.0 / 3.0)]
+            } else {
+                let mut v = vec![];
+                for i in i0..n_div {
+                    for j in i0..(n_div - i) {
+                        v.push((i as f64 / n_div as f64, j as f64 / n_div as f64));
+                    }
+                }
+                if v.is_empty() { v.push((1.0 / 3.0, 1.0 / 3.0)); }
+                v
+            };
+            for (u, v) in samples {
+                {
+                    let w = 1.0 - u - v;
+                    let p = [a[0] * w + b[0] * u + c[0] * v, a[1] * w + b[1] * u + c[1] * v, a[2] * w + b[2] * u + c[2] * v];
+                    let Some(cc) = cell_of(p) else { continue };
+                    let idx = grid.idx(cc[0], cc[1], cc[2]);
+                    if cells[idx] != FLUID { continue; }
+                    let mut lo = cc;
+                    let mut hi = cc;
+                    if cc[axis] == 0 || cc[axis] + 1 >= grid.dims[axis] { continue; }
+                    lo[axis] -= 1;
+                    hi[axis] += 1;
+                    if cells[grid.idx(lo[0], lo[1], lo[2])] == FLUID && cells[grid.idx(hi[0], hi[1], hi[2])] == FLUID {
+                        add.push(idx);
+                    }
+                }
+            }
+        }
+    }
+    let _ = label;
+    if std::env::var_os("PG_DEBUG").is_some() {
+        let mut ex: Vec<[usize; 3]> = add.iter().take(12).map(|&i| grid.xyz(i)).collect();
+        ex.sort();
+        eprintln!("thin-wall restore adds {} cells, e.g. {:?}", add.len(), ex);
+    }
+    for i in add {
+        if cells[i] == FLUID { cells[i] = SOLID; }
+    }
 }
 
 /// Make every thin wall face-connected. A wall one cell thick at a slant becomes a staircase of cells that touch
@@ -991,5 +1065,28 @@ mod diag_tests {
         let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], 3, true);
         assert!(filled.is_empty() && !review.is_empty());
         assert!(cells[grid.idx(15, 3, 2)] == FLUID, "the long gap must stay open");
+    }
+
+    /// A sheet thinner than a cell must never vanish, wherever it sits relative to the cell centres.
+    #[test]
+    fn thin_sheets_survive_voxelization() {
+        use peregrine_core::shapes;
+        let mut lost_without = 0;
+        for k in 0..10 {
+            let off = 0.05 + 0.1 * k as f64;
+            let sheet = shapes::solid_box([off, -5.0, -5.0], [off + 0.25, 5.0, 5.0]);
+            let mut bb = sheet.bounds();
+            bb.grow([-3.0, -6.0, -6.0]);
+            bb.grow([4.0, 6.0, 6.0]);
+            let grid = Grid::from_bounds(&bb, 1.0);
+            let (inside, _) = voxelize_inside(&sheet, &grid);
+            let mut cells: Vec<u8> = inside.iter().map(|&i| if i { SOLID } else { FLUID }).collect();
+            let row = |cells: &[u8]| (0..grid.dims[0]).any(|x| cells[grid.idx(x, grid.dims[1] / 2, grid.dims[2] / 2)] == SOLID);
+            if !row(&cells) { lost_without += 1; }
+            let label = vec![0u16; grid.len()];
+            restore_thin_walls(&grid, &mut cells, &label, &[&sheet]);
+            assert!(row(&cells), "sheet at offset {off} vanished");
+        }
+        assert!(lost_without > 0, "the test must include sheets that the plain test loses");
     }
 }

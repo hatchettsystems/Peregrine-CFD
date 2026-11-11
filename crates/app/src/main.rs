@@ -296,6 +296,8 @@ fn main() -> eframe::Result {
                 app.focus_issue = Some("Air leaks out of the duct".into());
             }
             if a == "--show-sealed" { app.show_sealed = true; }
+            if a == "--look" { if let Some(v) = args.get(i + 1) { let n: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect(); if n.len() >= 3 { app.cam.target = [n[0], n[1], n[2]]; if let Some(d) = n.get(3) { app.cam.dist = *d; } } } }
+            if a == "--only-ducts" { for (k, b) in app.bodies.iter().enumerate() { if app.project.duct_of(&b.name).is_none() { app.visible[k] = false; } } }
             if a == "--tab" { match args.get(i + 1).map(|v| v.as_str()) { Some("ports") => app.tab = Tab::Ports, Some("results") => app.tab = Tab::Results, Some("exceptions") => app.tab = Tab::Exceptions, _ => {} } }
             if a == "--tutorial" { app.start_tutorial(); }
             if a == "--tutorial-selftest" {
