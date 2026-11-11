@@ -112,6 +112,13 @@ pub struct Source {
     /// Name of the library fan the curve was taken from, if any (for estimate warnings).
     #[serde(default)]
     pub preset: Option<String>,
+    /// Number of flow trajectories (streamlines) drawn from this source's inlets.
+    #[serde(default = "default_streamlines")]
+    pub streamlines: usize,
+}
+
+fn default_streamlines() -> usize {
+    40
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -251,12 +258,12 @@ mod tests {
     fn source_validation() {
         let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]] };
         let mut p = Project::new("g");
-        p.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split: SplitMode::ByArea, preset: None });
+        p.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         p.ports.push(Port { name: "a".into(), body: "d".into(), kind: PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, cap: cap.clone() });
         p.ports.push(Port { name: "o".into(), body: "d".into(), kind: PortKind::PressureOutlet { pressure: 0.0 }, cap: cap.clone() });
         assert!(p.validate().is_empty(), "{:?}", p.validate());
         assert_eq!(p.members("fan"), vec![0]);
-        p.sources.push(Source { name: "empty".into(), kind: SourceKind::Flow { l_per_min: 1.0 }, split: SplitMode::ByArea, preset: None });
+        p.sources.push(Source { name: "empty".into(), kind: SourceKind::Flow { l_per_min: 1.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         assert!(p.validate().iter().any(|m| m.contains("no inlet ports")));
         let s = toml::to_string_pretty(&p).unwrap();
         let q: Project = toml::from_str(&s).unwrap();

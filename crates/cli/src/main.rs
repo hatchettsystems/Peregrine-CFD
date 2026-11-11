@@ -6,6 +6,9 @@ use peregrine_project::{Port, PortKind, Project, Source, SourceKind, SplitMode};
 use peregrine_solver::{Backend, Simulation};
 use std::path::{Path, PathBuf};
 
+/// Round holes up to this diameter (mm) are treated as screw holes and not offered as ports.
+const SCREW_MAX_D: f64 = 6.0;
+
 const USAGE: &str = "peregrine <command>
   demo <dir>                       write a demo duct + nozzle block (STL) and a project file
   ports <project.toml>             list port candidates (planar openings) of the duct bodies
@@ -98,7 +101,7 @@ fn ports(project_path: &Path) -> Result<()> {
     for b in &bodies {
         println!("body {:<16} role {:?}  ({} triangles)", b.name, b.role, b.mesh.triangles.len());
     }
-    let c = duct_port_candidates(&bodies, 0.5);
+    let c = duct_port_candidates(&bodies, 0.5, Some(SCREW_MAX_D));
     if c.is_empty() {
         println!("no port candidates found (a duct needs planar faces with openings)");
     }
@@ -112,7 +115,7 @@ fn ports(project_path: &Path) -> Result<()> {
 
 fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result<()> {
     let (mut project, bodies) = load(project_path)?;
-    let c = duct_port_candidates(&bodies, 0.5);
+    let c = duct_port_candidates(&bodies, 0.5, Some(SCREW_MAX_D));
     let (body, cand) = c.get(index).with_context(|| format!("no candidate #{index}"))?;
     let (k, v) = kind.split_once('=').context("kind must look like velocity=5")?;
     let kind = match k {
@@ -157,7 +160,7 @@ fn set_source(project_path: &Path, name: &str, spec: &str, split: Option<&str>) 
         Some(o) => bail!("unknown split {o} (area|weights|plenum)"),
     };
     project.sources.retain(|s| s.name != name);
-    project.sources.push(Source { name: name.to_string(), kind, split, preset });
+    project.sources.push(Source { name: name.to_string(), kind, split, preset, streamlines: 40 });
     project.save(project_path)?;
     println!("source '{name}' set; assign inlets with: set-port <project> <#> <port> source={name}");
     Ok(())
@@ -178,20 +181,37 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) 
     if domain.sealed_cells_removed > 0 {
         println!("note: {} enclosed fluid cells not connected to any port were closed off", domain.sealed_cells_removed);
     }
-    let mut sim = Simulation::new(&project, &domain, backend)?;
-    for w in sim.units.warnings() { println!("warning: {w}"); }
-    println!("engine: {}", sim.engine_name());
-    println!("dt = {:.3e} s, tau = {:.3}", sim.units.dt, sim.units.tau_used());
     let total = steps.unwrap_or(project.solver.max_steps);
-    let chunk = 500;
-    let mut done = 0;
-    while done < total {
-        let n = chunk.min(total - done);
-        sim.advance(n);
-        done += n;
-        if !sim.is_finite() { bail!("solution diverged at step {done}; use a coarser cell or lower reference speed"); }
-        let net: f64 = sim.report().iter().map(|r| r.flow_l_min).sum();
-        println!("step {done:>6}/{total}  net flow imbalance {net:+.3} L/min  max speed {:.2} m/s", { let ms = sim.max_speed() as f64; sim.units.vel_to_phys(ms) });
+    let mut ref_speed = project.solver.reference_speed;
+    let mut sim;
+    let mut attempt = 0;
+    'attempts: loop {
+        sim = Simulation::new_with_ref(&project, &domain, backend, ref_speed)?;
+        println!("engine: {}", sim.engine_name());
+        if sim.ref_speed > ref_speed * 1.01 {
+            println!("note: reference speed raised to {:.1} m/s (estimated peak flow speed is higher than the project setting)", sim.ref_speed);
+        }
+        for w in sim.units.warnings() { println!("warning: {w}"); }
+        println!("dt = {:.3e} s, tau = {:.3}", sim.units.dt, sim.units.tau_used());
+        let chunk = 500;
+        let mut done = 0;
+        while done < total {
+            let n = chunk.min(total - done);
+            sim.advance(n);
+            done += n;
+            if sim.unstable() {
+                attempt += 1;
+                if attempt > 2 {
+                    bail!("solution became unstable at step {done} even with reference speed {:.0} m/s. Check the geometry for tiny gaps, reduce the flow, or refine the cell size.", sim.ref_speed);
+                }
+                ref_speed = sim.ref_speed * 1.6;
+                println!("unstable at step {done}: retrying with reference speed {ref_speed:.1} m/s (attempt {attempt})");
+                continue 'attempts;
+            }
+            let net: f64 = sim.report().iter().map(|r| r.flow_l_min).sum();
+            println!("step {done:>6}/{total}  net flow imbalance {net:+.3} L/min  max speed {:.2} m/s", { let ms = sim.max_speed() as f64; sim.units.vel_to_phys(ms) });
+        }
+        break;
     }
     print!("{}", peregrine_post::format_report(&sim.report()));
     for g in sim.source_reports() {

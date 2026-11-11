@@ -31,8 +31,8 @@ fn square_duct_pressure_drop_and_mass_balance() {
         open_faces: [false; 6],
         body_force: [0.0; 3],
         ports: vec![
-            PortInfo { bc: PortBc::Velocity([u_in, 0.0, 0.0]), inward: [1, 0, 0] },
-            PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0] },
+            PortInfo { bc: PortBc::Velocity([u_in, 0.0, 0.0]), inward: [1, 0, 0], normal: [0.0; 3] },
+            PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0], normal: [0.0; 3] },
         ],
     };
     let mut lbm = Lbm::new(cfg);

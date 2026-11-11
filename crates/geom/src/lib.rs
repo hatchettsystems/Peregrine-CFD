@@ -60,10 +60,14 @@ pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
 }
 
 /// Port candidates (planar holes) of every Duct body, as (body name, candidate).
-pub fn duct_port_candidates(bodies: &[Body], min_area: f64) -> Vec<(String, PortCandidate)> {
+/// `hide_round_below`: skip small round holes (screw holes) with an equivalent diameter up to this (mm).
+pub fn duct_port_candidates(bodies: &[Body], min_area: f64, hide_round_below: Option<f64>) -> Vec<(String, PortCandidate)> {
     let mut out = vec![];
     for b in bodies.iter().filter(|b| b.role == BodyRole::Duct) {
         for c in find_port_candidates(&b.mesh, min_area) {
+            if hide_round_below.map_or(false, |d| c.is_screw_hole(d)) {
+                continue;
+            }
             out.push((b.name.clone(), c));
         }
     }
@@ -118,6 +122,6 @@ mod tests {
         let bodies = load_bodies(&f, &Project::new("t")).unwrap();
         let duct = bodies.iter().find(|b| b.name == "duct").unwrap();
         assert_eq!(duct.role, BodyRole::Duct);
-        assert_eq!(duct_port_candidates(&bodies, 1.0).len(), 2);
+        assert_eq!(duct_port_candidates(&bodies, 1.0, None).len(), 2);
     }
 }

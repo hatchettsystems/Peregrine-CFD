@@ -29,8 +29,8 @@ fn config() -> LbmConfig {
         open_faces: [false, false, false, false, true, false],
         body_force: [0.0; 3],
         ports: vec![
-            PortInfo { bc: PortBc::Velocity([0.03, 0.0, 0.0]), inward: [1, 0, 0] },
-            PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0] },
+            PortInfo { bc: PortBc::Velocity([0.03, 0.0, 0.0]), inward: [1, 0, 0], normal: [0.0; 3] },
+            PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0], normal: [0.0; 3] },
         ],
     }
 }

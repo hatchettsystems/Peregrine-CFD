@@ -10,6 +10,9 @@ Airflow simulation for 3D-printer part-cooling ducts, written in Rust.
 - A source can feed several openings (one fan over a hole that splits four ways). Choose how it is shared:
   by cross-section (flow proportional to each opening's area), by manual weights, or as a shared plenum
   pressure where the flow divides by each duct's resistance.
+- Flow trajectories (streamlines) seeded from each source's inlets, with a per-source line count, colouring by
+  speed or source, and a Shaded / Ghost / Hidden mesh mode (key `M`) to see only the flow.
+- Small round holes (screw holes) are hidden from the opening list by default (adjustable diameter).
 - GPU lattice-Boltzmann solver (wgpu: DX12 / Vulkan / Metal) with a CPU fallback. Velocity and pressure only.
 - Photoshop-style dark UI with slice views, port report and VTK export.
 

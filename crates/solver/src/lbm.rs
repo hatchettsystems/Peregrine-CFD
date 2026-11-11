@@ -44,6 +44,21 @@ pub struct PortInfo {
     pub bc: PortBc,
     /// Unit step (axis-snapped) from a port cell into the duct.
     pub inward: [i32; 3],
+    /// True inward unit normal of the opening (zero = use `inward`). Needed for tilted openings.
+    pub normal: [f32; 3],
+}
+
+impl PortInfo {
+    /// Inward unit normal, falling back to the axis step.
+    pub fn inward_unit(&self) -> [f32; 3] {
+        let n = self.normal;
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if l > 1e-6 {
+            [n[0] / l, n[1] / l, n[2] / l]
+        } else {
+            [self.inward[0] as f32, self.inward[1] as f32, self.inward[2] as f32]
+        }
+    }
 }
 
 /// Common interface of the CPU and GPU solvers.
@@ -57,20 +72,36 @@ pub trait Engine {
 }
 
 /// (cell index, port k, inward-neighbour index) for every port cell.
+/// The inward neighbour is the fluid cell (among the 18 lattice neighbours) that best lines up with the
+/// opening's true inward normal, so tilted openings read from a real fluid cell.
 pub fn port_cell_list(cfg: &LbmConfig) -> Vec<(usize, usize, usize)> {
-    let [nx, ny, _] = cfg.dims;
+    let [nx, ny, nz] = cfg.dims;
     let mut out = vec![];
     for idx in 0..cfg.cells.len() {
         let code = cfg.cells[idx];
-        if code >= 2 {
-            let k = (code - 2) as usize;
-            let (x, y, z) = ((idx % nx) as i32, ((idx / nx) % ny) as i32, (idx / (nx * ny)) as i32);
-            let inw = cfg.ports[k].inward;
-            let (xx, yy, zz) = (x + inw[0], y + inw[1], z + inw[2]);
-            let ok = xx >= 0 && yy >= 0 && zz >= 0 && (xx as usize) < cfg.dims[0] && (yy as usize) < cfg.dims[1] && (zz as usize) < cfg.dims[2];
-            let nb = if ok { xx as usize + nx * (yy as usize + ny * zz as usize) } else { idx };
-            out.push((idx, k, nb));
+        if code < 2 {
+            continue;
         }
+        let k = (code - 2) as usize;
+        let n = cfg.ports[k].inward_unit();
+        let (x, y, z) = ((idx % nx) as i32, ((idx / nx) % ny) as i32, (idx / (nx * ny)) as i32);
+        let mut best: Option<(f32, usize)> = None;
+        for c in C.iter().skip(1) {
+            let (xx, yy, zz) = (x + c[0], y + c[1], z + c[2]);
+            if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 {
+                continue;
+            }
+            let j = xx as usize + nx * (yy as usize + ny * zz as usize);
+            if cfg.cells[j] != 0 {
+                continue;
+            }
+            let l = ((c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) as f32).sqrt();
+            let score = (c[0] as f32 * n[0] + c[1] as f32 * n[1] + c[2] as f32 * n[2]) / l;
+            if best.map_or(true, |b| score > b.0) {
+                best = Some((score, j));
+            }
+        }
+        out.push((idx, k, best.map_or(idx, |b| b.1)));
     }
     out
 }
@@ -270,13 +301,13 @@ impl Lbm {
 
     /// Mean density and inward velocity of the inward-neighbour layer of port `k`; also returns cell count.
     pub fn port_stats(&self, k: usize) -> (f32, f32, usize) {
-        let inw = self.cfg.ports[k].inward;
+        let inw = self.cfg.ports[k].inward_unit();
         let (mut r, mut u, mut n) = (0.0, 0.0, 0);
         for &(_, pk, nb) in &self.port_cells {
             if pk == k {
                 let m = self.mac[nb];
                 r += m[0];
-                u += m[1] * inw[0] as f32 + m[2] * inw[1] as f32 + m[3] * inw[2] as f32;
+                u += m[1] * inw[0] + m[2] * inw[1] + m[3] * inw[2];
                 n += 1;
             }
         }

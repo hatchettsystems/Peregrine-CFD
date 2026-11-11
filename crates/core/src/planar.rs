@@ -20,6 +20,17 @@ pub struct PortCandidate {
     pub area: f64,
     /// Area of the planar face that contains the hole.
     pub parent_area: f64,
+    /// 4*pi*area / perimeter^2: 1.0 for a circle, 0.785 for a square.
+    pub circularity: f64,
+    /// Diameter of the circle with the same area (mm).
+    pub equiv_diameter: f64,
+}
+
+impl PortCandidate {
+    /// Small round holes (screw holes) are usually not airflow ports.
+    pub fn is_screw_hole(&self, max_diameter: f64) -> bool {
+        self.circularity > 0.8 && self.equiv_diameter <= max_diameter
+    }
 }
 
 /// Group coplanar connected triangles and extract their boundary loops.
@@ -146,7 +157,13 @@ pub fn find_port_candidates(mesh: &TriMesh, min_area: f64) -> Vec<PortCandidate>
             let cap = PortCap { origin: c, normal: r.normal, polygon: h.clone() };
             let area = cap.area();
             if area >= min_area {
-                out.push(PortCandidate { cap, area, parent_area: r.area });
+                let mut perim = 0.0;
+                for i in 0..h.len() {
+                    perim += len(sub(h[(i + 1) % h.len()], h[i]));
+                }
+                let circularity = if perim > 0.0 { 4.0 * std::f64::consts::PI * area / (perim * perim) } else { 0.0 };
+                let equiv_diameter = 2.0 * (area / std::f64::consts::PI).sqrt();
+                out.push(PortCandidate { cap, area, parent_area: r.area, circularity, equiv_diameter });
             }
         }
     }

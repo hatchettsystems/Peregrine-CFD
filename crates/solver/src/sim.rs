@@ -65,6 +65,8 @@ const CHUNK: usize = 25;
 pub struct Simulation {
     engine: Box<dyn Engine>,
     pub units: Units,
+    /// Reference speed (m/s) that fixed the time step; may be higher than the project's setting.
+    pub ref_speed: f64,
     pub dims: [usize; 3],
     cells: Vec<u8>,
     ports: Vec<PortInfo>,
@@ -103,8 +105,50 @@ fn dir_vel(d: [f64; 3], speed_lat: f64) -> [f32; 3] {
 
 impl Simulation {
     pub fn new(project: &Project, domain: &Domain, backend: Backend) -> anyhow::Result<Simulation> {
+        Self::new_with_ref(project, domain, backend, project.solver.reference_speed)
+    }
+
+    /// Rough peak speed (m/s) expected in the domain: the fastest inlet or the mean outlet speed.
+    pub fn estimate_peak_speed(project: &Project, domain: &Domain) -> f64 {
+        let dx_m = domain.grid.dx * 1e-3;
+        let area = |k: usize| domain.port_cell_counts[k].max(1) as f64 * dx_m * dx_m;
+        let (mut peak, mut q_total, mut a_out) = (0.0f64, 0.0f64, 0.0f64); // q in m^3/s
+        for (k, p) in project.ports.iter().enumerate() {
+            match &p.kind {
+                PortKind::VelocityInlet { speed } => { peak = peak.max(*speed); q_total += speed * area(k); }
+                PortKind::FlowInlet { l_per_min } => { let q = l_per_min / 60000.0; peak = peak.max(q / area(k)); q_total += q; }
+                PortKind::FanInlet { curve } => { let q = curve.last().map_or(0.0, |c| c.0) * 0.7 / 60000.0; peak = peak.max(q / area(k)); q_total += q; }
+                PortKind::PressureOutlet { .. } => a_out += area(k),
+                PortKind::SourceInlet { .. } => {}
+            }
+        }
+        for src in &project.sources {
+            let members = project.members(&src.name);
+            let sum_a: f64 = members.iter().map(|&k| area(k)).sum();
+            let q = match &src.kind {
+                SourceKind::Flow { l_per_min } => l_per_min / 60000.0,
+                SourceKind::Velocity { speed } => speed * sum_a,
+                SourceKind::Fan { curve } => curve.last().map_or(0.0, |c| c.0) * 0.7 / 60000.0,
+            };
+            q_total += q;
+            // forced splits give each opening q*share/area; manual weights can concentrate flow
+            let worst = members.iter().map(|&k| {
+                let w = match &project.ports[k].kind { PortKind::SourceInlet { weight, .. } => *weight, _ => 1.0 };
+                let wsum: f64 = members.iter().map(|&j| match &project.ports[j].kind { PortKind::SourceInlet { weight, .. } => *weight, _ => 1.0 }).sum();
+                match src.split { SplitMode::Weights => q * w / wsum.max(1e-9) / area(k), _ => q / sum_a.max(1e-12) }
+            }).fold(0.0, f64::max);
+            peak = peak.max(if src.split == SplitMode::Plenum { 2.0 * q / sum_a.max(1e-12) } else { worst });
+        }
+        if a_out > 0.0 { peak = peak.max(q_total / a_out); }
+        peak
+    }
+
+    /// Like [`Simulation::new`] but with an explicit minimum reference speed. The speed is raised
+    /// automatically to 2.5x the estimated peak so lattice velocities stay in the low-Mach range.
+    pub fn new_with_ref(project: &Project, domain: &Domain, backend: Backend, ref_speed: f64) -> anyhow::Result<Simulation> {
         let g = &domain.grid;
-        let units = Units::new(g.dx * 1e-3, project.solver.reference_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity);
+        let ref_speed = ref_speed.max(2.5 * Self::estimate_peak_speed(project, domain));
+        let units = Units::new(g.dx * 1e-3, ref_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity);
         let mut infos = vec![];
         let mut meta = vec![];
         let mut dirs = vec![];
@@ -126,7 +170,7 @@ impl Simulation {
                 PortKind::PressureOutlet { pressure } => PortBc::Pressure(units.rho_lat(*pressure) as f32),
                 PortKind::SourceInlet { .. } => PortBc::Velocity([0.0; 3]),
             };
-            infos.push(PortInfo { bc, inward: snap(inward_f) });
+            infos.push(PortInfo { bc, inward: snap(inward_f), normal: { let l = (inward_f[0] * inward_f[0] + inward_f[1] * inward_f[1] + inward_f[2] * inward_f[2]).sqrt().max(1e-12); [(inward_f[0] / l) as f32, (inward_f[1] / l) as f32, (inward_f[2] / l) as f32] } });
             meta.push((p.name.clone(), p.kind.clone(), area));
             dirs.push(inward_f);
         }
@@ -177,7 +221,7 @@ impl Simulation {
             };
             sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, members, weights, areas, q_cmd, p_cmd });
         }
-        let mut sim = Simulation { engine, units, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
+        let mut sim = Simulation { engine, units, ref_speed, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
         sim.apply_sources();
         Ok(sim)
@@ -219,14 +263,14 @@ impl Simulation {
     }
 
     fn port_stats(&mut self, k: usize) -> (f32, f32, usize) {
-        let inw = self.ports[k].inward;
+        let inw = self.ports[k].inward_unit();
         let list: Vec<usize> = self.port_cells.iter().filter(|c| c.1 == k).map(|c| c.2).collect();
         let mac = self.engine.mac();
         let (mut r, mut u) = (0.0, 0.0);
         for &nb in &list {
             let m = mac[nb];
             r += m[0];
-            u += m[1] * inw[0] as f32 + m[2] * inw[1] as f32 + m[3] * inw[2] as f32;
+            u += m[1] * inw[0] + m[2] * inw[1] + m[3] * inw[2];
         }
         let d = list.len().max(1) as f32;
         (r / d, u / d, list.len())
@@ -345,6 +389,11 @@ impl Simulation {
         let cells = &self.cells;
         let mac = self.engine.mac();
         mac.iter().zip(cells).filter(|(_, &c)| c == 0).map(|(m, _)| (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt()).fold(0.0, f32::max)
+    }
+
+    /// True when the run has blown up or lattice speeds are far into the compressible range.
+    pub fn unstable(&mut self) -> bool {
+        !self.is_finite() || self.max_speed() > 0.35
     }
 
     pub fn is_finite(&mut self) -> bool {

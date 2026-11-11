@@ -1,4 +1,5 @@
-//! Result export: legacy-VTK structured points (open in ParaView) and text reports.
+//! Result export (legacy VTK, reports) and flow trajectories.
+pub mod streamlines;
 use peregrine_solver::{PortReport, Simulation};
 use peregrine_voxel::Grid;
 use std::io::Write;

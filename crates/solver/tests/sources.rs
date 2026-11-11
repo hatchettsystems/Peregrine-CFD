@@ -21,7 +21,7 @@ fn setup(split: SplitMode) -> (Project, peregrine_voxel::Domain) {
     let mut project = Project::new("t");
     project.solver.cell_size_mm = 0.5;
     project.solver.reference_speed = 4.0;
-    project.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split, preset: None });
+    project.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split, preset: None, streamlines: 40 });
     let mut caps: Vec<(String, PortCap)> = vec![];
     for (tag, m) in [("A", &a), ("B", &b)] {
         for c in find_port_candidates(m, 1.0) {

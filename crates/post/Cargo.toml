@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 peregrine-solver.workspace = true
 peregrine-voxel.workspace = true
+peregrine-core.workspace = true
+rayon.workspace = true

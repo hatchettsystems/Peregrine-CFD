@@ -2412,8 +2412,10 @@ dependencies = [
 name = "peregrine-post"
 version = "0.1.0"
 dependencies = [
+ "peregrine-core",
  "peregrine-solver",
  "peregrine-voxel",
+ "rayon",
 ]
 
 [[package]]

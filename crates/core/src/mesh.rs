@@ -90,6 +90,14 @@ impl TriMesh {
         out
     }
 
+    /// Rotate about the Z axis through the origin (radians).
+    pub fn rotate_z(&mut self, angle: f64) {
+        let (s, c) = angle.sin_cos();
+        for v in &mut self.vertices {
+            *v = [c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]];
+        }
+    }
+
     pub fn translate(&mut self, d: V3) {
         for v in &mut self.vertices {
             *v = add(*v, d);

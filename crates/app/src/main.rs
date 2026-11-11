@@ -11,6 +11,7 @@ use peregrine_core::{shapes, PortCandidate, PortCap};
 use peregrine_geom::{build_project_domain, domain_bounds, duct_port_candidates, load_bodies, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
+use peregrine_post::streamlines::{self as sl, SeedSpec, Streamline, VelocityField};
 use peregrine_solver::{Backend, PortReport, Simulation, SourceReport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +22,10 @@ use viewport::Camera;
 enum Tool { Orbit, Pan, PickPort, Slice }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshMode { Shaded, Ghost, Hidden }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineColor { Speed, Source }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field { Speed, Pressure }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,7 +39,9 @@ struct Snapshot {
     dims: [usize; 3],
     origin: [f64; 3],
     dx: f64,
-    cells: Vec<u8>,
+    cells: Arc<Vec<u8>>,
+    vel: Arc<Vec<[f32; 3]>>,
+    ref_speed: f64,
     speed: Vec<f32>,
     pressure: Vec<f32>,
     report: Vec<PortReport>,
@@ -70,6 +77,17 @@ struct App {
     slice_pos: f32,
     status: String,
     ctx_target: Option<Target>,
+    hide_screws: bool,
+    screw_max_d: f64,
+    mesh_mode: MeshMode,
+    show_lines: bool,
+    show_slice: bool,
+    line_color: LineColor,
+    line_width: f32,
+    lines: Vec<Streamline>,
+    lines_vmax: f32,
+    lines_request_sig: u64,
+    lines_job: Option<std::sync::mpsc::Receiver<(u64, Vec<Streamline>)>>,
 }
 
 fn main() -> eframe::Result {
@@ -80,6 +98,20 @@ fn main() -> eframe::Result {
     eframe::run_native("Peregrine CFD", opts, Box::new(|cc| {
         theme::apply(&cc.egui_ctx);
         let mut app = App::new();
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--mesh") {
+            match args.get(pos + 1).map(String::as_str) { Some("hidden") => app.mesh_mode = MeshMode::Hidden, Some("ghost") => app.mesh_mode = MeshMode::Ghost, _ => {} }
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--project") {
+            if let Some(path) = args.get(pos + 1) {
+                app.load_project_file(PathBuf::from(path));
+                if args.iter().any(|a| a == "--run") {
+                    if let Some(sp) = args.iter().position(|a| a == "--steps") { if let Some(n) = args.get(sp + 1).and_then(|v| v.parse().ok()) { app.project.solver.max_steps = n; } }
+                    app.backend = Backend::Cpu;
+                    app.start_run();
+                }
+            }
+        }
         if std::env::args().any(|a| a == "--demo") {
             app.load_demo();
             if std::env::args().any(|a| a == "--run") {
@@ -113,6 +145,17 @@ impl App {
             slice_pos: 0.5,
             status: "Open a geometry file (STL) or load the demo to begin.".into(),
             ctx_target: None,
+            hide_screws: true,
+            screw_max_d: 6.0,
+            mesh_mode: MeshMode::Shaded,
+            show_lines: true,
+            show_slice: false,
+            line_color: LineColor::Speed,
+            line_width: 1.6,
+            lines: vec![],
+            lines_vmax: 1.0,
+            lines_request_sig: 0,
+            lines_job: None,
         }
     }
 
@@ -137,7 +180,7 @@ impl App {
     }
 
     fn refresh_candidates(&mut self) {
-        self.candidates = duct_port_candidates(&self.bodies, 0.5);
+        self.candidates = duct_port_candidates(&self.bodies, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None });
         self.sel_cand = None;
     }
 
@@ -154,7 +197,7 @@ impl App {
             Body { name: "nozzle".into(), role: BodyRole::Solid, mesh: nozzle },
         ];
         self.set_bodies(bodies);
-        self.project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 8.0 }, split: SplitMode::ByArea, preset: None });
+        self.project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 8.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         self.add_port_from(0, "inlet_1", PortKind::SourceInlet { source: "fan".into(), weight: 1.0 });
         self.add_port_from(1, "outlet_1", PortKind::PressureOutlet { pressure: 0.0 });
         self.status = "Demo loaded: straight duct with a nozzle block. Press Simulation > Run.".into();
@@ -191,21 +234,25 @@ impl App {
 
     fn open_project(&mut self) {
         if let Some(p) = rfd::FileDialog::new().add_filter("Peregrine project", &["toml"]).pick_file() {
-            match Project::load(&p) {
-                Ok(pr) => {
-                    self.project = pr;
-                    self.project_path = Some(p.clone());
-                    if let Some(g) = self.project.geometry_file.clone() {
-                        let full = if g.is_absolute() { g } else { p.parent().unwrap_or(std::path::Path::new(".")).join(g) };
-                        match load_bodies(&full, &self.project) {
-                            Ok(b) => self.set_bodies(b),
-                            Err(e) => self.status = format!("Geometry: {e:#}"),
-                        }
+            self.load_project_file(p);
+        }
+    }
+
+    fn load_project_file(&mut self, p: PathBuf) {
+        match Project::load(&p) {
+            Ok(pr) => {
+                self.project = pr;
+                self.project_path = Some(p.clone());
+                if let Some(g) = self.project.geometry_file.clone() {
+                    let full = if g.is_absolute() { g } else { p.parent().unwrap_or(std::path::Path::new(".")).join(g) };
+                    match load_bodies(&full, &self.project) {
+                        Ok(b) => self.set_bodies(b),
+                        Err(e) => self.status = format!("Geometry: {e:#}"),
                     }
-                    self.status = format!("Opened {}", p.display());
                 }
-                Err(e) => self.status = format!("Open failed: {e:#}"),
+                self.status = format!("Opened {}", p.display());
             }
+            Err(e) => self.status = format!("Open failed: {e:#}"),
         }
     }
 
@@ -226,44 +273,69 @@ impl App {
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let domain = build_project_domain(&project, &bodies)?;
-                let mut sim = Simulation::new(&project, &domain, backend)?;
+                let cells = Arc::new(domain.cells.clone());
+                let mut base_warnings = presets::preset_warnings(&project);
+                if domain.odd_columns > 0 {
+                    base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
+                }
                 {
                     let mut s = snap2.lock().unwrap();
                     s.dims = domain.grid.dims;
                     s.origin = domain.grid.origin;
                     s.dx = domain.grid.dx;
-                    s.cells = domain.cells.clone();
-                    s.engine = sim.engine_name();
-                    s.inflation = sim.units.viscosity_inflation();
-                    s.warnings = sim.units.warnings();
-                    s.warnings.extend(presets::preset_warnings(&project));
-                    if domain.odd_columns > 0 {
-                        s.warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
-                    }
+                    s.cells = cells.clone();
                 }
                 let total = project.solver.max_steps;
-                let mut done = 0;
-                while done < total && !stop2.load(Ordering::Relaxed) {
-                    let n = 250.min(total - done);
-                    sim.advance(n);
-                    done += n;
-                    if !sim.is_finite() {
-                        anyhow::bail!("solution diverged at step {done}; use a coarser cell or lower reference speed");
+                let mut ref_speed = project.solver.reference_speed;
+                let mut attempt = 0;
+                let mut notes: Vec<String> = vec![];
+                'attempts: loop {
+                    let mut sim = Simulation::new_with_ref(&project, &domain, backend, ref_speed)?;
+                    {
+                        let mut s = snap2.lock().unwrap();
+                        s.engine = sim.engine_name();
+                        s.inflation = sim.units.viscosity_inflation();
+                        s.ref_speed = sim.ref_speed;
+                        s.step = 0;
+                        s.warnings = base_warnings.clone();
+                        s.warnings.extend(notes.clone());
+                        if sim.ref_speed > ref_speed * 1.01 {
+                            s.warnings.push(format!("Reference speed raised to {:.1} m/s: the estimated peak flow speed is higher than the project setting.", sim.ref_speed));
+                        }
+                        s.warnings.extend(sim.units.warnings());
                     }
-                    let u = sim.units;
-                    let mac: Vec<[f32; 4]> = sim.mac().to_vec();
-                    let cells = sim.cells().to_vec();
-                    let speed = mac.iter().zip(&cells).map(|(m, &c)| if c == 1 { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
-                    let pressure = mac.iter().zip(&cells).map(|(m, &c)| if c == 1 { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
-                    let report = sim.report();
-                    let sources = sim.source_reports();
-                    let mut s = snap2.lock().unwrap();
-                    s.sources = sources;
-                    s.step = done;
-                    s.speed = speed;
-                    s.pressure = pressure;
-                    s.report = report;
-                    s.version += 1;
+                    let mut done = 0;
+                    while done < total && !stop2.load(Ordering::Relaxed) {
+                        let n = 250.min(total - done);
+                        sim.advance(n);
+                        done += n;
+                        if sim.unstable() {
+                            attempt += 1;
+                            if attempt > 2 {
+                                anyhow::bail!("solution became unstable at step {done} even with reference speed {:.0} m/s. Check the geometry for tiny gaps, reduce the flow, or refine the cell size.", sim.ref_speed);
+                            }
+                            ref_speed = sim.ref_speed * 1.6;
+                            notes.push(format!("Run became unstable at step {done}; restarted with reference speed {ref_speed:.1} m/s (attempt {attempt})."));
+                            continue 'attempts;
+                        }
+                        let u = sim.units;
+                        let mac: Vec<[f32; 4]> = sim.mac().to_vec();
+                        let solid = |i: usize| cells[i] == 1;
+                        let speed: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
+                        let pressure: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
+                        let vel: Vec<[f32; 3]> = mac.iter().enumerate().map(|(i, m)| if solid(i) { [0.0; 3] } else { [u.vel_to_phys(m[1] as f64) as f32, u.vel_to_phys(m[2] as f64) as f32, u.vel_to_phys(m[3] as f64) as f32] }).collect();
+                        let report = sim.report();
+                        let sources = sim.source_reports();
+                        let mut s = snap2.lock().unwrap();
+                        s.sources = sources;
+                        s.step = done;
+                        s.speed = speed;
+                        s.pressure = pressure;
+                        s.vel = Arc::new(vel);
+                        s.report = report;
+                        s.version += 1;
+                    }
+                    break;
                 }
                 Ok(())
             })();
@@ -274,7 +346,66 @@ impl App {
         self.run = Some(RunHandle { stop, snap: snap.clone() });
         self.last = Some(snap);
         self.tab = Tab::Results;
+        self.lines.clear();
+        self.lines_request_sig = 0;
+        if self.mesh_mode == MeshMode::Shaded { self.mesh_mode = MeshMode::Ghost; }
         self.status = "Running...".into();
+    }
+
+    fn lines_signature(&self, version: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        version.hash(&mut h);
+        for s in &self.project.sources { (&s.name, s.streamlines).hash(&mut h); }
+        for p in &self.project.ports {
+            p.name.hash(&mut h);
+            p.kind.source().hash(&mut h);
+            for c in p.cap.centroid() { c.to_bits().hash(&mut h); }
+        }
+        h.finish().max(1)
+    }
+
+    /// Collect a finished streamline job and start a new one when the data or line counts changed.
+    fn update_lines(&mut self) {
+        if let Some(rx) = &self.lines_job {
+            if let Ok((_, lines)) = rx.try_recv() {
+                let mut speeds: Vec<f32> = lines.iter().flat_map(|l| l.speed.iter().copied()).collect();
+                speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                self.lines_vmax = speeds.get(speeds.len().saturating_sub(1) * 98 / 100).copied().unwrap_or(1.0).max(0.1);
+                self.lines = lines;
+                self.lines_job = None;
+            }
+        }
+        let Some(snap) = self.last.clone() else { return };
+        let (version, ready) = { let s = snap.lock().unwrap(); (s.version, !s.vel.is_empty()) };
+        if !ready { return; }
+        let sig = self.lines_signature(version);
+        if self.lines_job.is_some() || sig == self.lines_request_sig { return; }
+        self.lines_request_sig = sig;
+        // seeds: each source spreads its line count over its inlet openings in proportion to area
+        let mut specs: Vec<SeedSpec> = vec![];
+        for (si, src) in self.project.sources.iter().enumerate() {
+            let members = self.project.members(&src.name);
+            if src.streamlines == 0 || members.is_empty() { continue; }
+            let areas: Vec<f64> = members.iter().map(|&k| self.project.ports[k].cap.area()).collect();
+            let total: f64 = areas.iter().sum::<f64>().max(1e-9);
+            let caps = members.iter().zip(&areas).map(|(&k, a)| (self.project.ports[k].cap.clone(), ((src.streamlines as f64 * a / total).round() as usize).max(1))).collect();
+            specs.push(SeedSpec { source: si, caps });
+        }
+        let n_src = self.project.sources.len();
+        for (j, p) in self.project.ports.iter().enumerate() {
+            if matches!(p.kind, PortKind::VelocityInlet { .. } | PortKind::FlowInlet { .. } | PortKind::FanInlet { .. }) {
+                specs.push(SeedSpec { source: n_src + j, caps: vec![(p.cap.clone(), 12)] });
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lines_job = Some(rx);
+        std::thread::spawn(move || {
+            let (dims, origin, dx, cells, vel) = { let s = snap.lock().unwrap(); (s.dims, s.origin, s.dx, s.cells.clone(), s.vel.clone()) };
+            let field = VelocityField { dims, origin, dx, cells: &cells, vel: &vel };
+            let lines = sl::streamlines(&field, &specs, 600.0);
+            let _ = tx.send((sig, lines));
+        });
     }
 
     fn running(&self) -> bool {
@@ -305,6 +436,12 @@ impl App {
                 if ui.button("Clear all ports").clicked() { self.project.ports.clear(); ui.close_menu(); }
             });
             ui.menu_button("View", |ui| {
+                ui.label("Mesh");
+                ui.radio_value(&mut self.mesh_mode, MeshMode::Shaded, "Shaded");
+                ui.radio_value(&mut self.mesh_mode, MeshMode::Ghost, "Ghost (see-through)");
+                ui.radio_value(&mut self.mesh_mode, MeshMode::Hidden, "Hidden (flow only)");
+                ui.checkbox(&mut self.show_lines, "Streamlines");
+                ui.separator();
                 if ui.button("Frame all").clicked() {
                     let b = domain_bounds(&self.bodies, 0.0);
                     if b.is_valid() { self.cam.frame(b.min, b.max); }
@@ -472,7 +609,7 @@ impl App {
 
     fn add_source(&mut self, kind: SourceKind, prefix: &str, preset: Option<String>) -> String {
         let name = Self::unique_name(|n| self.project.sources.iter().any(|s| s.name == n), prefix);
-        self.project.sources.push(Source { name: name.clone(), kind, split: SplitMode::ByArea, preset });
+        self.project.sources.push(Source { name: name.clone(), kind, split: SplitMode::ByArea, preset, streamlines: 40 });
         name
     }
 
@@ -606,7 +743,7 @@ impl App {
                     if ui.small_button("x").on_hover_text("Delete source and unassign its inlets").clicked() { remove_src = Some(name.clone()); }
                 });
                 let src = &mut self.project.sources[si];
-                let Source { kind, split, preset, .. } = src;
+                let Source { kind, split, preset, streamlines, .. } = src;
                 match kind {
                     SourceKind::Flow { l_per_min } => { ui.horizontal(|ui| { ui.label("Total flow"); ui.add(egui::DragValue::new(l_per_min).speed(0.1).range(0.0..=2000.0).suffix(" L/min")); }); }
                     SourceKind::Velocity { speed } => { ui.horizontal(|ui| { ui.label("Mean speed"); ui.add(egui::DragValue::new(speed).speed(0.1).range(0.0..=200.0).suffix(" m/s")); }); }
@@ -642,6 +779,10 @@ impl App {
                         ui.selectable_value(split, SplitMode::Weights, "Manual weights").on_hover_text("Each opening takes flow in proportion to the weight you set.");
                         ui.selectable_value(split, SplitMode::Plenum, "Shared plenum pressure").on_hover_text("All openings sit at one pressure and the flow divides by each duct's resistance (one fan over a manifold).");
                     });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Streamlines");
+                    ui.add(egui::DragValue::new(streamlines).speed(1.0).range(0..=2000)).on_hover_text("Flow trajectories started from this source's inlets (0 = none). More lines = finer detail.");
                 });
                 ui.label(egui::RichText::new(format!("Inlet openings ({})", members.len())).color(theme::TEXT_DIM));
                 for (j, &k) in members.iter().enumerate() {
@@ -679,6 +820,13 @@ impl App {
             ui.label(egui::RichText::new("None. Duct bodies need planar faces with openings.").color(theme::TEXT_DIM));
         }
         ui.label(egui::RichText::new("Tip: right-click an opening in the 3D view to assign it.").color(theme::TEXT_DIM));
+        ui.horizontal(|ui| {
+            let mut changed = ui.checkbox(&mut self.hide_screws, "Hide small round holes").changed();
+            if self.hide_screws {
+                changed |= ui.add(egui::DragValue::new(&mut self.screw_max_d).speed(0.1).range(0.5..=30.0).prefix("up to ").suffix(" mm")).changed();
+            }
+            if changed { self.refresh_candidates(); }
+        });
         let mut act: Option<(usize, u8, String)> = None;
         for i in 0..self.candidates.len() {
             let status = match self.port_for_cand(i).map(|k| &self.project.ports[k].kind) {
@@ -769,7 +917,42 @@ impl App {
                 }
             });
         });
-        theme::section(ui, "Slice", |ui| {
+        theme::section(ui, "Display", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Mesh");
+                ui.selectable_value(&mut self.mesh_mode, MeshMode::Shaded, "Shaded");
+                ui.selectable_value(&mut self.mesh_mode, MeshMode::Ghost, "Ghost");
+                ui.selectable_value(&mut self.mesh_mode, MeshMode::Hidden, "Hidden");
+            });
+            ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
+            if self.show_lines {
+                ui.horizontal(|ui| {
+                    ui.label("Colour by");
+                    ui.selectable_value(&mut self.line_color, LineColor::Speed, "Speed");
+                    ui.selectable_value(&mut self.line_color, LineColor::Source, "Source");
+                });
+                ui.add(egui::Slider::new(&mut self.line_width, 0.5..=5.0).text("width"));
+                ui.label(egui::RichText::new("Lines per source").color(theme::TEXT_DIM));
+                for src in &mut self.project.sources {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("■").color(source_color(0)));
+                        ui.label(&src.name);
+                        ui.add(egui::DragValue::new(&mut src.streamlines).speed(1.0).range(0..=2000));
+                    });
+                }
+                if self.line_color == LineColor::Speed {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(240.0), 10.0), Sense::hover());
+                    for k in 0..60 {
+                        let r = Rect::from_min_max(Pos2::new(rect.min.x + rect.width() * k as f32 / 60.0, rect.min.y), Pos2::new(rect.min.x + rect.width() * (k + 1) as f32 / 60.0, rect.max.y));
+                        ui.painter().rect_filled(r, 0.0, theme::ramp(k as f32 / 59.0));
+                    }
+                    ui.horizontal(|ui| { ui.label("0"); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(format!("{:.1} m/s", self.lines_vmax))); });
+                }
+                ui.label(egui::RichText::new(format!("{} lines drawn{}", self.lines.len(), if self.lines_job.is_some() { " (updating...)" } else { "" })).color(theme::TEXT_DIM));
+            }
+            ui.checkbox(&mut self.show_slice, "Slice plane");
+        });
+        if self.show_slice { theme::section(ui, "Slice", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Field");
                 ui.selectable_value(&mut self.field, Field::Speed, "Speed");
@@ -789,7 +972,7 @@ impl App {
                 }
                 ui.horizontal(|ui| { ui.label(format!("{lo:.1}")); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(format!("{hi:.1} {}", if self.field == Field::Speed { "m/s" } else { "Pa" }))); });
             }
-        });
+        }); }
     }
 
     fn viewport_ui(&mut self, ui: &mut egui::Ui) {
@@ -804,14 +987,22 @@ impl App {
 
         // geometry
         for (i, b) in self.bodies.iter().enumerate() {
-            if !self.visible[i] || b.role == BodyRole::Ignore { continue; }
-            let (col, alpha) = match b.role { BodyRole::Duct => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 150), _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255) };
+            if self.mesh_mode == MeshMode::Hidden || !self.visible[i] || b.role == BodyRole::Ignore { continue; }
+            let (col, alpha) = match (b.role, self.mesh_mode) {
+                (BodyRole::Duct, MeshMode::Ghost) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
+                (_, MeshMode::Ghost) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
+                (BodyRole::Duct, _) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 150),
+                _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
+            };
             viewport::draw_mesh(&painter, rect, &self.cam, &b.mesh, col, alpha, false);
         }
         // slice
-        if let Some(snap) = &self.last {
+        if let (true, Some(snap)) = (self.show_slice, &self.last) {
             let s = snap.lock().unwrap();
             if !s.speed.is_empty() { draw_slice(&painter, rect, &self.cam, &s, self.field, self.slice_axis, self.slice_pos); }
+        }
+        if self.show_lines && !self.lines.is_empty() {
+            draw_streamlines(&painter, rect, &self.cam, &self.lines, self.line_color, self.lines_vmax, self.line_width);
         }
         // port caps: unassigned openings in grey, assigned ports coloured
         for (i, (_, c)) in self.candidates.iter().enumerate() {
@@ -885,6 +1076,44 @@ impl App {
     }
 }
 
+fn source_color(i: usize) -> Color32 {
+    const PAL: [(u8, u8, u8); 6] = [(0x2D, 0xC8, 0xF0), (0xF0, 0x88, 0x3E), (0x7C, 0xE0, 0x5A), (0xE0, 0x5A, 0xA0), (0xB0, 0x8C, 0xF0), (0xF2, 0xD0, 0x3A)];
+    let c = PAL[i % PAL.len()];
+    Color32::from_rgb(c.0, c.1, c.2)
+}
+
+fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[Streamline], mode: LineColor, vmax: f32, width: f32) {
+    let mut shapes: Vec<Shape> = Vec::with_capacity(lines.len() * 8);
+    for l in lines {
+        let pts: Vec<Option<Pos2>> = l.pts.iter().map(|p| cam.project(rect, [p[0] as f64, p[1] as f64, p[2] as f64]).map(|x| x.0)).collect();
+        let n = pts.len();
+        match mode {
+            LineColor::Source => {
+                let mut run: Vec<Pos2> = vec![];
+                for p in pts.iter().chain(std::iter::once(&None)) {
+                    match p {
+                        Some(q) => run.push(*q),
+                        None => { if run.len() > 1 { shapes.push(Shape::line(std::mem::take(&mut run), Stroke::new(width, source_color(l.source)))); } else { run.clear(); } }
+                    }
+                }
+            }
+            LineColor::Speed => {
+                let mut i = 0;
+                while i + 1 < n {
+                    let j = (i + 4).min(n - 1);
+                    let seg: Vec<Pos2> = pts[i..=j].iter().flatten().copied().collect();
+                    if seg.len() == j - i + 1 {
+                        let v = l.speed[i..=j].iter().sum::<f32>() / (j - i + 1) as f32;
+                        shapes.push(Shape::line(seg, Stroke::new(width, theme::ramp(v / vmax))));
+                    }
+                    i = j;
+                }
+            }
+        }
+    }
+    painter.extend(shapes);
+}
+
 fn fan_library_menu(ui: &mut egui::Ui) -> Option<FanPreset> {
     let mut chosen = None;
     for p in presets::fan_presets() {
@@ -898,7 +1127,7 @@ fn field_range(s: &Snapshot, f: Field) -> (f32, f32) {
     let v = if f == Field::Speed { &s.speed } else { &s.pressure };
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
-    for (x, &c) in v.iter().zip(&s.cells) {
+    for (x, &c) in v.iter().zip(s.cells.iter()) {
         if c != 1 { lo = lo.min(*x); hi = hi.max(*x); }
     }
     if lo >= hi { (0.0, 1.0) } else { (if f == Field::Speed { 0.0 } else { lo }, hi) }
@@ -977,12 +1206,16 @@ fn draw_tool_icon(p: &egui::Painter, r: Rect, t: Tool) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.running() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+        self.update_lines();
+        if self.running() || self.lines_job.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
         ctx.input(|i| {
             if i.key_pressed(egui::Key::O) { self.tool = Tool::Orbit; }
             if i.key_pressed(egui::Key::H) { self.tool = Tool::Pan; }
             if i.key_pressed(egui::Key::P) { self.tool = Tool::PickPort; }
             if i.key_pressed(egui::Key::S) && !i.modifiers.ctrl { self.tool = Tool::Slice; }
+            if i.key_pressed(egui::Key::M) {
+                self.mesh_mode = match self.mesh_mode { MeshMode::Shaded => MeshMode::Ghost, MeshMode::Ghost => MeshMode::Hidden, MeshMode::Hidden => MeshMode::Shaded };
+            }
         });
         let bar = egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(8, 3)).stroke(Stroke::new(1.0, theme::BORDER));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui));
