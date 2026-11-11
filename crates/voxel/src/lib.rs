@@ -127,6 +127,8 @@ pub struct Domain {
     pub odd_columns: usize,
     /// Fluid cells not connected to any port that were turned solid.
     pub sealed_cells_removed: usize,
+    /// Places (mm) where [`auto_seal_leaks`] closed a small leak.
+    pub repaired: Vec<V3>,
 }
 
 pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
@@ -137,11 +139,11 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
 /// that form that duct. A fluid cell squeezed between two DIFFERENT parts of the same duct, at most
 /// `seam_tol_mm` apart along an axis, is filled, so small gaps between parts do not leak.
 pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
-    build_domain_full(solids, groups, seam_tol_mm, ports, &[], &[], bounds, dx)
+    build_domain_full(solids, groups, seam_tol_mm, 0.0, ports, &[], &[], bounds, dx)
 }
 
 /// Like [`build_domain_ext`], and every cap in `blockers` is filled solid (a shut opening: screw hole, vent...).
-pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], blockers: &[PortCap], plugs: &[(V3, f64)], bounds: &Aabb, dx: f64) -> Domain {
+pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, gap_all_mm: f64, ports: &[PortSpec], blockers: &[PortCap], plugs: &[(V3, f64)], bounds: &Aabb, dx: f64) -> Domain {
     assert!(ports.len() <= (255 - PORT_BASE as usize), "too many ports");
     let grid = Grid::from_bounds(bounds, dx);
     let mut cells = vec![FLUID; grid.len()];
@@ -169,7 +171,12 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
                 }
             }
         }
-        seal_seams(&grid, &mut cells, &label, &group_of, reach);
+        seal_seams(&grid, &mut cells, &label, &group_of, reach, false);
+    }
+    if gap_all_mm > 0.0 {
+        // aggressive: close any gap up to this size between two different parts, duct or not
+        let reach = ((gap_all_mm / dx).ceil() as usize).max(1);
+        seal_seams(&grid, &mut cells, &label, &[], reach, true);
     }
     close_diagonal_gaps(&grid, &mut cells);
     let [nx, ny, nz] = grid.dims;
@@ -225,7 +232,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             removed += 1;
         }
     }
-    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed }
+    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![] }
 }
 
 /// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
@@ -562,8 +569,44 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
     Some(Leak { boundary_cells: edge_hits.len(), exit_point: g.center(x, y, z), throat: g.center(tx, ty, tz), throat_width: if tw == f64::MAX { 2.0 * g.dx } else { 2.0 * tw * g.dx } })
 }
 
+/// Repair small leaks: while air from the inlets can reach the edge of the domain without passing a port, close
+/// the narrowest point of its escape path with a small ball of solid. Stops when sealed, after `max_repairs`, or
+/// when the narrowest point is wider than `max_width_mm` (that is a real opening, not a gap: it is left for the
+/// user). Returns the places that were closed.
+pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], max_repairs: usize, max_width_mm: f64) -> Vec<V3> {
+    let mut done = vec![];
+    for _ in 0..max_repairs {
+        let Some(leak) = leak_check(domain, inlet_codes) else { break };
+        if leak.throat_width > max_width_mm {
+            break;
+        }
+        let g = &domain.grid;
+        let r = 0.5 * leak.throat_width + 0.75 * g.dx;
+        let c = leak.throat;
+        let lo = [0, 1, 2].map(|i| (((c[i] - r - g.origin[i]) / g.dx).floor().max(0.0)) as usize);
+        let hi = [0, 1, 2].map(|i| ((((c[i] + r - g.origin[i]) / g.dx).ceil()).max(0.0) as usize).min(g.dims[i]));
+        let mut filled = 0;
+        for z in lo[2]..hi[2] {
+            for y in lo[1]..hi[1] {
+                for x in lo[0]..hi[0] {
+                    let i = g.idx(x, y, z);
+                    if domain.cells[i] == FLUID && len(sub(g.center(x, y, z), c)) <= r {
+                        domain.cells[i] = SOLID;
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        done.push(c);
+    }
+    done
+}
+
 /// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).
-fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize) {
+fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) {
     let [nx, ny, nz] = grid.dims;
     let mut fill: Vec<usize> = vec![];
     let step_dirs: [(i32, i32, i32); 3] = [(1, 0, 0), (0, 1, 0), (0, 0, 1)];
@@ -592,7 +635,7 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                         None
                     };
                     if let (Some(a), Some(b)) = (find(-1), find(1)) {
-                        if a != b && a != u16::MAX && b != u16::MAX && group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize] {
+                        if a != b && a != u16::MAX && b != u16::MAX && (any_pair || (group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize])) {
                             fill.push(i);
                             break 'axes;
                         }

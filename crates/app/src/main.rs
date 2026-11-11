@@ -46,6 +46,8 @@ fn classify_issue(msg: &str) -> Issue {
         (Sev::Warning, "Air leaks out of the duct".to_string())
     } else if msg.starts_with("Reference speed raised") {
         (Sev::Info, "Reference speed raised".to_string())
+    } else if msg.starts_with("Auto-sealed") {
+        (Sev::Info, "Small gaps sealed automatically".to_string())
     } else if msg.contains("too coarse") {
         (Sev::Warning, "Cells too coarse for the physical viscosity".to_string())
     } else if msg.starts_with("Viscosity is") {
@@ -825,6 +827,7 @@ impl App {
                 let cells = Arc::new(domain.cells.clone());
                 let mut base_warnings = presets::preset_warnings(&project);
                 if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { base_warnings.push(w); }
+                if let Some(w) = peregrine_geom::repair_note(&domain) { base_warnings.push(w); }
                 if domain.odd_columns > 0 {
                     base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
                 }
@@ -1689,10 +1692,14 @@ impl App {
     fn check_leaks(&mut self) {
         if self.bodies.is_empty() || self.project.ports.is_empty() { self.status = "Define the duct and its ports first.".into(); return; }
         match build_project_domain(&self.project, &self.bodies) {
-            Ok(d) => match peregrine_geom::leak_warning(&self.project, &d) {
-                Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes = vec![m]; }
-                None => { self.status = "No leaks: the duct is sealed except at its ports.".into(); self.leak_notes.clear(); }
-            },
+            Ok(d) => {
+                self.leak_notes.clear();
+                if let Some(n) = peregrine_geom::repair_note(&d) { self.leak_notes.push(n); }
+                match peregrine_geom::leak_warning(&self.project, &d) {
+                    Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes.push(m); }
+                    None => self.status = if d.repaired.is_empty() { "No leaks: the duct is sealed except at its ports.".into() } else { format!("Sealed {} small gap(s) automatically; no leaks left.", d.repaired.len()) },
+                }
+            }
             Err(e) => self.status = format!("Leak check failed: {e:#}"),
         }
     }

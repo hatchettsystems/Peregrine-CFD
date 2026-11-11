@@ -203,7 +203,11 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
         .collect();
     let blockers: Vec<peregrine_core::PortCap> = project.blockers.iter().map(|b| b.cap.clone()).collect();
     let plugs: Vec<([f64; 3], f64)> = project.plugs.iter().map(|p| (p.center, p.radius_mm)).collect();
-    let d = build_domain_full(&meshes, &groups, project.domain.seam_tolerance_mm, &ports, &blockers, &plugs, &bounds, project.solver.cell_size_mm);
+    let mut d = build_domain_full(&meshes, &groups, project.domain.seam_tolerance_mm, project.domain.gap_seal_mm, &ports, &blockers, &plugs, &bounds, project.solver.cell_size_mm);
+    if project.domain.auto_seal_leaks {
+        let inlets: Vec<u8> = project.ports.iter().enumerate().filter(|(_, p)| p.kind.is_inlet()).map(|(k, _)| PORT_BASE + k as u8).collect();
+        d.repaired = peregrine_voxel::auto_seal_leaks(&mut d, &inlets, 600, 2.6);
+    }
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
         if *n == 0 {
             bail!("port '{}' covers no cells at {} mm; refine the grid or check the cap", p.name, project.solver.cell_size_mm);
@@ -312,6 +316,15 @@ pub fn leak_warning(project: &Project, domain: &Domain) -> Option<String> {
     Some(format!(
         "Air can leave the duct through something that is not a port, near ({:.1}, {:.1}, {:.1}) mm (gap about {:.1} mm wide): a gap between parts wider than {:.1} mm, or an opening you did not define as a port. Seal it, block it, or define it as a port.",
         p[0], p[1], p[2], leak.throat_width, project.domain.seam_tolerance_mm
+    ))
+}
+
+/// What the automatic sealer did, if anything (shown as an informational note with a marker).
+pub fn repair_note(domain: &Domain) -> Option<String> {
+    let first = domain.repaired.first()?;
+    Some(format!(
+        "Auto-sealed {} small gap(s) (up to about 2.5 mm) that let air out of the duct, the first near ({:.1}, {:.1}, {:.1}) mm. Real openings are never closed automatically: define them as ports or blockers. Turn this off with 'auto_seal_leaks = false' in the project's [domain] section.",
+        domain.repaired.len(), first[0], first[1], first[2]
     ))
 }
 

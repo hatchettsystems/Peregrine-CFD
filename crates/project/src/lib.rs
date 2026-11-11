@@ -130,6 +130,7 @@ pub struct Source {
     pub streamlines: usize,
 }
 
+fn default_gap_seal() -> f64 { 1.5 }
 fn default_seam_tolerance() -> f64 {
     0.5
 }
@@ -183,11 +184,18 @@ pub struct DomainSettings {
     /// of a mounted fan. Use when a fan mount leaks around the inlet because the fan body is not in the model. 0 = off.
     #[serde(default)]
     pub inlet_collar_mm: f64,
+    /// Aggressive gap sealer (mm): a gap up to this size between ANY two different parts (duct or not) is closed.
+    /// Real assemblies are tight where the CAD has small clearances; 0 = only gaps within one duct are sealed.
+    #[serde(default = "default_gap_seal")]
+    pub gap_seal_mm: f64,
+    /// Automatically close small leaks (up to ~2.5 mm wide) found between the inlets and the edge of the domain.
+    #[serde(default)]
+    pub auto_seal_leaks: bool,
     /// Faces in order -X, +X, -Y, +Y, -Z, +Z.
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, gap_seal_mm: 1.5, auto_seal_leaks: false, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
