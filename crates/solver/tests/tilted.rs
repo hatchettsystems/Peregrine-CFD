@@ -10,7 +10,7 @@ fn run(angle_deg: f64) -> (f64, f64, bool) {
     let mut project = Project::new("t");
     project.solver.cell_size_mm = 0.5;
     project.solver.reference_speed = 6.0;
-    project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 3.0 }, split: SplitMode::ByArea, preset: None });
+    project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 3.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
     for (i, c) in find_port_candidates(&tube, 1.0).into_iter().enumerate() {
         let inlet = c.cap.normal[0] < 0.0;
         let kind = if inlet { PortKind::SourceInlet { source: "fan".into(), weight: 1.0 } } else { PortKind::PressureOutlet { pressure: 0.0 } };

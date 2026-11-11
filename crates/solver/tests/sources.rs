@@ -71,7 +71,7 @@ fn flow_source_split_by_cross_section() {
 fn flow_source_plenum_splits_by_resistance() {
     let (project, domain) = setup(SplitMode::Plenum);
     let mut sim = Simulation::new(&project, &domain, Backend::Cpu).unwrap();
-    sim.advance(5000);
+    sim.advance(9000);
     assert!(sim.is_finite());
     let rep = sim.report();
     let (a, b) = (flow(&rep, "inA"), flow(&rep, "inB"));
