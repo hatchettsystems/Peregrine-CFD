@@ -46,6 +46,8 @@ fn classify_issue(msg: &str) -> Issue {
         (Sev::Warning, "Air leaks out of the duct".to_string())
     } else if msg.starts_with("Reference speed raised") {
         (Sev::Info, "Reference speed raised".to_string())
+    } else if msg.starts_with("Possible intentional") {
+        (Sev::Warning, "Possible intentional openings left unsealed".to_string())
     } else if msg.starts_with("Auto-sealed") {
         (Sev::Info, "Small gaps sealed automatically".to_string())
     } else if msg.contains("too coarse") {
@@ -837,6 +839,7 @@ impl App {
                 let mut base_warnings = presets::preset_warnings(&project);
                 if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { base_warnings.push(w); }
                 if let Some(w) = peregrine_geom::repair_note(&domain) { base_warnings.push(w); }
+                if let Some(w) = peregrine_geom::review_note(&domain) { base_warnings.push(w); }
                 let sealed_regions = peregrine_geom::sealed_regions(&domain);
                 if domain.odd_columns > 0 {
                     base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
@@ -1763,6 +1766,7 @@ impl App {
                 self.leak_notes.clear();
                 self.sealed_check = peregrine_geom::sealed_regions(&d);
                 if let Some(n) = peregrine_geom::repair_note(&d) { self.leak_notes.push(n); }
+                if let Some(n) = peregrine_geom::review_note(&d) { self.leak_notes.push(n); }
                 match peregrine_geom::leak_warning(&self.project, &d) {
                     Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes.push(m); }
                     None => self.status = if d.sealed_idx.is_empty() { "No leaks: the duct is sealed except at its ports.".into() } else { format!("Sealed {} small gap region(s) automatically; no leaks left.", self.sealed_check.len()) },

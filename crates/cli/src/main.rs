@@ -186,6 +186,7 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) 
     for w in presets::preset_warnings(&project) { println!("warning: {w}"); }
     let domain = build_project_domain(&project, &bodies)?;
     if let Some(w) = peregrine_geom::repair_note(&domain) { println!("note: {w}"); }
+    if let Some(w) = peregrine_geom::review_note(&domain) { println!("warning: {w}"); }
     if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { println!("warning: {w}"); }
     let g = &domain.grid;
     let (gpu, cpu) = g.memory_estimate();

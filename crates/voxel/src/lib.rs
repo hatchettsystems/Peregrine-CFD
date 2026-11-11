@@ -141,6 +141,8 @@ pub struct Domain {
     pub repaired: Vec<V3>,
     /// Every cell the gap sealer and the leak repair closed (for reporting regions).
     pub sealed_idx: Vec<u32>,
+    /// Thin gaps that were NOT closed because they are long or wide enough to be an intentional opening.
+    pub review_idx: Vec<u32>,
 }
 
 /// A cluster of cells that were closed automatically.
@@ -155,15 +157,24 @@ pub struct SealedRegion {
 impl Domain {
     /// The automatically closed cells grouped into regions (nearby cells merge; at most `max_regions` are returned).
     pub fn sealed_regions(&self, max_regions: usize) -> Vec<SealedRegion> {
+        self.cluster(&self.sealed_idx, max_regions)
+    }
+
+    /// Gaps left open for review, grouped the same way.
+    pub fn review_regions(&self, max_regions: usize) -> Vec<SealedRegion> {
+        self.cluster(&self.review_idx, max_regions)
+    }
+
+    fn cluster(&self, cells_idx: &[u32], max_regions: usize) -> Vec<SealedRegion> {
         use std::collections::HashMap;
-        if self.sealed_idx.is_empty() {
+        if cells_idx.is_empty() {
             return vec![];
         }
         let g = &self.grid;
         let mut bin = (3.0 / g.dx).ceil().max(2.0) as i64; // cells per bin
         loop {
             let mut bins: HashMap<(i64, i64, i64), (V3, usize)> = HashMap::new();
-            for &i in &self.sealed_idx {
+            for &i in cells_idx {
                 let [x, y, z] = g.xyz(i as usize);
                 let key = (x as i64 / bin, y as i64 / bin, z as i64 / bin);
                 let c = g.center(x, y, z);
@@ -254,10 +265,13 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
         let _ = seal_seams(&grid, &mut cells, &label, &group_of, reach, false);
     }
     let mut sealed_idx: Vec<u32> = vec![];
+    let mut review_idx: Vec<u32> = vec![];
     if gap_all_mm > 0.0 {
         // aggressive: close any gap up to this size between two different parts, duct or not
         let reach = ((gap_all_mm / dx + 1e-6).floor() as usize).max(1);
-        sealed_idx = seal_seams(&grid, &mut cells, &label, &[], reach, true).into_iter().map(|i| i as u32).collect();
+        let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], reach, true);
+        sealed_idx = filled.into_iter().map(|i| i as u32).collect();
+        review_idx = review.into_iter().map(|i| i as u32).collect();
     }
     close_diagonal_gaps(&grid, &mut cells);
     let [nx, ny, nz] = grid.dims;
@@ -313,7 +327,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             removed += 1;
         }
     }
-    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![], sealed_idx }
+    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![], sealed_idx, review_idx }
 }
 
 /// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
@@ -545,10 +559,27 @@ pub struct Leak {
 /// If that air reaches the edge of the domain, it can leave through something that is not a port: a gap between
 /// parts, or an opening that was not defined as a port.
 pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
+    leak_check_ignoring(domain, inlet_codes, &[])
+}
+
+/// Like [`leak_check`], but air that escapes inside one of the `ignore` spheres (centre mm, radius mm) does not
+/// count: those are the surroundings of the outlets, where air is meant to leave.
+pub fn leak_check_ignoring(domain: &Domain, inlet_codes: &[u8], ignore: &[(V3, f64)]) -> Option<Leak> {
     let g = &domain.grid;
     let [nx, ny, nz] = g.dims;
     let n = g.len();
     let mut seen = vec![false; n];
+    for (c, r) in ignore {
+        let lo = [0, 1, 2].map(|i| (((c[i] - r - g.origin[i]) / g.dx).floor().max(0.0)) as usize);
+        let hi = [0, 1, 2].map(|i| ((((c[i] + r - g.origin[i]) / g.dx).ceil()).max(0.0) as usize).min(g.dims[i]));
+        for z in lo[2]..hi[2] {
+            for y in lo[1]..hi[1] {
+                for x in lo[0]..hi[0] {
+                    if len(sub(g.center(x, y, z), *c)) <= *r { seen[g.idx(x, y, z)] = true; } // never entered
+                }
+            }
+        }
+    }
     let mut parent = vec![u32::MAX; n];
     let mut stack: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // start from the fluid cells next to an inlet port cell
@@ -654,10 +685,10 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
 /// the narrowest point of its escape path with a small ball of solid. Stops when sealed, after `max_repairs`, or
 /// when the narrowest point is wider than `max_width_mm` (that is a real opening, not a gap: it is left for the
 /// user). Returns the places that were closed.
-pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], max_repairs: usize, max_width_mm: f64) -> Vec<V3> {
+pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], ignore: &[(V3, f64)], max_repairs: usize, max_width_mm: f64) -> Vec<V3> {
     let mut done = vec![];
     for _ in 0..max_repairs {
-        let Some(leak) = leak_check(domain, inlet_codes) else { break };
+        let Some(leak) = leak_check_ignoring(domain, inlet_codes, ignore) else { break };
         if leak.throat_width > max_width_mm {
             break;
         }
@@ -748,7 +779,11 @@ pub fn keep_relevant_seals(domain: &mut Domain, inlet_codes: &[u8]) {
 }
 
 /// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).
-fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) -> Vec<usize> {
+/// A thin gap longer than this (mm), or covering more than [`INTENTIONAL_AREA_MM2`], is taken to be intentional.
+const INTENTIONAL_LENGTH_MM: f64 = 12.0;
+const INTENTIONAL_AREA_MM2: f64 = 60.0;
+
+fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) -> (Vec<usize>, Vec<usize>) {
     let [nx, ny, nz] = grid.dims;
     let mut fill: Vec<usize> = vec![];
     let step_dirs: [(i32, i32, i32); 3] = [(1, 0, 0), (0, 1, 0), (0, 0, 1)];
@@ -790,10 +825,47 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
             }
         }
     }
+    // A gap this thin that runs over a long distance or a large area is an intentional opening (a slot, a vent),
+    // not a CAD clearance: leave it open and hand it back for review.
+    let mut review: Vec<usize> = vec![];
+    if any_pair && !fill.is_empty() {
+        let n = grid.len();
+        let mut in_fill = vec![false; n];
+        for &i in &fill { in_fill[i] = true; }
+        let mut done = vec![false; n];
+        let mut keep: Vec<usize> = vec![];
+        for &s in &fill {
+            if done[s] { continue; }
+            let mut comp = vec![s];
+            done[s] = true;
+            let mut head = 0;
+            let (mut lo, mut hi) = (grid.xyz(s), grid.xyz(s));
+            while head < comp.len() {
+                let [x, y, z] = grid.xyz(comp[head]);
+                head += 1;
+                for k in 0..3 { let c = [x, y, z][k]; lo[k] = lo[k].min(c); hi[k] = hi[k].max(c); }
+                for dz in -1i32..=1 { for dy in -1i32..=1 { for dx in -1i32..=1 {
+                    let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    if xx < 0 || yy < 0 || zz < 0 || xx as usize >= nx || yy as usize >= ny || zz as usize >= nz { continue; }
+                    let j = grid.idx(xx as usize, yy as usize, zz as usize);
+                    if in_fill[j] && !done[j] { done[j] = true; comp.push(j); }
+                } } }
+            }
+            let mut ext: Vec<f64> = (0..3).map(|k| (hi[k] - lo[k] + 1) as f64 * grid.dx).collect();
+            ext.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let (longest, second) = (ext[0], ext[1]);
+            if longest > INTENTIONAL_LENGTH_MM || longest * second > INTENTIONAL_AREA_MM2 {
+                review.extend(comp);
+            } else {
+                keep.extend(comp);
+            }
+        }
+        fill = keep;
+    }
     for &i in &fill {
         cells[i] = SOLID;
     }
-    fill
+    (fill, review)
 }
 
 /// For each cap, the volume (mm^3) of the connected air just behind it, with every cap plugged. Air behind a
@@ -889,10 +961,35 @@ mod diag_tests {
                 }
             }
             let label = vec![0u16; grid.len()];
-            seal_seams(&grid, &mut cells, &label, &[], 3, true);
+            let _ = seal_seams(&grid, &mut cells, &label, &[], 3, true);
             let filled = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == SOLID);
             let untouched = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == FLUID);
             assert!(if closed { filled } else { untouched }, "gap of {gap} cells: closed = {closed}");
         }
+    }
+
+    /// A thin gap that runs a long way is an intentional opening: it must be left open and handed back for review.
+    #[test]
+    fn long_thin_gaps_are_left_for_review() {
+        let make = |len: usize| {
+            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [len, len.min(8), 6] };
+            let mut cells = vec![FLUID; grid.len()];
+            for x in 0..grid.dims[0] { for y in 0..grid.dims[1] {
+                cells[grid.idx(x, y, 0)] = SOLID; cells[grid.idx(x, y, 1)] = SOLID;
+                cells[grid.idx(x, y, 4)] = SOLID; cells[grid.idx(x, y, 5)] = SOLID;
+            } }
+            (grid, cells)
+        };
+        // 6 x 6 mm patch, 2 mm gap: a clearance, sealed
+        let (grid, mut cells) = make(6);
+        let label = vec![0u16; grid.len()];
+        let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], 3, true);
+        assert!(!filled.is_empty() && review.is_empty());
+        // 30 mm long: intentional, left open
+        let (grid, mut cells) = make(30);
+        let label = vec![0u16; grid.len()];
+        let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], 3, true);
+        assert!(filled.is_empty() && !review.is_empty());
+        assert!(cells[grid.idx(15, 3, 2)] == FLUID, "the long gap must stay open");
     }
 }
