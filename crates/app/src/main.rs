@@ -7,7 +7,7 @@ mod viewport;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use peregrine_core::port_cap::point_in_polygon;
 use peregrine_core::vec3::{dot, len, sub};
-use peregrine_core::{cap_from_loop, shapes, smooth_region_loops, PortCandidate, PortCap, TriMesh};
+use peregrine_core::{cap_from_loop_with_grid, external_visibility, inward_clearance, shapes, smooth_region_loops, PortCandidate, PortCap, RayGrid, TriMesh};
 use peregrine_geom::{apply_roles, build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
@@ -24,6 +24,10 @@ enum Tool { Orbit, Pan, PickPort, Slice, Rim }
 enum Tab { Bodies, Ports, Results }
 /// What the active tab asks the tab shell to do after the frame.
 enum ShellCmd { New, Duplicate, Close(usize), Switch(usize) }
+
+/// An edge loop found by the Rim tool with its quality scores.
+#[derive(Clone)]
+struct RimInfo { l: peregrine_core::RimLoop, vis: f64, clear: f64 }
 
 #[derive(Clone)]
 struct TabInfo { title: String, running: bool }
@@ -86,7 +90,8 @@ struct App {
     hide_screws: bool,
     screw_max_d: f64,
     detect_curved: bool,
-    rim_loops: Vec<peregrine_core::RimLoop>,
+    show_hidden: bool,
+    rim_loops: Vec<RimInfo>,
     rim_sel: Option<usize>,
     rim_body: Option<usize>,
     manual_openings: Vec<(String, PortCandidate)>,
@@ -175,6 +180,7 @@ impl App {
             hide_screws: true,
             screw_max_d: 6.0,
             detect_curved: true,
+            show_hidden: false,
             rim_loops: vec![],
             rim_sel: None,
             rim_body: None,
@@ -218,6 +224,8 @@ impl App {
 
     fn refresh_candidates(&mut self) {
         self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None }, self.detect_curved);
+        // an opening that admits air is visible from outside and leads into a channel, not a pocket
+        if !self.show_hidden { self.candidates.retain(|c| c.1.visibility >= 0.5 && c.1.clearance >= 0.5); }
         self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
     }
@@ -242,26 +250,46 @@ impl App {
         loops.retain(|l| l.perimeter >= 5.0);
         loops.truncate(12);
         self.rim_body = Some(body);
-        // a rim band has an outer and an inner edge; the inner (shorter) one outlines the opening
-        let pick = if loops.len() == 2 { loops.iter().enumerate().min_by(|a, b| a.1.perimeter.partial_cmp(&b.1.perimeter).unwrap()).map(|x| x.0) } else if loops.is_empty() { None } else { Some(0) };
+        // score every loop: is it visible from outside, and does air continue behind it?
+        let (_, duct_mesh) = self.duct_mesh_and_name(body);
+        let grid = RayGrid::new(&duct_mesh);
+        let infos: Vec<RimInfo> = loops
+            .into_iter()
+            .map(|l| {
+                let (vis, clear) = match cap_from_loop_with_grid(&l.points, &grid) {
+                    Some(cap) => (external_visibility(&cap, &grid), inward_clearance(&cap, &grid, 5.0)),
+                    None => (0.0, 0.0),
+                };
+                RimInfo { l, vis, clear }
+            })
+            .collect();
+        // prefer the loop that is both visible and leads into a channel; otherwise a rim band's inner (shorter) edge
+        let best = infos.iter().enumerate().max_by(|a, b| (a.1.vis * a.1.clear).partial_cmp(&(b.1.vis * b.1.clear)).unwrap());
+        let pick = match best {
+            Some((i, r)) if r.vis * r.clear >= 0.25 => Some(i),
+            _ if infos.len() == 2 => infos.iter().enumerate().min_by(|a, b| a.1.l.perimeter.partial_cmp(&b.1.l.perimeter).unwrap()).map(|x| x.0),
+            _ if infos.is_empty() => None,
+            _ => Some(0),
+        };
         self.rim_sel = pick;
-        self.status = if loops.is_empty() {
+        self.status = if infos.is_empty() {
             "No closed edge loop found at that surface. Click the rim of the opening or the wall just inside it.".into()
         } else {
-            format!("{} edge loop(s) found. Select the one that outlines the opening and press 'Add as opening'.", loops.len())
+            format!("{} edge loop(s) found; the one that is visible from outside and leads into the duct is preselected. Press 'Add as opening'.", infos.len())
         };
-        self.rim_loops = loops;
+        self.rim_loops = infos;
         self.tab = Tab::Ports;
     }
 
     fn add_rim_opening(&mut self, li: usize) {
-        let (Some(l), Some(bi)) = (self.rim_loops.get(li).cloned(), self.rim_body) else { return };
+        let (Some(info), Some(bi)) = (self.rim_loops.get(li).cloned(), self.rim_body) else { return };
+        let l = info.l.clone();
         let (duct, mesh) = self.duct_mesh_and_name(bi);
-        match cap_from_loop(&l.points, &mesh) {
+        match cap_from_loop_with_grid(&l.points, &RayGrid::new(&mesh)) {
             Some(cap) => {
                 let area = cap.area();
                 let perim = l.perimeter;
-                let cand = PortCandidate { area, parent_area: 0.0, circularity: (4.0 * std::f64::consts::PI * area / (perim * perim)).min(1.0), equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), cap };
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: (4.0 * std::f64::consts::PI * area / (perim * perim)).min(1.0), equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: info.vis, clearance: info.clear, cap };
                 self.manual_openings.push((duct, cand));
                 self.refresh_candidates();
                 self.sel_cand = Some(self.candidates.len() - 1);
@@ -428,6 +456,7 @@ impl App {
                 let domain = build_project_domain(&project, &bodies)?;
                 let cells = Arc::new(domain.cells.clone());
                 let mut base_warnings = presets::preset_warnings(&project);
+                if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { base_warnings.push(w); }
                 if domain.odd_columns > 0 {
                     base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
                 }
@@ -789,6 +818,13 @@ impl App {
             }
             if let Some(n) = delete { self.project.ducts.retain(|d| d.name != n); self.reclassify(); }
         });
+        theme::section(ui, "Seams between parts", |ui| {
+            ui.label(egui::RichText::new("Parts of one duct that do not quite touch: gaps up to this size are sealed. Bigger gaps leak and are reported when you run.").color(theme::TEXT_DIM));
+            ui.horizontal(|ui| {
+                ui.label("Seal gaps up to");
+                ui.add(egui::DragValue::new(&mut self.project.domain.seam_tolerance_mm).speed(0.05).range(0.0..=3.0).suffix(" mm"));
+            });
+        });
         theme::section(ui, "Name hints (regex)", |ui| {
             ui.label(egui::RichText::new("Parts whose name matches are highlighted as likely ducts. Only a hint; you decide.").color(theme::TEXT_DIM));
             for r in &mut self.project.geometry.rules {
@@ -1131,10 +1167,10 @@ impl App {
             ui.label(egui::RichText::new("Edge loops at your click").strong());
             let mut add: Option<usize> = None;
             for li in 0..self.rim_loops.len() {
-                let l = &self.rim_loops[li];
+                let info = &self.rim_loops[li];
+                let l = &info.l;
                 let kind = if l.planarity_dev > 0.05 { format!("curved, {:.1} mm off-plane", l.planarity_dev) } else { "flat".to_string() };
-                let which = if self.rim_loops.len() == 2 { if self.rim_loops.iter().all(|o| o.perimeter >= l.perimeter) { " (outer edge)" } else { " (inner edge: the opening)" } } else { "" };
-                let text = format!("loop {}{which}  {:.0} mm around  ({kind})", li + 1, l.perimeter);
+                let text = format!("loop {}  {:.0} mm around  ({kind})  visible {:.0}%, air behind {:.0}%", li + 1, l.perimeter, info.vis * 100.0, info.clear * 100.0);
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.rim_sel == Some(li), text).clicked() { self.rim_sel = Some(li); }
                     if self.rim_sel == Some(li) && ui.button("Add as opening").clicked() { add = Some(li); }
@@ -1148,6 +1184,7 @@ impl App {
             if self.hide_screws {
                 changed |= ui.add(egui::DragValue::new(&mut self.screw_max_d).speed(0.1).range(0.5..=30.0).prefix("up to ").suffix(" mm")).changed();
             }
+            changed |= ui.checkbox(&mut self.show_hidden, "Show hidden loops").on_hover_text("Also list loops that are not visible from outside the duct, or that open onto a pocket instead of a channel.").changed();
             changed |= ui.checkbox(&mut self.detect_curved, "Detect curved openings").on_hover_text("Also look for openings that are not flat (scoops, curved lips). Use the Curved Opening tool for any it misses.").changed();
             if changed { self.refresh_candidates(); }
         });
@@ -1159,7 +1196,8 @@ impl App {
                 None => "unassigned".to_string(),
             };
             let (body, c) = &self.candidates[i];
-            let text = format!("#{i}  {body}  {:.1} mm²{}  [{status}]", c.area, if c.cap.is_surface() { "  curved" } else { "" });
+            let hidden = if c.visibility < 0.5 { "  hidden" } else if c.clearance < 0.5 { "  pocket" } else { "" };
+            let text = format!("#{i}  {body}  {:.1} mm²{}{}  [{status}]", c.area, if c.cap.is_surface() { "  curved" } else { "" }, hidden);
             if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
         }
         if let Some(i) = self.sel_cand {
@@ -1364,7 +1402,7 @@ impl App {
         // loops found by the Rim tool
         for (li, l) in self.rim_loops.iter().enumerate() {
             let sel = self.rim_sel == Some(li);
-            viewport::draw_polygon(&painter, rect, &self.cam, &l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
+            viewport::draw_polygon(&painter, rect, &self.cam, &l.l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
         }
         // hover highlight, left-click select, right-click menu
         let hover = if resp.hovered() { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };

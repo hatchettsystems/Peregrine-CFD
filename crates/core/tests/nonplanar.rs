@@ -60,3 +60,32 @@ fn automatic_detection_finds_only_the_curved_inner_opening() {
     assert!(o.cap.normal[0] > 0.95, "outward normal {:?}", o.cap.normal);
     assert!(o.planarity_dev > 0.8);
 }
+
+#[test]
+fn visibility_and_clearance_tell_real_openings_from_internal_loops() {
+    use peregrine_core::{external_visibility, inward_clearance, PortCap, RayGrid};
+    let tube = shapes::hollow_tube(8.0, 4.0, 20.0);
+    let grid = RayGrid::new(&tube);
+    // the real end opening: visible from outside, with a channel behind it
+    let end = find_port_candidates(&tube, 1.0).into_iter().find(|c| c.cap.normal[0] < 0.0).unwrap().cap;
+    assert!(external_visibility(&end, &grid) > 0.95, "end opening visibility {}", external_visibility(&end, &grid));
+    assert!(inward_clearance(&end, &grid, 5.0) > 0.95);
+    // a made-up loop inside the channel that faces the channel wall is not visible from outside
+    let inner = PortCap {
+        origin: [10.0, 0.0, 0.0],
+        normal: [0.0, 1.0, 0.0],
+        polygon: vec![[8.0, 0.0, -1.0], [12.0, 0.0, -1.0], [12.0, 0.0, 1.0], [8.0, 0.0, 1.0]],
+        triangles: vec![],
+        holes: vec![],
+    };
+    assert!(external_visibility(&inner, &grid) < 0.2, "internal loop visibility {}", external_visibility(&inner, &grid));
+    // a pocket: an opening whose "inside" is a wall within a few mm (the wall faces the cap)
+    let pocket = PortCap {
+        origin: [10.0, 1.0, 0.0],
+        normal: [0.0, -1.0, 0.0], // inward direction is +y, into the channel wall 1 mm away
+        polygon: vec![[8.0, 1.0, -1.0], [12.0, 1.0, -1.0], [12.0, 1.0, 1.0], [8.0, 1.0, 1.0]],
+        triangles: vec![],
+        holes: vec![],
+    };
+    assert!(inward_clearance(&pocket, &grid, 5.0) < 0.2, "pocket clearance {}", inward_clearance(&pocket, &grid, 5.0));
+}

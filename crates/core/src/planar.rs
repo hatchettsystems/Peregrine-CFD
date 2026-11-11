@@ -24,6 +24,11 @@ pub struct PortCandidate {
     pub circularity: f64,
     /// Diameter of the circle with the same area (mm).
     pub equiv_diameter: f64,
+    /// Fraction (0..1) of the opening visible from outside the duct; low values mean an internal loop.
+    /// Set by the duct-level detector; 1.0 until it is computed.
+    pub visibility: f64,
+    /// Fraction (0..1) of the opening with open air continuing behind it (a channel, not a pocket).
+    pub clearance: f64,
 }
 
 impl PortCandidate {
@@ -154,7 +159,7 @@ pub fn find_port_candidates(mesh: &TriMesh, min_area: f64) -> Vec<PortCandidate>
                 c = add(c, *p);
             }
             let c = scale(c, 1.0 / h.len() as f64);
-            let cap = PortCap { origin: c, normal: r.normal, polygon: h.clone(), triangles: vec![] };
+            let cap = PortCap { origin: c, normal: r.normal, polygon: h.clone(), triangles: vec![], holes: vec![] };
             let area = cap.area();
             if area >= min_area {
                 let mut perim = 0.0;
@@ -163,7 +168,7 @@ pub fn find_port_candidates(mesh: &TriMesh, min_area: f64) -> Vec<PortCandidate>
                 }
                 let circularity = if perim > 0.0 { 4.0 * std::f64::consts::PI * area / (perim * perim) } else { 0.0 };
                 let equiv_diameter = 2.0 * (area / std::f64::consts::PI).sqrt();
-                out.push(PortCandidate { cap, area, parent_area: r.area, circularity, equiv_diameter });
+                out.push(PortCandidate { cap, area, parent_area: r.area, circularity, equiv_diameter, visibility: 1.0, clearance: 1.0 });
             }
         }
     }

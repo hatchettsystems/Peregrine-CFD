@@ -114,7 +114,7 @@ fn ports(project_path: &Path) -> Result<()> {
         let duct = project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()).into_iter().find(|d| d.parts.contains(&b.name)).map(|d| d.name);
         println!("body {:<24} {}  ({} triangles)", b.name, duct.map_or("solid".to_string(), |d| format!("part of duct '{d}'")), b.mesh.triangles.len());
     }
-    let c = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D), true);
+    let c: Vec<_> = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D), true).into_iter().filter(|x| peregrine_geom::is_real_opening(&x.1)).collect();
     if c.is_empty() {
         println!("no port candidates found (a duct needs planar faces with openings)");
     }
@@ -128,7 +128,7 @@ fn ports(project_path: &Path) -> Result<()> {
 
 fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result<()> {
     let (mut project, bodies) = load(project_path)?;
-    let c = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D), true);
+    let c: Vec<_> = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D), true).into_iter().filter(|x| peregrine_geom::is_real_opening(&x.1)).collect();
     let (body, cand) = c.get(index).with_context(|| format!("no candidate #{index}"))?;
     let (k, v) = kind.split_once('=').context("kind must look like velocity=5")?;
     let kind = match k {
@@ -185,6 +185,7 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) 
     if !problems.is_empty() { bail!("project is not ready: {}", problems.join("; ")); }
     for w in presets::preset_warnings(&project) { println!("warning: {w}"); }
     let domain = build_project_domain(&project, &bodies)?;
+    if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { println!("warning: {w}"); }
     let g = &domain.grid;
     let (gpu, cpu) = g.memory_estimate();
     println!("grid {}x{}x{} = {} cells at {} mm  (GPU ~{} MB, CPU ~{} MB)", g.dims[0], g.dims[1], g.dims[2], g.len(), g.dx, gpu >> 20, cpu >> 20);

@@ -163,52 +163,14 @@ pub fn triangulate_loop(pts: &[V3]) -> Vec<[V3; 3]> {
     (0..n).map(|i| [c, pts[i], pts[(i + 1) % n]]).collect()
 }
 
-fn ray_hits(mesh: &TriMesh, o: V3, d: V3, max_t: f64) -> bool {
-    for i in 0..mesh.triangles.len() {
-        let [a, b, c] = mesh.tri(i);
-        let (e1, e2) = (sub(b, a), sub(c, a));
-        let p = cross(d, e2);
-        let det = dot(e1, p);
-        if det.abs() < 1e-12 {
-            continue;
-        }
-        let inv = 1.0 / det;
-        let t0 = sub(o, a);
-        let u = dot(t0, p) * inv;
-        if !(0.0..=1.0).contains(&u) {
-            continue;
-        }
-        let q = cross(t0, e1);
-        let v = dot(d, q) * inv;
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        let t = dot(e2, q) * inv;
-        if t > 1e-6 && t < max_t {
-            return true;
-        }
-    }
-    false
-}
-
-/// How enclosed a point is: number of 26 directions that hit the mesh within 60 mm.
-fn enclosure(mesh: &TriMesh, p: V3) -> usize {
-    let mut n = 0;
-    for dx in -1..=1 {
-        for dy in -1..=1 {
-            for dz in -1..=1 {
-                if dx == 0 && dy == 0 && dz == 0 { continue; }
-                let d = normalize([dx as f64, dy as f64, dz as f64]);
-                if ray_hits(mesh, p, d, 60.0) { n += 1; }
-            }
-        }
-    }
-    n
-}
-
 /// Build a cap surface for the loop. `duct` is the duct's mesh (all parts); it decides which side of the cap
 /// is the inside of the duct so that the normal points out of it.
 pub fn cap_from_loop(points: &[V3], duct: &TriMesh) -> Option<PortCap> {
+    cap_from_loop_with_grid(points, &RayGrid::new(duct))
+}
+
+/// Same as [`cap_from_loop`] with a prebuilt [`RayGrid`] (build it once when testing many loops).
+pub fn cap_from_loop_with_grid(points: &[V3], grid: &RayGrid) -> Option<PortCap> {
     let tris = triangulate_loop(points);
     if tris.is_empty() {
         return None;
@@ -228,17 +190,136 @@ pub fn cap_from_loop(points: &[V3], duct: &TriMesh) -> Option<PortCap> {
     }
     let ctr = scale(ctr, 1.0 / a_tot);
     let n0 = normalize(n0);
-    // which side is enclosed by the duct?
+    // probe from the point deepest inside the cap (the area centroid can lie outside a bent slot)
+    let cents: Vec<V3> = tris.iter().map(|t| scale(add(add(t[0], t[1]), t[2]), 1.0 / 3.0)).collect();
+    let base = cents
+        .iter()
+        .max_by(|a, b| {
+            let da = points.iter().map(|p| len(sub(*p, **a))).fold(f64::INFINITY, f64::min);
+            let db = points.iter().map(|p| len(sub(*p, **b))).fold(f64::INFINITY, f64::min);
+            da.partial_cmp(&db).unwrap()
+        })
+        .copied()
+        .unwrap_or(ctr);
     let (mut plus, mut minus) = (0usize, 0usize);
     for dist in [1.5, 3.0, 5.0] {
-        plus += enclosure(duct, add(ctr, scale(n0, dist)));
-        minus += enclosure(duct, sub(ctr, scale(n0, dist)));
+        plus += grid.enclosure(add(base, scale(n0, dist)), 60.0);
+        minus += grid.enclosure(sub(base, scale(n0, dist)), 60.0);
     }
     // lumen on the minus side => n0 already points out of the duct
     let n_out = if plus > minus { scale(n0, -1.0) } else { n0 };
     let flip = dot(n0, n_out) < 0.0;
     let triangles: Vec<[V3; 3]> = tris.into_iter().map(|t| if flip { [t[0], t[2], t[1]] } else { t }).collect();
-    Some(PortCap { origin: ctr, normal: n_out, polygon: points.to_vec(), triangles })
+    Some(PortCap { origin: ctr, normal: n_out, polygon: points.to_vec(), triangles, holes: vec![] })
+}
+
+/// Fraction (0..1) of the opening that can be seen from outside the duct: sample points over the cap are tested
+/// with a few rays in a cone around the outward normal; a point counts as visible when at least one ray escapes
+/// without touching the duct. Openings facing into the duct's own walls score near 0.
+pub fn external_visibility(cap: &PortCap, grid: &RayGrid) -> f64 {
+    let pts = cap_samples(cap);
+    external_visibility_at(cap, grid, &pts)
+}
+
+/// Sample points spread over an opening (islands excluded).
+pub fn cap_samples(cap: &PortCap) -> Vec<V3> {
+    let mut pts: Vec<V3> = vec![];
+    if cap.is_surface() {
+        let areas: Vec<f64> = cap.triangles.iter().map(|t| 0.5 * len(cross(sub(t[1], t[0]), sub(t[2], t[0])))).collect();
+        let total: f64 = areas.iter().sum();
+        if total < 1e-12 {
+            return vec![];
+        }
+        let mut cum = vec![];
+        let mut acc = 0.0;
+        for a in &areas { acc += a; cum.push(acc); }
+        let frac = |x: f64| x - x.floor();
+        for i in 0..120 {
+            let u = frac(0.5 + i as f64 * 0.754_877_666_246_692_7) * total;
+            let ti = cum.partition_point(|&c| c < u).min(cap.triangles.len() - 1);
+            let (a, b) = (frac(0.5 + i as f64 * 0.618_033_988_749_894_9), frac(0.5 + i as f64 * 0.414_213_562_373_095));
+            let (ra, rb) = (a.sqrt(), b);
+            let t = cap.triangles[ti];
+            pts.push(add(add(scale(t[0], 1.0 - ra), scale(t[1], ra * (1.0 - rb))), scale(t[2], ra * rb)));
+        }
+    } else {
+        let poly = cap.polygon_2d();
+        let holes = cap.holes_2d();
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in &poly {
+            for k in 0..2 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); }
+        }
+        let (u, v) = cap.basis();
+        let h = (cap.area() / 100.0).sqrt().max(0.3);
+        let mut y = lo[1] + h * 0.5;
+        while y < hi[1] {
+            let mut x = lo[0] + h * 0.5;
+            while x < hi[0] {
+                if crate::port_cap::point_in_polygon(&poly, [x, y]) && !holes.iter().any(|hh| crate::port_cap::point_in_polygon(hh, [x, y])) {
+                    pts.push(add(cap.origin, add(scale(u, x), scale(v, y))));
+                }
+                x += h;
+            }
+            y += h;
+        }
+    }
+    pts
+}
+
+fn external_visibility_at(cap: &PortCap, grid: &RayGrid, pts: &[V3]) -> f64 {
+    if pts.is_empty() {
+        return 0.0;
+    }
+    let n = cap.normal;
+    let (a, b) = basis(n);
+    // a viewer may look from any direction within 60 degrees of the opening's normal
+    let dirs: Vec<V3> = {
+        let mut d = vec![n];
+        for tilt_deg in [25.0f64, 45.0, 60.0] {
+            let tilt = tilt_deg.to_radians();
+            for k in 0..8 {
+                let ang = std::f64::consts::TAU * k as f64 / 8.0;
+                let side = add(scale(a, ang.cos()), scale(b, ang.sin()));
+                d.push(normalize(add(scale(n, tilt.cos()), scale(side, tilt.sin()))));
+            }
+        }
+        d
+    };
+    let visible = pts
+        .iter()
+        .filter(|p| {
+            // start a hair in front of the cap so the cap's own rim does not block the ray
+            let o = add(**p, scale(n, 0.15));
+            dirs.iter().any(|d| !grid.any_hit(o, *d, 1.0e5))
+        })
+        .count();
+    visible as f64 / pts.len() as f64
+}
+
+/// Fraction (0..1) of the opening with open air continuing at least `min_depth` mm behind it (into the duct).
+/// A real opening leads into a channel; a recess or pocket in a face ends against a floor within a few mm.
+pub fn inward_clearance(cap: &PortCap, grid: &RayGrid, min_depth: f64) -> f64 {
+    let pts = cap_samples(cap);
+    if pts.is_empty() {
+        return 0.0;
+    }
+    let n = scale(cap.normal, -1.0); // into the duct
+    let (a, b) = basis(n);
+    let tilt = 20f64.to_radians();
+    let mut dirs = vec![n];
+    for k in 0..4 {
+        let ang = std::f64::consts::TAU * k as f64 / 4.0;
+        let side = add(scale(a, ang.cos()), scale(b, ang.sin()));
+        dirs.push(normalize(add(scale(n, tilt.cos()), scale(side, tilt.sin()))));
+    }
+    let ok = pts
+        .iter()
+        .filter(|p| {
+            let o = add(**p, scale(n, 0.2));
+            dirs.iter().any(|d| !grid.any_hit(o, *d, min_depth))
+        })
+        .count();
+    ok as f64 / pts.len() as f64
 }
 
 /// Uniform-grid acceleration for ray queries against a triangle mesh.
@@ -540,6 +621,12 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
         let interior: Vec<usize> = (0..cents.len()).filter(|&i| depth[i] >= 0.5 * dmax).collect();
         // the cap must run through air, not through the material
         let in_material = interior.iter().filter(|&&i| !grid.is_air(cents[i])).count();
+        c_cap += 1;
+        if in_material * 10 > interior.len() * 3 {
+            c_mat += 1;
+            if dbg { eprintln!("  rejected (cap inside material): perim {:.0} samples {} in material {}", l.perimeter, interior.len(), in_material); }
+            continue;
+        }
         let probe_base = cents[(0..cents.len()).max_by(|&a, &b| depth[a].partial_cmp(&depth[b]).unwrap()).unwrap()];
         let mut a_tot = 0.0;
         let mut n0 = [0.0; 3];
@@ -576,7 +663,7 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
         if confidence < prm.min_confidence { c_conf += 1; if dbg { eprintln!("  rejected: perim {:.0} area {:.0} enc lumen {:.1} open {:.1} (conf {:.2})", l.perimeter, a_tot, lumen_enc, open_enc, confidence); } continue; }
         let flip = dot(n0, n_out) < 0.0;
         let triangles: Vec<[V3; 3]> = tris.into_iter().map(|t| if flip { [t[0], t[2], t[1]] } else { t }).collect();
-        out.push(CurvedOpening { cap: PortCap { origin: ctr, normal: n_out, polygon: l.points.clone(), triangles }, perimeter: l.perimeter, planarity_dev: l.planarity_dev, confidence });
+        out.push(CurvedOpening { cap: PortCap { origin: ctr, normal: n_out, polygon: l.points.clone(), triangles, holes: vec![] }, perimeter: l.perimeter, planarity_dev: l.planarity_dev, confidence });
     }
     if dbg { eprintln!("cap tested {c_cap}, in material {c_mat}, solid on a side {c_air}, low confidence {c_conf}, accepted {}", out.len()); }
     // A rim has an outer and an inner edge loop around the same opening; keep the inner (smaller) one.

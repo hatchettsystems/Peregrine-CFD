@@ -49,3 +49,24 @@ fn curved_cap_gets_port_cells() {
     assert!((got - expect).abs() / expect < 0.25, "curved port cells {got} vs expected {expect}");
     assert_eq!(d.sealed_cells_removed, 0);
 }
+
+#[test]
+fn island_is_excluded_from_the_port_cells() {
+    use peregrine_core::PortCap;
+    let tube = shapes::hollow_tube(12.0, 8.0, 20.0);
+    let mut cap = find_port_candidates(&tube, 1.0).into_iter().find(|c| c.cap.normal[0] < 0.0).unwrap().cap;
+    let full = PortSpec { cap: cap.clone(), plug: true };
+    // a 4x4 island in the middle of the 8x8 opening
+    let h = 2.0;
+    cap.holes = vec![vec![[0.0, -h, -h], [0.0, h, -h], [0.0, h, h], [0.0, -h, h]]];
+    assert!((cap.area() - (64.0 - 16.0)).abs() < 1e-9, "area {}", cap.area());
+    let ring = PortSpec { cap, plug: true };
+    let mut b = tube.bounds().expanded(3.0);
+    b.min[0] -= 1.0;
+    let dx = 0.25;
+    let n_full = build_domain(&[&tube], &[full], &b, dx).port_cell_counts[0] as f64;
+    let n_ring = build_domain(&[&tube], &[ring], &b, dx).port_cell_counts[0] as f64;
+    assert!((n_full - 64.0 / (dx * dx)).abs() / (64.0 / (dx * dx)) < 0.1, "{n_full}");
+    assert!((n_ring - 48.0 / (dx * dx)).abs() / (48.0 / (dx * dx)) < 0.1, "ring cells {n_ring} vs {}", 48.0 / (dx * dx));
+    let _ = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![], triangles: vec![], holes: vec![] };
+}

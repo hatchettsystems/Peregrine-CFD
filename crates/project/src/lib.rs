@@ -130,6 +130,10 @@ pub struct Source {
     pub streamlines: usize,
 }
 
+fn default_seam_tolerance() -> f64 {
+    0.5
+}
+
 fn default_outlet_clearance() -> f64 {
     30.0
 }
@@ -172,11 +176,14 @@ pub struct DomainSettings {
     /// develop and converge before they reach the domain boundary.
     #[serde(default = "default_outlet_clearance")]
     pub outlet_clearance_mm: f64,
+    /// Gaps up to this size (mm) between two parts of the same duct are sealed. Larger gaps leak and are reported.
+    #[serde(default = "default_seam_tolerance")]
+    pub seam_tolerance_mm: f64,
     /// Faces in order -X, +X, -Y, +Y, -Z, +Z.
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -351,7 +358,7 @@ mod tests {
     }
     #[test]
     fn source_validation() {
-        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![] };
+        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![], holes: vec![] };
         let mut p = Project::new("g");
         p.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         p.ports.push(Port { name: "a".into(), body: "d".into(), kind: PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, cap: cap.clone() });
@@ -394,7 +401,7 @@ mod tests {
     #[test]
     fn curved_cap_survives_save_and_load() {
         let tri = [[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.5, 1.0, 1.5]];
-        let cap = PortCap { origin: [0.1, 0.9, 0.4], normal: [1.0, 0.0, 0.0], polygon: vec![tri[0], tri[1], tri[2]], triangles: vec![tri] };
+        let cap = PortCap { origin: [0.1, 0.9, 0.4], normal: [1.0, 0.0, 0.0], polygon: vec![tri[0], tri[1], tri[2]], triangles: vec![tri], holes: vec![] };
         let mut p = Project::new("c");
         p.ports.push(Port { name: "scoop".into(), body: "duct".into(), kind: PortKind::PressureOutlet { pressure: 0.0 }, cap });
         let q: Project = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
@@ -407,7 +414,7 @@ mod tests {
     fn roundtrip() {
         let mut p = Project::new("t");
         p.ports.push(Port { name: "in".into(), body: "duct".into(), kind: PortKind::FanInlet { curve: vec![(0.0, 300.0), (100.0, 0.0)] },
-            cap: PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![] } });
+            cap: PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![], holes: vec![] } });
         let s = toml::to_string_pretty(&p).unwrap();
         let q: Project = toml::from_str(&s).unwrap();
         assert_eq!(q.ports.len(), 1);

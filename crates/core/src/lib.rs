@@ -11,4 +11,4 @@ pub mod vec3;
 pub use mesh::{Aabb, TriMesh};
 pub use planar::{find_port_candidates, planar_regions, PlanarRegion, PortCandidate};
 pub use port_cap::PortCap;
-pub use rim::{cap_from_loop, find_curved_openings, find_curved_openings_with, smooth_region_loops, triangulate_loop, CurvedOpening, CurvedParams, RayGrid, RimLoop};
+pub use rim::{cap_from_loop, cap_from_loop_with_grid, external_visibility, inward_clearance, find_curved_openings, find_curved_openings_with, smooth_region_loops, triangulate_loop, CurvedOpening, CurvedParams, RayGrid, RimLoop};

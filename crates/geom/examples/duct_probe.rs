@@ -12,6 +12,6 @@ fn main() {
     println!("{} openings in {:.1}s", c.len(), t.elapsed().as_secs_f64());
     for (i, (_, x)) in c.iter().enumerate() {
         let ctr = x.cap.centroid();
-        println!("#{i}: {:>8.1} mm2 {}  centre ({:.1},{:.1},{:.1}) normal ({:.2},{:.2},{:.2})", x.area, if x.cap.is_surface() { "curved" } else { "flat  " }, ctr[0], ctr[1], ctr[2], x.cap.normal[0], x.cap.normal[1], x.cap.normal[2]);
+        println!("#{i}: {:>8.1} mm2 {} islands {} visible {:>3.0}% clear {:>3.0}%  centre ({:.1},{:.1},{:.1}) normal ({:.2},{:.2},{:.2})", x.area, if x.cap.is_surface() { "curved" } else { "flat  " }, x.cap.holes.len(), x.visibility * 100.0, x.clearance * 100.0, ctr[0], ctr[1], ctr[2], x.cap.normal[0], x.cap.normal[1], x.cap.normal[2]);
     }
 }

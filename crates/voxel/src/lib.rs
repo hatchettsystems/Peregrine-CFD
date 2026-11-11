@@ -127,18 +127,41 @@ pub struct Domain {
 }
 
 pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
+    build_domain_ext(solids, &[], 0.0, ports, bounds, dx)
+}
+
+/// Like [`build_domain`], with seam sealing. `groups` lists, per duct, the indices (into `solids`) of the parts
+/// that form that duct. A fluid cell squeezed between two DIFFERENT parts of the same duct, at most
+/// `seam_tol_mm` apart along an axis, is filled, so small gaps between parts do not leak.
+pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
     assert!(ports.len() <= (255 - PORT_BASE as usize), "too many ports");
     let grid = Grid::from_bounds(bounds, dx);
     let mut cells = vec![FLUID; grid.len()];
+    let mut label = vec![u16::MAX; grid.len()]; // which solid first claimed each solid cell
     let mut odd_columns = 0;
-    for m in solids {
+    for (si, m) in solids.iter().enumerate() {
         let (inside, odd) = voxelize_inside(m, &grid);
         odd_columns += odd;
-        for (c, i) in cells.iter_mut().zip(inside) {
+        for (k, i) in inside.into_iter().enumerate() {
             if i {
-                *c = SOLID;
+                cells[k] = SOLID;
+                if label[k] == u16::MAX {
+                    label[k] = si as u16;
+                }
             }
         }
+    }
+    if seam_tol_mm > 0.0 && groups.iter().any(|g| g.len() >= 2) {
+        let reach = ((seam_tol_mm / dx).ceil() as usize).max(1);
+        let mut group_of = vec![usize::MAX; solids.len()];
+        for (gi, g) in groups.iter().enumerate() {
+            if g.len() >= 2 {
+                for &si in g {
+                    if si < group_of.len() { group_of[si] = gi; }
+                }
+            }
+        }
+        seal_seams(&grid, &mut cells, &label, &group_of, reach);
     }
     let [nx, ny, nz] = grid.dims;
     let mut counts = vec![0usize; ports.len()];
@@ -148,6 +171,7 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
             continue;
         }
         let poly = p.cap.polygon_2d();
+        let holes = p.cap.holes_2d();
         let mut bb = Aabb::empty();
         for v in &p.cap.polygon {
             bb.grow(*v);
@@ -159,7 +183,7 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
             for y in lo[1]..hi[1] {
                 for x in lo[0]..hi[0] {
                     let c = grid.center(x, y, z);
-                    if !p.cap.contains_projected(&poly, c) {
+                    if !p.cap.contains_in_opening(&poly, &holes, c) {
                         continue;
                     }
                     let d = p.cap.height(c);
@@ -264,4 +288,131 @@ fn mark_surface_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug
         }
     }
     count
+}
+
+/// Result of [`leak_check`].
+#[derive(Clone, Debug)]
+pub struct Leak {
+    /// Domain-boundary cells reached from the inlets without passing through any port.
+    pub boundary_cells: usize,
+    /// Approximate place (mm) where the escaping air path leaves the duct region.
+    pub exit_point: V3,
+}
+
+/// Is the duct sealed except at its ports? Flood the air from the inlet cells, treating every port cell as a wall.
+/// If that air reaches the edge of the domain, it can leave through something that is not a port: a gap between
+/// parts, or an opening that was not defined as a port.
+pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
+    let g = &domain.grid;
+    let [nx, ny, nz] = g.dims;
+    let n = g.len();
+    let mut seen = vec![false; n];
+    let mut parent = vec![u32::MAX; n];
+    let mut stack: Vec<usize> = vec![];
+    // start from the fluid cells next to an inlet port cell
+    for i in 0..n {
+        if inlet_codes.contains(&domain.cells[i]) {
+            let [x, y, z] = g.xyz(i);
+            let mut push = |xx: usize, yy: usize, zz: usize| {
+                let j = g.idx(xx, yy, zz);
+                if !seen[j] && domain.cells[j] == FLUID {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            };
+            if x > 0 { push(x - 1, y, z); }
+            if x + 1 < nx { push(x + 1, y, z); }
+            if y > 0 { push(x, y - 1, z); }
+            if y + 1 < ny { push(x, y + 1, z); }
+            if z > 0 { push(x, y, z - 1); }
+            if z + 1 < nz { push(x, y, z + 1); }
+        }
+    }
+    let on_edge = |x: usize, y: usize, z: usize| x == 0 || y == 0 || z == 0 || x + 1 == nx || y + 1 == ny || z + 1 == nz;
+    let mut edge_hits = vec![];
+    while let Some(i) = stack.pop() {
+        let [x, y, z] = g.xyz(i);
+        if on_edge(x, y, z) {
+            edge_hits.push(i);
+            continue;
+        }
+        for (dx, dy, dz) in [(-1i32, 0i32, 0i32), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+            let (xx, yy, zz) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize, (z as i32 + dz) as usize);
+            let j = g.idx(xx, yy, zz);
+            if !seen[j] && domain.cells[j] == FLUID {
+                seen[j] = true;
+                parent[j] = i as u32;
+                stack.push(j);
+            }
+        }
+    }
+    if edge_hits.is_empty() {
+        return None;
+    }
+    // walk back from one escape cell to the first cell that lies inside the solid bodies' extent
+    let mut solid_lo = [usize::MAX; 3];
+    let mut solid_hi = [0usize; 3];
+    for i in 0..n {
+        if domain.cells[i] == SOLID {
+            let c = g.xyz(i);
+            for k in 0..3 { solid_lo[k] = solid_lo[k].min(c[k]); solid_hi[k] = solid_hi[k].max(c[k]); }
+        }
+    }
+    let mut cur = edge_hits[0];
+    let mut exit = cur;
+    loop {
+        let c = g.xyz(cur);
+        if (0..3).all(|k| c[k] >= solid_lo[k] && c[k] <= solid_hi[k]) {
+            exit = cur;
+            break;
+        }
+        if parent[cur] == u32::MAX { break; }
+        cur = parent[cur] as usize;
+    }
+    let [x, y, z] = g.xyz(exit);
+    Some(Leak { boundary_cells: edge_hits.len(), exit_point: g.center(x, y, z) })
+}
+
+/// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).
+fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize) {
+    let [nx, ny, nz] = grid.dims;
+    let mut fill: Vec<usize> = vec![];
+    let step_dirs: [(i32, i32, i32); 3] = [(1, 0, 0), (0, 1, 0), (0, 0, 1)];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = grid.idx(x, y, z);
+                if cells[i] != FLUID {
+                    continue;
+                }
+                'axes: for (dx_, dy_, dz_) in step_dirs {
+                    let find = |sign: i32| -> Option<u16> {
+                        for k in 1..=reach as i32 {
+                            let (xx, yy, zz) = (x as i32 + sign * k * dx_, y as i32 + sign * k * dy_, z as i32 + sign * k * dz_);
+                            if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 {
+                                return None;
+                            }
+                            let j = grid.idx(xx as usize, yy as usize, zz as usize);
+                            if cells[j] == SOLID {
+                                return Some(label[j]);
+                            }
+                            if cells[j] != FLUID {
+                                return None;
+                            }
+                        }
+                        None
+                    };
+                    if let (Some(a), Some(b)) = (find(-1), find(1)) {
+                        if a != b && a != u16::MAX && b != u16::MAX && group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize] {
+                            fill.push(i);
+                            break 'axes;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for i in fill {
+        cells[i] = SOLID;
+    }
 }

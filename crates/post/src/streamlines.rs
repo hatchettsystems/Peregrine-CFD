@@ -40,6 +40,7 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
         return seed_points_surface(cap, n, dx);
     }
     let poly = cap.polygon_2d();
+    let holes = cap.holes_2d();
     let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
     let mut ctr = [0.0; 2];
     for p in &poly {
@@ -84,7 +85,7 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
         while y < hi[1] {
             let mut x = lo[0] + h * 0.5;
             while x < hi[0] {
-                if point_in_polygon(&poly, [x, y]) {
+                if point_in_polygon(&poly, [x, y]) && !holes.iter().any(|h| point_in_polygon(h, [x, y])) {
                     pts.push([x, y]);
                 }
                 x += h;
@@ -313,7 +314,7 @@ mod tests {
 
     #[test]
     fn seeds_fill_the_opening() {
-        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, -5.0, -5.0], [0.0, 5.0, -5.0], [0.0, 5.0, 5.0], [0.0, -5.0, 5.0]], triangles: vec![] };
+        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, -5.0, -5.0], [0.0, 5.0, -5.0], [0.0, 5.0, 5.0], [0.0, -5.0, 5.0]], triangles: vec![], holes: vec![] };
         for n in [1usize, 5, 20, 60] {
             let s = seed_points(&cap, n, 0.5);
             assert!(!s.is_empty() && s.len() <= n, "n {n}: {}", s.len());

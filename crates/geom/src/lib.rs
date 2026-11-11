@@ -2,7 +2,7 @@
 use anyhow::{bail, Context, Result};
 use peregrine_core::{find_port_candidates, stl, Aabb, PortCandidate, TriMesh};
 use peregrine_project::{BodyRole, DuctDef, Project};
-use peregrine_voxel::{build_domain, Domain, PortSpec};
+use peregrine_voxel::{build_domain_ext, leak_check, Domain, PortSpec, PORT_BASE};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -115,12 +115,19 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                 let area = o.cap.area();
                 if area < min_area.max(8.0) { continue; }
                 let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
-                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), cap: o.cap };
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, cap: o.cap };
                 if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
                 planar_kept.push(cand);
             }
         }
-        for c in planar_kept {
+        // A loop lying inside another coplanar, same-facing loop is an island of the larger opening (a hub or
+        // boss): subtract it, so the opening is the area BETWEEN the loops.
+        nest_islands(&mut planar_kept);
+        // an opening that admits air must be visible from outside the duct
+        let grid = peregrine_core::RayGrid::new(&mesh);
+        for mut c in planar_kept {
+            c.visibility = peregrine_core::external_visibility(&c.cap, &grid);
+            c.clearance = peregrine_core::inward_clearance(&c.cap, &grid, 5.0);
             out.push((d.name.clone(), c));
         }
     }
@@ -160,7 +167,15 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
     let meshes: Vec<&TriMesh> = active.iter().map(|b| &b.mesh).collect();
     let ports: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
     let bounds = project_bounds(project, bodies);
-    let d = build_domain(&meshes, &ports, &bounds, project.solver.cell_size_mm);
+    // parts of one duct: seal small gaps between them
+    let names: Vec<String> = active.iter().map(|b| b.name.clone()).collect();
+    let groups: Vec<Vec<usize>> = project
+        .effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>())
+        .iter()
+        .map(|d| d.parts.iter().filter_map(|p| names.iter().position(|n| n == p)).collect::<Vec<usize>>())
+        .filter(|g| g.len() >= 2)
+        .collect();
+    let d = build_domain_ext(&meshes, &groups, project.domain.seam_tolerance_mm, &ports, &bounds, project.solver.cell_size_mm);
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
         if *n == 0 {
             bail!("port '{}' covers no cells at {} mm; refine the grid or check the cap", p.name, project.solver.cell_size_mm);
@@ -220,6 +235,28 @@ mod tests {
     }
 
     #[test]
+    fn inner_loop_becomes_an_island_of_the_outer_opening() {
+        use peregrine_core::shapes;
+        // an 8x8 opening with a smaller coplanar loop (a hub bore) inside it
+        let bodies = vec![
+            Body { name: "shell".into(), role: BodyRole::Solid, mesh: shapes::hollow_tube(12.0, 8.0, 10.0) },
+            Body { name: "hub".into(), role: BodyRole::Solid, mesh: shapes::hollow_tube(5.0, 3.0, 10.0) },
+        ];
+        let ducts = vec![DuctDef { name: "d".into(), parts: vec!["shell".into(), "hub".into()] }];
+        let c = duct_port_candidates(&bodies, &ducts, 1.0, None, false);
+        // find the outer opening at x = 0 (normal -x) with the larger area
+        let outer = c.iter().filter(|x| x.1.cap.normal[0] < -0.99).max_by(|a, b| (a.1.cap.polygon.len(), a.1.area).partial_cmp(&(b.1.cap.polygon.len(), b.1.area)).unwrap()).unwrap();
+        let big = c.iter().filter(|x| x.1.cap.normal[0] < -0.99 && !x.1.cap.holes.is_empty()).collect::<Vec<_>>();
+        assert_eq!(big.len(), 1, "{:?}", c.iter().map(|x| (x.1.area, x.1.cap.holes.len())).collect::<Vec<_>>());
+        let a = &big[0].1;
+        assert!((a.area - (64.0 - 9.0)).abs() < 0.01, "outer opening should be 64 - 9 = 55 mm2, got {}", a.area);
+        assert_eq!(a.cap.holes.len(), 1);
+        let _ = outer;
+        // the inner loop stays available as its own opening
+        assert!(c.iter().any(|x| (x.1.area - 9.0).abs() < 0.01));
+    }
+
+    #[test]
     fn roles_follow_user_ducts() {
         use peregrine_core::shapes;
         let mut p = Project::new("t");
@@ -234,5 +271,56 @@ mod tests {
         apply_roles(&p, &mut bodies, false);
         assert_eq!(bodies[1].role, BodyRole::Duct);
         assert_eq!(bodies[0].role, BodyRole::Solid);
+    }
+}
+
+
+/// A warning when air can leave the duct through something that is not a port (a gap between parts wider than the
+/// seam tolerance, or an opening that was not defined as a port).
+pub fn leak_warning(project: &Project, domain: &Domain) -> Option<String> {
+    let inlets: Vec<u8> = project.ports.iter().enumerate().filter(|(_, p)| p.kind.is_inlet()).map(|(k, _)| PORT_BASE + k as u8).collect();
+    let leak = leak_check(domain, &inlets)?;
+    let p = leak.exit_point;
+    Some(format!(
+        "Air can leave the duct through something that is not a port, near ({:.1}, {:.1}, {:.1}) mm: a gap between parts wider than {:.1} mm, or an opening you did not define as a port. Seal it, or define it as a port.",
+        p[0], p[1], p[2], project.domain.seam_tolerance_mm
+    ))
+}
+
+/// True for an opening that admits air: visible from outside the duct and leading into a channel (not a pocket).
+pub fn is_real_opening(c: &PortCandidate) -> bool {
+    c.visibility >= 0.5 && c.clearance >= 0.5
+}
+
+/// Make every planar opening that lies wholly inside another coplanar, same-facing opening an island of it.
+fn nest_islands(cands: &mut [PortCandidate]) {
+    use peregrine_core::port_cap::point_in_polygon;
+    use peregrine_core::vec3::{dot, sub};
+    for a in 0..cands.len() {
+        if cands[a].cap.is_surface() {
+            continue;
+        }
+        let poly_a = cands[a].cap.polygon_2d();
+        let mut islands: Vec<Vec<peregrine_core::vec3::V3>> = vec![];
+        for b in 0..cands.len() {
+            if a == b || cands[b].cap.is_surface() || cands[b].cap.area() >= cands[a].cap.area() {
+                continue;
+            }
+            let (ca, cb) = (&cands[a].cap, &cands[b].cap);
+            let same_plane = dot(ca.normal, cb.normal) > 0.999 && dot(sub(cb.origin, ca.origin), ca.normal).abs() < 0.05;
+            if !same_plane {
+                continue;
+            }
+            let inside = cb.polygon.iter().all(|p| point_in_polygon(&poly_a, ca.project2d(*p)));
+            if inside {
+                islands.push(cb.polygon.clone());
+            }
+        }
+        if !islands.is_empty() {
+            cands[a].cap.holes = islands;
+            let area = cands[a].cap.area();
+            cands[a].area = area;
+            cands[a].equiv_diameter = 2.0 * (area / std::f64::consts::PI).sqrt();
+        }
     }
 }
