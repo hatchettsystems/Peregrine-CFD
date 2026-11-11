@@ -134,11 +134,11 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
 /// that form that duct. A fluid cell squeezed between two DIFFERENT parts of the same duct, at most
 /// `seam_tol_mm` apart along an axis, is filled, so small gaps between parts do not leak.
 pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
-    build_domain_full(solids, groups, seam_tol_mm, ports, &[], bounds, dx)
+    build_domain_full(solids, groups, seam_tol_mm, ports, &[], &[], bounds, dx)
 }
 
 /// Like [`build_domain_ext`], and every cap in `blockers` is filled solid (a shut opening: screw hole, vent...).
-pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], blockers: &[PortCap], bounds: &Aabb, dx: f64) -> Domain {
+pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], blockers: &[PortCap], plugs: &[(V3, f64)], bounds: &Aabb, dx: f64) -> Domain {
     assert!(ports.len() <= (255 - PORT_BASE as usize), "too many ports");
     let grid = Grid::from_bounds(bounds, dx);
     let mut cells = vec![FLUID; grid.len()];
@@ -169,6 +169,21 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
         seal_seams(&grid, &mut cells, &label, &group_of, reach);
     }
     let [nx, ny, nz] = grid.dims;
+    // sphere plugs (a leak the user sealed at its narrowest point)
+    for (c, r) in plugs {
+        let lo = [0, 1, 2].map(|i| (((c[i] - r - grid.origin[i]) / dx).floor().max(0.0)) as usize);
+        let hi = [0, 1, 2].map(|i| ((((c[i] + r - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
+        for z in lo[2]..hi[2] {
+            for y in lo[1]..hi[1] {
+                for x in lo[0]..hi[0] {
+                    let i = grid.idx(x, y, z);
+                    if cells[i] == FLUID && len(sub(grid.center(x, y, z), *c)) <= *r {
+                        cells[i] = SOLID;
+                    }
+                }
+            }
+        }
+    }
     // shut openings first, so nothing can flow through them
     for cap in blockers {
         mark_cap(&grid, &mut cells, cap, SOLID, true);
@@ -366,6 +381,9 @@ pub struct Leak {
     pub boundary_cells: usize,
     /// Approximate place (mm) where the escaping air path leaves the duct region.
     pub exit_point: V3,
+    /// Narrowest point (mm) of the escape path, and the width (mm) of the gap there.
+    pub throat: V3,
+    pub throat_width: f64,
 }
 
 /// Is the duct sealed except at its ports? Flood the air from the inlet cells, treating every port cell as a wall.
@@ -377,7 +395,7 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
     let n = g.len();
     let mut seen = vec![false; n];
     let mut parent = vec![u32::MAX; n];
-    let mut stack: Vec<usize> = vec![];
+    let mut stack: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // start from the fluid cells next to an inlet port cell
     for i in 0..n {
         if inlet_codes.contains(&domain.cells[i]) {
@@ -386,7 +404,7 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
                 let j = g.idx(xx, yy, zz);
                 if !seen[j] && domain.cells[j] == FLUID {
                     seen[j] = true;
-                    stack.push(j);
+                    stack.push_back(j);
                 }
             };
             if x > 0 { push(x - 1, y, z); }
@@ -399,7 +417,7 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
     }
     let on_edge = |x: usize, y: usize, z: usize| x == 0 || y == 0 || z == 0 || x + 1 == nx || y + 1 == ny || z + 1 == nz;
     let mut edge_hits = vec![];
-    while let Some(i) = stack.pop() {
+    while let Some(i) = stack.pop_front() {
         let [x, y, z] = g.xyz(i);
         if on_edge(x, y, z) {
             edge_hits.push(i);
@@ -411,7 +429,7 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
             if !seen[j] && domain.cells[j] == FLUID {
                 seen[j] = true;
                 parent[j] = i as u32;
-                stack.push(j);
+                stack.push_back(j);
             }
         }
     }
@@ -439,7 +457,42 @@ pub fn leak_check(domain: &Domain, inlet_codes: &[u8]) -> Option<Leak> {
         cur = parent[cur] as usize;
     }
     let [x, y, z] = g.xyz(exit);
-    Some(Leak { boundary_cells: edge_hits.len(), exit_point: g.center(x, y, z) })
+    // narrowest point of the whole escape path (skipping the first stretch next to the inlet)
+    let mut path = vec![edge_hits[0]];
+    let mut cur = edge_hits[0];
+    while parent[cur] != u32::MAX {
+        cur = parent[cur] as usize;
+        path.push(cur);
+    }
+    path.reverse();
+    let skip = (path.len() / 8).max(3).min(path.len().saturating_sub(1));
+    let clearance = |i: usize| -> f64 {
+        let [cx, cy, cz] = g.xyz(i);
+        let r = 8i32;
+        let mut best = f64::MAX;
+        for dz in -r..=r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (xx, yy, zz) = (cx as i32 + dx, cy as i32 + dy, cz as i32 + dz);
+                    if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 { continue; }
+                    if domain.cells[g.idx(xx as usize, yy as usize, zz as usize)] != FLUID {
+                        best = best.min(((dx * dx + dy * dy + dz * dz) as f64).sqrt());
+                    }
+                }
+            }
+        }
+        if best == f64::MAX { r as f64 } else { best }
+    };
+    let mut throat = path[path.len() - 1];
+    let mut tw = f64::MAX;
+    for &i in &path[skip..] {
+        let c = g.xyz(i);
+        if !(0..3).all(|k| c[k] >= solid_lo[k] && c[k] <= solid_hi[k]) { continue; }
+        let w = clearance(i);
+        if w <= tw { tw = w; throat = i; }
+    }
+    let [tx, ty, tz] = g.xyz(throat);
+    Some(Leak { boundary_cells: edge_hits.len(), exit_point: g.center(x, y, z), throat: g.center(tx, ty, tz), throat_width: if tw == f64::MAX { 2.0 * g.dx } else { 2.0 * tw * g.dx } })
 }
 
 /// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).

@@ -213,6 +213,14 @@ pub struct Blocker {
     pub cap: PortCap,
 }
 
+/// A small solid sphere that seals a leak at its narrowest point.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Plug {
+    pub name: String,
+    pub center: [f64; 3],
+    pub radius_mm: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -236,6 +244,9 @@ pub struct Project {
     /// Openings the user has shut (screw holes and the like).
     #[serde(default)]
     pub blockers: Vec<Blocker>,
+    /// Leaks the user sealed with a plug.
+    #[serde(default)]
+    pub plugs: Vec<Plug>,
 }
 
 impl Project {
@@ -342,6 +353,7 @@ impl Project {
             ports: vec![],
             sources: vec![],
             blockers: vec![],
+            plugs: vec![],
         }
     }
     pub fn load(path: &Path) -> anyhow::Result<Project> {

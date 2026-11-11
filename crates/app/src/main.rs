@@ -207,6 +207,8 @@ struct App {
     detect_curved: bool,
     show_hidden: bool,
     tut: Option<usize>,
+    leak_notes: Vec<String>,
+    plug_radius: f64,
     show_markers: bool,
     focus_issue: Option<String>,
     show_ports: bool,
@@ -331,6 +333,8 @@ impl App {
             detect_curved: true,
             show_hidden: false,
             tut: None,
+            leak_notes: vec![],
+            plug_radius: 3.0,
             show_markers: true,
             focus_issue: None,
             show_ports: true,
@@ -997,6 +1001,7 @@ impl App {
                 if ui.button("Re-detect port candidates").clicked() { self.refresh_candidates(); ui.close_menu(); }
             });
             ui.menu_button("Simulation", |ui| {
+                if ui.button("Check for leaks").clicked() { self.check_leaks(); self.tab = Tab::Exceptions; ui.close_menu(); }
                 let running = self.running();
                 if ui.add_enabled(!running, egui::Button::new("Run")).clicked() { self.start_run(); ui.close_menu(); }
                 if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
@@ -1453,6 +1458,16 @@ impl App {
             });
         }
         if let Some(i) = remove { self.remove_blocker(i); }
+        let mut rm_plug = None;
+        for (i, p) in self.project.plugs.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("o").color(Color32::from_rgb(0xE0, 0x4A, 0x4A)));
+                ui.label(format!("{} ({:.1}, {:.1}, {:.1})", p.name, p.center[0], p.center[1], p.center[2]));
+                ui.add(egui::DragValue::new(&mut p.radius_mm).speed(0.1).range(0.3..=20.0).prefix("r ").suffix(" mm"));
+                if ui.small_button("Remove").clicked() { rm_plug = Some(i); }
+            });
+        }
+        if let Some(i) = rm_plug { self.project.plugs.remove(i); }
     }
 
     fn sources_ui(&mut self, ui: &mut egui::Ui) {
@@ -1655,7 +1670,30 @@ impl App {
     }
 
     fn current_issues(&self) -> Vec<Issue> {
-        match &self.last { Some(s) => issues_of(&s.lock().unwrap(), &self.project), None => vec![] }
+        let mut v: Vec<Issue> = self.leak_notes.iter().map(|m| classify_issue(m)).collect();
+        if let Some(s) = &self.last { v.extend(issues_of(&s.lock().unwrap(), &self.project)); }
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|i| seen.insert(i.title.clone()));
+        v.sort_by(|a, b| b.sev.cmp(&a.sev));
+        v
+    }
+
+    /// Voxelize at the current settings and look for air escaping through anything that is not a port.
+    fn check_leaks(&mut self) {
+        if self.bodies.is_empty() || self.project.ports.is_empty() { self.status = "Define the duct and its ports first.".into(); return; }
+        match build_project_domain(&self.project, &self.bodies) {
+            Ok(d) => match peregrine_geom::leak_warning(&self.project, &d) {
+                Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes = vec![m]; }
+                None => { self.status = "No leaks: the duct is sealed except at its ports.".into(); self.leak_notes.clear(); }
+            },
+            Err(e) => self.status = format!("Leak check failed: {e:#}"),
+        }
+    }
+
+    fn add_plug(&mut self, at: [f64; 3]) {
+        let name = Self::unique_name(|n| self.project.plugs.iter().any(|p| p.name == n), "plug");
+        self.project.plugs.push(peregrine_project::Plug { name, center: at, radius_mm: self.plug_radius });
+        self.check_leaks();
     }
 
     fn issue_counts(&self) -> (usize, usize) {
@@ -1664,6 +1702,9 @@ impl App {
     }
 
     fn exceptions_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Check for leaks").on_hover_text("Voxelize the duct and look for air escaping through anything that is not a port, without running the simulation").clicked() { self.check_leaks(); }
+        });
         let issues = self.current_issues();
         if issues.is_empty() {
             ui.label(egui::RichText::new(if self.last.is_some() { "No warnings or errors." } else { "Nothing to report yet. Warnings and errors from a run appear here." }).color(theme::TEXT_DIM));
@@ -1672,6 +1713,8 @@ impl App {
         ui.label(egui::RichText::new("Click an item to read the details.").color(theme::TEXT_DIM));
         ui.add_space(2.0);
         let mut locate: Option<[f64; 3]> = None;
+        let mut seal: Option<[f64; 3]> = None;
+        let mut plug_r = self.plug_radius;
         let focus = self.focus_issue.take();
         for (k, it) in issues.iter().enumerate() {
             let id = ui.make_persistent_id(("issue", &it.title, k));
@@ -1687,10 +1730,18 @@ impl App {
                 .body(|ui| {
                     ui.label(egui::RichText::new(&it.detail).color(theme::TEXT));
                     if let Some(p) = at {
-                        if ui.button("Show in 3D view").on_hover_text("Centre the view on the marker for this item").clicked() { locate = Some(p); }
+                        ui.horizontal(|ui| {
+                            if ui.button("Show in 3D view").on_hover_text("Centre the view on the marker for this item").clicked() { locate = Some(p); }
+                            if it.title.starts_with("Air leaks") {
+                                if ui.button("Seal this leak").on_hover_text("Adds a small solid plug at the marker and checks again").clicked() { seal = Some(p); }
+                                ui.add(egui::DragValue::new(&mut plug_r).speed(0.1).range(0.5..=15.0).prefix("r ").suffix(" mm"));
+                            }
+                        });
                     }
                 });
         }
+        self.plug_radius = plug_r;
+        if let Some(p) = seal { self.add_plug(p); }
         if let Some(p) = locate { self.cam.target = p; self.status = format!("Centred on ({:.1}, {:.1}, {:.1}) mm.", p[0], p[1], p[2]); }
     }
 
@@ -1875,6 +1926,16 @@ impl App {
                 if let Some((pos, _)) = self.cam.project(rect, b.cap.centroid()) {
                     painter.line_segment([pos + Vec2::new(-3.5, -3.5), pos + Vec2::new(3.5, 3.5)], Stroke::new(1.5, red));
                     painter.line_segment([pos + Vec2::new(-3.5, 3.5), pos + Vec2::new(3.5, -3.5)], Stroke::new(1.5, red));
+                }
+            }
+        }
+        if show_ports {
+            for p in &self.project.plugs {
+                if let Some((q, _)) = self.cam.project(rect, p.center) {
+                    let red = Color32::from_rgb(0xE0, 0x4A, 0x4A);
+                    painter.circle_stroke(q, 6.0, Stroke::new(2.0, red));
+                    painter.line_segment([q + Vec2::new(-3.0, -3.0), q + Vec2::new(3.0, 3.0)], Stroke::new(1.5, red));
+                    painter.line_segment([q + Vec2::new(-3.0, 3.0), q + Vec2::new(3.0, -3.0)], Stroke::new(1.5, red));
                 }
             }
         }
