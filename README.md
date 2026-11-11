@@ -14,6 +14,8 @@ Airflow simulation for 3D-printer part-cooling ducts, written in Rust.
   speed or source, and a Shaded / Ghost / Hidden mesh mode (key `M`) to see only the flow.
 - Small round holes (screw holes) are hidden from the opening list by default (adjustable diameter).
 - GPU lattice-Boltzmann solver (wgpu: DX12 / Vulkan / Metal) with a CPU fallback. Velocity and pressure only.
+- Tabs: each tab is an independent simulation (own geometry, ports, settings and run). Runs keep going in
+  background tabs; `Ctrl+T` new, `Ctrl+W` close, `Ctrl+Tab` next, and File > Duplicate This Tab to compare variants.
 - Photoshop-style dark UI with slice views, port report and VTK export.
 
 ![UI](docs/screenshot.png)

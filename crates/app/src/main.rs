@@ -22,6 +22,12 @@ use viewport::Camera;
 enum Tool { Orbit, Pan, PickPort, Slice }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results }
+/// What the active tab asks the tab shell to do after the frame.
+enum ShellCmd { New, Duplicate, Close(usize), Switch(usize) }
+
+#[derive(Clone)]
+struct TabInfo { title: String, running: bool }
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MeshMode { Shaded, Ghost, Hidden }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +94,10 @@ struct App {
     lines_vmax: f32,
     lines_request_sig: u64,
     lines_job: Option<std::sync::mpsc::Receiver<(u64, Vec<Streamline>)>>,
+    // tab shell plumbing
+    tab_infos: Vec<TabInfo>,
+    tab_active: usize,
+    cmds: Vec<ShellCmd>,
 }
 
 fn main() -> eframe::Result {
@@ -120,14 +130,14 @@ fn main() -> eframe::Result {
                 app.start_run();
             }
         }
-        Ok(Box::new(app))
+        Ok(Box::new(Shell { docs: vec![app], active: 0, counter: 1 }))
     }))
 }
 
 impl App {
     fn new() -> App {
         App {
-            project: Project::new("untitled"),
+            project: Project::new("untitled 1"),
             project_path: None,
             bodies: vec![],
             visible: vec![],
@@ -156,6 +166,9 @@ impl App {
             lines_vmax: 1.0,
             lines_request_sig: 0,
             lines_job: None,
+            tab_infos: vec![],
+            tab_active: 0,
+            cmds: vec![],
         }
     }
 
@@ -208,6 +221,9 @@ impl App {
             Ok(b) => {
                 let n = b.len();
                 self.project.geometry_file = Some(path.clone());
+                if self.project.name.starts_with("untitled") {
+                    if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) { self.project.name = stem.to_string(); }
+                }
                 self.set_bodies(b);
                 self.status = format!("Loaded {n} bodies from {}", path.display());
             }
@@ -418,6 +434,10 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("New Simulation Tab   Ctrl+T").clicked() { self.cmds.push(ShellCmd::New); ui.close_menu(); }
+                if ui.button("Duplicate This Tab").on_hover_text("Copy geometry, ports and settings into a new tab to try a variation").clicked() { self.cmds.push(ShellCmd::Duplicate); ui.close_menu(); }
+                if ui.button("Close Tab   Ctrl+W").clicked() { self.cmds.push(ShellCmd::Close(self.tab_active)); ui.close_menu(); }
+                ui.separator();
                 if ui.button("Open Geometry (STL file)...").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Geometry", &["stl", "step", "stp"]).pick_file() { self.open_geometry(p); }
                     ui.close_menu();
@@ -1212,15 +1232,76 @@ fn draw_tool_icon(p: &egui::Painter, r: Rect, t: Tool) {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    /// Per-frame upkeep that must also run for tabs that are not on screen (streamline jobs, run bookkeeping).
+    fn background(&mut self, ctx: &egui::Context) {
         self.update_lines();
         if self.running() || self.lines_job.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+        if let Some(r) = &self.run {
+            let s = r.snap.lock().unwrap();
+            if s.finished {
+                let msg = match &s.error { Some(e) => format!("Run failed: {e}"), None => format!("Run complete ({} steps)", s.step) };
+                drop(s);
+                self.status = msg;
+                self.run = None;
+            }
+        }
+    }
+
+    fn title(&self) -> String { self.project.name.clone() }
+
+    /// A new tab with the same geometry, ports and settings but no results.
+    fn duplicate(&self) -> App {
+        let mut a = App::new();
+        a.project = self.project.clone();
+        a.project.name = format!("{} copy", self.project.name);
+        a.bodies = self.bodies.clone();
+        a.visible = self.visible.clone();
+        a.candidates = self.candidates.clone();
+        a.cam = self.cam.clone();
+        a.backend = self.backend;
+        a.mesh_mode = self.mesh_mode;
+        a.hide_screws = self.hide_screws;
+        a.screw_max_d = self.screw_max_d;
+        a.status = "Duplicated tab: change the settings and press Run to compare.".into();
+        a
+    }
+
+    fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        let infos = self.tab_infos.clone();
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (i, t) in infos.iter().enumerate() {
+                let active = i == self.tab_active;
+                let fill = if active { theme::APP_BG } else { theme::BAR };
+                egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, if active { theme::ACCENT } else { theme::BORDER })).corner_radius(egui::CornerRadius::same(2)).inner_margin(egui::Margin::symmetric(6, 1)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if t.running {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 3.5, theme::ACCENT);
+                            resp.on_hover_text("Simulation running");
+                        }
+                        let title = egui::RichText::new(&t.title).color(if active { Color32::WHITE } else { theme::TEXT_DIM });
+                        if ui.add(egui::Button::new(title).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() && !active { self.cmds.push(ShellCmd::Switch(i)); }
+                        if ui.add(egui::Button::new("×").small().fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).on_hover_text("Close tab (stops its run)").clicked() { self.cmds.push(ShellCmd::Close(i)); }
+                    });
+                });
+            }
+            if ui.add(egui::Button::new("+").fill(theme::BAR)).on_hover_text("New simulation tab (Ctrl+T)").clicked() { self.cmds.push(ShellCmd::New); }
+        });
+    }
+
+    fn ui(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::T) { self.cmds.push(ShellCmd::New); }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::W) { self.cmds.push(ShellCmd::Close(self.tab_active)); }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Tab) && !self.tab_infos.is_empty() { self.cmds.push(ShellCmd::Switch((self.tab_active + 1) % self.tab_infos.len())); }
+            if i.modifiers.ctrl { return; }
             if i.key_pressed(egui::Key::O) { self.tool = Tool::Orbit; }
             if i.key_pressed(egui::Key::H) { self.tool = Tool::Pan; }
             if i.key_pressed(egui::Key::P) { self.tool = Tool::PickPort; }
-            if i.key_pressed(egui::Key::S) && !i.modifiers.ctrl { self.tool = Tool::Slice; }
+            if i.key_pressed(egui::Key::S) { self.tool = Tool::Slice; }
             if i.key_pressed(egui::Key::M) {
                 self.mesh_mode = match self.mesh_mode { MeshMode::Shaded => MeshMode::Ghost, MeshMode::Ghost => MeshMode::Hidden, MeshMode::Hidden => MeshMode::Shaded };
             }
@@ -1228,6 +1309,10 @@ impl eframe::App for App {
         let bar = egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(8, 3)).stroke(Stroke::new(1.0, theme::BORDER));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("options").frame(bar).exact_height(30.0).show(ctx, |ui| self.options_bar(ui));
+        egui::TopBottomPanel::top("tabs")
+            .frame(egui::Frame::new().fill(theme::DEEP).inner_margin(egui::Margin::symmetric(6, 2)).stroke(Stroke::new(1.0, theme::BORDER)))
+            .exact_height(30.0)
+            .show(ctx, |ui| self.tab_strip(ui));
         egui::TopBottomPanel::bottom("status").frame(bar).exact_height(22.0).show(ctx, |ui| self.status_bar(ui));
         egui::SidePanel::left("tools").exact_width(40.0).resizable(false)
             .frame(egui::Frame::new().fill(theme::APP_BG).stroke(Stroke::new(1.0, theme::BORDER))).show(ctx, |ui| self.tool_palette(ui));
@@ -1248,14 +1333,57 @@ impl eframe::App for App {
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::CANVAS)).show(ctx, |ui| self.viewport_ui(ui));
-        // finish bookkeeping
-        if let Some(r) = &self.run {
-            let s = r.snap.lock().unwrap();
-            if s.finished {
-                let msg = match &s.error { Some(e) => format!("Run failed: {e}"), None => format!("Run complete ({} steps)", s.step) };
-                drop(s);
-                self.status = msg;
-                self.run = None;
+    }
+}
+
+/// Tabbed workspace: every tab is an independent simulation (own geometry, ports, settings, run and results).
+struct Shell {
+    docs: Vec<App>,
+    active: usize,
+    counter: usize,
+}
+
+impl Shell {
+    fn new_doc(&mut self) -> App {
+        self.counter += 1;
+        let mut a = App::new();
+        a.project.name = format!("untitled {}", self.counter);
+        a
+    }
+
+    fn close(&mut self, i: usize) {
+        if i >= self.docs.len() { return; }
+        if let Some(r) = &self.docs[i].run { r.stop.store(true, Ordering::Relaxed); }
+        self.docs.remove(i);
+        if self.docs.is_empty() {
+            let d = self.new_doc();
+            self.docs.push(d);
+            self.active = 0;
+        } else if i < self.active || self.active >= self.docs.len() {
+            self.active = self.active.saturating_sub(1).min(self.docs.len() - 1);
+        }
+    }
+}
+
+impl eframe::App for Shell {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        for d in &mut self.docs { d.background(ctx); }
+        self.active = self.active.min(self.docs.len() - 1);
+        let infos: Vec<TabInfo> = self.docs.iter().map(|d| TabInfo { title: d.title(), running: d.running() }).collect();
+        let active = self.active;
+        {
+            let d = &mut self.docs[active];
+            d.tab_infos = infos;
+            d.tab_active = active;
+            d.ui(ctx);
+        }
+        let cmds = std::mem::take(&mut self.docs[active].cmds);
+        for c in cmds {
+            match c {
+                ShellCmd::New => { let d = self.new_doc(); self.docs.push(d); self.active = self.docs.len() - 1; }
+                ShellCmd::Duplicate => { let d = self.docs[self.active].duplicate(); self.docs.push(d); self.active = self.docs.len() - 1; }
+                ShellCmd::Close(i) => self.close(i),
+                ShellCmd::Switch(i) => { if i < self.docs.len() { self.active = i; } }
             }
         }
     }
