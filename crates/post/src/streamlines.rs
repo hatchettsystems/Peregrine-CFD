@@ -30,17 +30,20 @@ pub struct SeedSpec {
     pub caps: Vec<(PortCap, usize)>,
 }
 
-/// Evenly spread `n` points over the opening, nudged 1.5 cells into the duct.
+/// Spread `n` points over the opening, nudged 1.5 cells into the duct. Large counts also get a ring of
+/// seeds hugging the edge of the opening, where walls, scoops and ramps act on the flow.
 pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
     if n == 0 || cap.polygon.len() < 3 {
         return vec![];
     }
     let poly = cap.polygon_2d();
     let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    let mut ctr = [0.0; 2];
     for p in &poly {
         for k in 0..2 {
             lo[k] = lo[k].min(p[k]);
             hi[k] = hi[k].max(p[k]);
+            ctr[k] += p[k] / poly.len() as f64;
         }
     }
     let (u, v) = cap.basis();
@@ -48,9 +51,30 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
         let on_plane = add(cap.origin, add(scale(u, p[0]), scale(v, p[1])));
         sub(on_plane, scale(cap.normal, 1.5 * dx))
     };
+    // edge ring: evenly spaced along the outline, pulled one cell towards the centre
+    let ring_n = if n >= 8 { (n / 4).max(6) } else { 0 };
+    let mut ring: Vec<[f64; 2]> = vec![];
+    if ring_n > 0 {
+        let m = poly.len();
+        let seg: Vec<f64> = (0..m).map(|i| { let (a, b) = (poly[i], poly[(i + 1) % m]); ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() }).collect();
+        let perim: f64 = seg.iter().sum();
+        for k in 0..ring_n {
+            let mut t = perim * (k as f64 + 0.5) / ring_n as f64;
+            let mut i = 0;
+            while i + 1 < m && t > seg[i] { t -= seg[i]; i += 1; }
+            let (a, b) = (poly[i], poly[(i + 1) % m]);
+            let f = if seg[i] > 0.0 { t / seg[i] } else { 0.0 };
+            let q = [a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])];
+            let d = [ctr[0] - q[0], ctr[1] - q[1]];
+            let dl = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+            let inset = dx.min(dl * 0.5);
+            ring.push([q[0] + d[0] / dl * inset, q[1] + d[1] / dl * inset]);
+        }
+    }
+    let n_inner = n - ring.len();
     let area = cap.area().max(1e-9);
-    let mut h = (area / n as f64).sqrt();
-    let mut best: Vec<[f64; 2]> = vec![];
+    let mut h = (area / n_inner.max(1) as f64).sqrt();
+    let mut inner: Vec<[f64; 2]> = vec![];
     for _ in 0..24 {
         let mut pts = vec![];
         let mut y = lo[1] + h * 0.5;
@@ -64,19 +88,18 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
             }
             y += h;
         }
-        if pts.len() >= n || h < dx * 0.05 {
-            // thin evenly down to n
-            if pts.len() > n {
-                let step = pts.len() as f64 / n as f64;
-                pts = (0..n).map(|i| pts[(i as f64 * step) as usize]).collect();
+        if pts.len() >= n_inner || h < dx * 0.05 {
+            if pts.len() > n_inner && n_inner > 0 {
+                let step = pts.len() as f64 / n_inner as f64;
+                pts = (0..n_inner).map(|i| pts[(i as f64 * step) as usize]).collect();
             }
-            best = pts;
+            inner = pts;
             break;
         }
-        best = pts;
+        inner = pts;
         h *= 0.8;
     }
-    best.into_iter().map(to3).collect()
+    inner.into_iter().chain(ring).map(to3).collect()
 }
 
 fn cell_index(f: &VelocityField, p: V3) -> Option<usize> {
@@ -151,13 +174,27 @@ pub fn trace(f: &VelocityField, seed: V3, source: usize, max_len: f64) -> Option
     if line.pts.len() >= 3 { Some(line) } else { None }
 }
 
-/// Trace all requested seeds in parallel.
+/// Trace all requested seeds in parallel. Seeds that start inside a (voxelised) wall are moved towards
+/// the centre of their opening until they sit in fluid, instead of being dropped.
 pub fn streamlines(f: &VelocityField, specs: &[SeedSpec], max_len: f64) -> Vec<Streamline> {
     let mut seeds: Vec<(usize, V3)> = vec![];
     for s in specs {
         for (cap, n) in &s.caps {
+            let centre = cap.centroid();
             for p in seed_points(cap, *n, f.dx) {
-                seeds.push((s.source, p));
+                let mut q = p;
+                let mut ok = false;
+                for _ in 0..10 {
+                    match cell_index(f, q) {
+                        Some(i) if f.cells[i] != 1 => { ok = true; break; }
+                        None => break,
+                        _ => {}
+                    }
+                    q = add(q, scale(normalize(sub(centre, q)), 0.5 * f.dx));
+                }
+                if ok {
+                    seeds.push((s.source, q));
+                }
             }
         }
     }
@@ -207,6 +244,11 @@ mod tests {
             let s = seed_points(&cap, n, 0.5);
             assert!(!s.is_empty() && s.len() <= n, "n {n}: {}", s.len());
             assert!(s.len() as f64 >= 0.5 * n as f64, "n {n}: {}", s.len());
+            if n >= 20 {
+                // some seeds must sit close to the edge of the 10x10 opening
+                let edge = s.iter().filter(|p| p[1].abs().max(p[2].abs()) > 4.0).count();
+                assert!(edge >= n / 6, "n {n}: only {edge} near the edge");
+            }
             for p in &s {
                 assert!((p[0] + 0.75).abs() < 1e-9, "inside the duct (-x side): {p:?}");
                 assert!(p[1].abs() <= 5.0 && p[2].abs() <= 5.0);

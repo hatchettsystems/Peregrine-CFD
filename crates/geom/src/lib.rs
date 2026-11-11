@@ -82,6 +82,20 @@ pub fn domain_bounds(bodies: &[Body], padding: f64) -> Aabb {
     b.expanded(padding)
 }
 
+/// Domain box: all active bodies plus padding, extended beyond every outlet along its outward normal
+/// by `outlet_clearance_mm` so free jets have room to develop.
+pub fn project_bounds(project: &Project, bodies: &[Body]) -> Aabb {
+    let mut b = domain_bounds(bodies, project.domain.padding_mm);
+    for p in project.ports.iter().filter(|p| !p.kind.is_inlet()) {
+        let c = project.domain.outlet_clearance_mm;
+        for v in &p.cap.polygon {
+            let far = [v[0] + p.cap.normal[0] * c, v[1] + p.cap.normal[1] * c, v[2] + p.cap.normal[2] * c];
+            b.grow(far);
+        }
+    }
+    b
+}
+
 pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain> {
     let active: Vec<&Body> = bodies.iter().filter(|b| b.role != BodyRole::Ignore).collect();
     if active.is_empty() {
@@ -92,7 +106,7 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
     }
     let meshes: Vec<&TriMesh> = active.iter().map(|b| &b.mesh).collect();
     let ports: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
-    let bounds = domain_bounds(bodies, project.domain.padding_mm);
+    let bounds = project_bounds(project, bodies);
     let d = build_domain(&meshes, &ports, &bounds, project.solver.cell_size_mm);
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
         if *n == 0 {

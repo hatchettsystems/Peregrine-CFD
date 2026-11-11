@@ -45,9 +45,9 @@ pub fn write_vtk(sim: &mut Simulation, grid: &Grid, path: &Path) -> std::io::Res
 }
 
 pub fn format_report(reports: &[PortReport]) -> String {
-    let mut s = String::from("port            type    flow (L/min)   pressure (Pa)   cells\n");
+    let mut s = String::from("port            type    flow (L/min)   pressure (Pa)   speed (m/s)  angle   cells\n");
     for r in reports {
-        s += &format!("{:<15} {:<7} {:>12.3} {:>15.2} {:>7}\n", r.name, if r.inlet { "inlet" } else { "outlet" }, r.flow_l_min, r.pressure_pa, r.cells);
+        s += &format!("{:<15} {:<7} {:>12.3} {:>15.2} {:>12.2} {:>5.0}° {:>7}\n", r.name, if r.inlet { "inlet" } else { "outlet" }, r.flow_l_min, r.pressure_pa, r.mean_speed, r.angle_deg, r.cells);
     }
     let net: f64 = reports.iter().map(|r| r.flow_l_min).sum();
     s += &format!("net inflow (should be ~0 at steady state): {net:.3} L/min\n");

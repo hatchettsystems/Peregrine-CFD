@@ -117,6 +117,14 @@ pub struct Source {
     pub streamlines: usize,
 }
 
+fn default_outlet_clearance() -> f64 {
+    30.0
+}
+
+fn default_min_tau() -> f64 {
+    0.51
+}
+
 fn default_streamlines() -> usize {
     40
 }
@@ -145,25 +153,32 @@ pub enum FaceBc { Open, Wall }
 pub struct DomainSettings {
     /// Padding (mm) around the bounding box of all active bodies.
     pub padding_mm: f64,
+    /// The box is extended this far (mm) beyond every outlet along its outward normal so jets can
+    /// develop and converge before they reach the domain boundary.
+    #[serde(default = "default_outlet_clearance")]
+    pub outlet_clearance_mm: f64,
     /// Faces in order -X, +X, -Y, +Y, -Z, +Z.
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SolverSettings {
     /// Cell size in mm.
     pub cell_size_mm: f64,
-    /// Largest expected speed (m/s); sets the time step.
+    /// Largest expected speed (m/s); sets the time step. 0 = choose automatically from the sources.
     pub reference_speed: f64,
     pub max_steps: usize,
     pub smagorinsky: f64,
+    /// Lowest relaxation time the solver will use. Lower = less artificial viscosity but less stable.
+    #[serde(default = "default_min_tau")]
+    pub min_tau: f64,
 }
 impl Default for SolverSettings {
     fn default() -> Self {
-        SolverSettings { cell_size_mm: 0.5, reference_speed: 20.0, max_steps: 20000, smagorinsky: 0.12 }
+        SolverSettings { cell_size_mm: 0.5, reference_speed: 0.0, max_steps: 20000, smagorinsky: 0.12, min_tau: 0.51 }
     }
 }
 

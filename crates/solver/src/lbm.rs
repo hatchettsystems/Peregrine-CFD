@@ -117,6 +117,8 @@ pub struct LbmConfig {
     pub open_faces: [bool; 6],
     pub body_force: [f32; 3],
     pub ports: Vec<PortInfo>,
+    /// Regularized collision (filters non-hydrodynamic moments; stable at much lower viscosity than TRT).
+    pub regularized: bool,
 }
 
 pub struct Lbm {
@@ -160,6 +162,7 @@ impl Lbm {
         let force = self.cfg.body_force;
         let open = self.cfg.open_faces;
         let has_force = force != [0.0; 3];
+        let regularized = self.cfg.regularized;
         self.fnew.par_chunks_mut(Q).zip(self.mac_new.par_chunks_mut(1)).enumerate().for_each(|(idx, (out, mout))| {
             if cells[idx] != 0 {
                 return;
@@ -204,8 +207,8 @@ impl Lbm {
             let u = [m[0] * inv, m[1] * inv, m[2] * inv];
             // Smagorinsky relaxation time from the non-equilibrium stress.
             let mut tau = tau0;
-            if cs > 0.0 {
-                let mut pi = [[0f32; 3]; 3];
+            let mut pi = [[0f32; 3]; 3];
+            if cs > 0.0 || regularized {
                 for i in 0..Q {
                     let fneq = fi[i] - feq(i, rho, u);
                     for a in 0..3 {
@@ -214,13 +217,15 @@ impl Lbm {
                         }
                     }
                 }
-                let mut s = 0.0;
-                for a in 0..3 {
-                    for b in 0..3 {
-                        s += pi[a][b] * pi[a][b];
+                if cs > 0.0 {
+                    let mut s = 0.0;
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            s += pi[a][b] * pi[a][b];
+                        }
                     }
+                    tau = 0.5 * (tau0 + (tau0 * tau0 + 18.0 * std::f32::consts::SQRT_2 * cs * cs * s.sqrt() * inv).sqrt());
                 }
-                tau = 0.5 * (tau0 + (tau0 * tau0 + 18.0 * std::f32::consts::SQRT_2 * cs * cs * s.sqrt() * inv).sqrt());
             }
             let omega = 1.0 / tau;
             let mut ueq = u;
@@ -239,14 +244,25 @@ impl Lbm {
             for i in 0..Q {
                 fe[i] = feq(i, rho, ueq);
             }
-            out[0] = fi[0] - omega * (fi[0] - fe[0]);
-            for i in 1..Q {
-                let o = opp(i);
-                let fp = 0.5 * (fi[i] + fi[o]);
-                let fm = 0.5 * (fi[i] - fi[o]);
-                let ep = 0.5 * (fe[i] + fe[o]);
-                let em = 0.5 * (fe[i] - fe[o]);
-                out[i] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
+            if regularized {
+                // Regularized BGK: keep only the second-order (stress) part of the non-equilibrium
+                // population, projected on the Hermite basis, and relax it.
+                for i in 0..Q {
+                    let c = [C[i][0] as f32, C[i][1] as f32, C[i][2] as f32];
+                    let q = (c[0] * c[0] - 1.0 / 3.0) * pi[0][0] + (c[1] * c[1] - 1.0 / 3.0) * pi[1][1] + (c[2] * c[2] - 1.0 / 3.0) * pi[2][2]
+                        + 2.0 * (c[0] * c[1] * pi[0][1] + c[0] * c[2] * pi[0][2] + c[1] * c[2] * pi[1][2]);
+                    out[i] = fe[i] + (1.0 - omega) * W[i] * 4.5 * q;
+                }
+            } else {
+                out[0] = fi[0] - omega * (fi[0] - fe[0]);
+                for i in 1..Q {
+                    let o = opp(i);
+                    let fp = 0.5 * (fi[i] + fi[o]);
+                    let fm = 0.5 * (fi[i] - fi[o]);
+                    let ep = 0.5 * (fe[i] + fe[o]);
+                    let em = 0.5 * (fe[i] - fe[o]);
+                    out[i] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
+                }
             }
             mout[0] = [rho, uphys[0], uphys[1], uphys[2]];
         });

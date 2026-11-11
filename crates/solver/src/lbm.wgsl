@@ -92,14 +92,17 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tau0 = P.tau0_cs_nport.x;
     let cs = P.tau0_cs_nport.y;
     var tau = tau0;
-    if (cs > 0.0) {
-        var pxx = 0.0; var pyy = 0.0; var pzz = 0.0; var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
+    let reg = P.flags.z == 1u;
+    var pxx = 0.0; var pyy = 0.0; var pzz = 0.0; var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
+    if (cs > 0.0 || reg) {
         for (var i = 0u; i < Q; i = i + 1u) {
             let fn_ = fi[i] - feq(i, rho, u);
             let cx = f32(CX[i]); let cy = f32(CY[i]); let cz = f32(CZ[i]);
             pxx = pxx + cx * cx * fn_; pyy = pyy + cy * cy * fn_; pzz = pzz + cz * cz * fn_;
             pxy = pxy + cx * cy * fn_; pxz = pxz + cx * cz * fn_; pyz = pyz + cy * cz * fn_;
         }
+    }
+    if (cs > 0.0) {
         let s = pxx * pxx + pyy * pyy + pzz * pzz + 2.0 * (pxy * pxy + pxz * pxz + pyz * pyz);
         tau = 0.5 * (tau0 + sqrt(tau0 * tau0 + 18.0 * 1.41421356 * cs * cs * sqrt(s) * inv));
     }
@@ -111,14 +114,23 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uphys = u + 0.5 * force * inv;
     var fe: array<f32, 19>;
     for (var i = 0u; i < Q; i = i + 1u) { fe[i] = feq(i, rho, ueq); }
-    f_out[idx] = fi[0] - omega * (fi[0] - fe[0]);
-    for (var i = 1u; i < Q; i = i + 1u) {
-        let o = opp(i);
-        let fp = 0.5 * (fi[i] + fi[o]);
-        let fm = 0.5 * (fi[i] - fi[o]);
-        let ep = 0.5 * (fe[i] + fe[o]);
-        let em = 0.5 * (fe[i] - fe[o]);
-        f_out[i * n + idx] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
+    if (reg) {
+        for (var i = 0u; i < Q; i = i + 1u) {
+            let cx = f32(CX[i]); let cy = f32(CY[i]); let cz = f32(CZ[i]);
+            let q = (cx * cx - 1.0 / 3.0) * pxx + (cy * cy - 1.0 / 3.0) * pyy + (cz * cz - 1.0 / 3.0) * pzz
+                + 2.0 * (cx * cy * pxy + cx * cz * pxz + cy * cz * pyz);
+            f_out[i * n + idx] = fe[i] + (1.0 - omega) * weight(i) * 4.5 * q;
+        }
+    } else {
+        f_out[idx] = fi[0] - omega * (fi[0] - fe[0]);
+        for (var i = 1u; i < Q; i = i + 1u) {
+            let o = opp(i);
+            let fp = 0.5 * (fi[i] + fi[o]);
+            let fm = 0.5 * (fi[i] - fi[o]);
+            let ep = 0.5 * (fe[i] + fe[o]);
+            let em = 0.5 * (fe[i] - fe[o]);
+            f_out[i * n + idx] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
+        }
     }
     mac[idx] = vec4<f32>(rho, uphys);
 }

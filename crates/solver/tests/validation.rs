@@ -3,6 +3,15 @@ use peregrine_solver::lbm::*;
 /// Square duct, velocity inlet / pressure outlet, compared with the laminar f*Re = 56.91 solution.
 #[test]
 fn square_duct_pressure_drop_and_mass_balance() {
+    check(false);
+}
+
+#[test]
+fn square_duct_regularized() {
+    check(true);
+}
+
+fn check(regularized: bool) {
     let (nx, ny, nz) = (80usize, 14usize, 14usize);
     let side = 12.0f64;
     let mut cells = vec![0u8; nx * ny * nz];
@@ -30,6 +39,7 @@ fn square_duct_pressure_drop_and_mass_balance() {
         smagorinsky: 0.0,
         open_faces: [false; 6],
         body_force: [0.0; 3],
+        regularized,
         ports: vec![
             PortInfo { bc: PortBc::Velocity([u_in, 0.0, 0.0]), inward: [1, 0, 0], normal: [0.0; 3] },
             PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0], normal: [0.0; 3] },

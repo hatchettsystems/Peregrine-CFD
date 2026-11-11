@@ -8,7 +8,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stro
 use peregrine_core::port_cap::point_in_polygon;
 use peregrine_core::vec3::{dot, len, sub};
 use peregrine_core::{shapes, PortCandidate, PortCap};
-use peregrine_geom::{build_project_domain, domain_bounds, duct_port_candidates, load_bodies, Body};
+use peregrine_geom::{build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
 use peregrine_post::streamlines::{self as sl, SeedSpec, Streamline, VelocityField};
@@ -479,11 +479,15 @@ impl App {
             ui.label("Cell size");
             ui.add(egui::DragValue::new(&mut self.project.solver.cell_size_mm).speed(0.01).range(0.05..=2.0).suffix(" mm"));
             ui.label("Ref. speed");
-            ui.add(egui::DragValue::new(&mut self.project.solver.reference_speed).speed(0.1).range(1.0..=100.0).suffix(" m/s"));
+            ui.add(egui::DragValue::new(&mut self.project.solver.reference_speed).speed(0.1).range(0.0..=100.0).suffix(" m/s").custom_formatter(|v, _| if v <= 0.0 { "auto".to_string() } else { format!("{v:.1}") }).custom_parser(|t| if t.trim().eq_ignore_ascii_case("auto") { Some(0.0) } else { t.trim().trim_end_matches("m/s").trim().parse().ok() })).on_hover_text("Largest expected air speed. 'auto' picks it from your sources; lower values reduce artificial viscosity but need a stable run.");
             ui.label("Steps");
             ui.add(egui::DragValue::new(&mut self.project.solver.max_steps).speed(50.0).range(250..=500_000));
             ui.label("Padding");
             ui.add(egui::DragValue::new(&mut self.project.domain.padding_mm).speed(0.2).range(0.0..=100.0).suffix(" mm"));
+            ui.label("Outlet room");
+            ui.add(egui::DragValue::new(&mut self.project.domain.outlet_clearance_mm).speed(0.5).range(0.0..=200.0).suffix(" mm")).on_hover_text("The simulation box extends this far beyond every outlet so jets can develop and converge.");
+            ui.label("Min tau");
+            ui.add(egui::DragValue::new(&mut self.project.solver.min_tau).speed(0.001).range(0.5005..=0.7).fixed_decimals(3)).on_hover_text("Lowest relaxation time. Lower = less artificial viscosity (more realistic jets) but less stable. The solver retries automatically if a run becomes unstable.");
             ui.separator();
             egui::ComboBox::from_id_salt("backend").selected_text(match self.backend { Backend::Auto => "Auto (GPU if found)", Backend::Cpu => "CPU", Backend::Gpu => "GPU" }).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.backend, Backend::Auto, "Auto (GPU if found)");
@@ -892,19 +896,21 @@ impl App {
         });
         theme::section(ui, "Flow report", |ui| {
             egui::Grid::new("rep").striped(true).show(ui, |ui| {
-                for h in ["Port", "Flow L/min", "Pressure Pa", "Share"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
+                for h in ["Port", "Flow L/min", "Pressure Pa", "Share", "Exit speed / angle"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
                 ui.end_row();
                 for g in &s.sources {
                     ui.label(egui::RichText::new(&g.name).strong().color(theme::INLET));
                     ui.label(format!("{:.2}", g.total_flow_l_min));
                     ui.label(format!("{:.1}", g.pressure_pa));
                     ui.label(match g.split { SplitMode::Plenum => format!("plenum {:.0} Pa", g.commanded), _ => format!("cmd {:.1}", g.commanded) });
+                    ui.label("");
                     ui.end_row();
                     for r in s.report.iter().filter(|r| r.source.as_deref() == Some(g.name.as_str())) {
                         ui.label(format!("   {}", r.name));
                         ui.label(format!("{:.2}", r.flow_l_min));
                         ui.label(format!("{:.1}", r.pressure_pa));
                         ui.label(format!("{:.0}%", 100.0 * r.flow_l_min / g.total_flow_l_min.abs().max(1e-9)));
+                        ui.label("");
                         ui.end_row();
                     }
                 }
@@ -913,6 +919,7 @@ impl App {
                     ui.label(format!("{:.2}", r.flow_l_min));
                     ui.label(format!("{:.1}", r.pressure_pa));
                     ui.label("");
+                    ui.label(if r.inlet { String::new() } else { format!("{:.1} m/s  {:.0}° from normal", r.mean_speed, r.angle_deg) });
                     ui.end_row();
                 }
             });
@@ -1061,7 +1068,7 @@ impl App {
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.bodies.is_empty() {
-                    let b = domain_bounds(&self.bodies, self.project.domain.padding_mm);
+                    let b = project_bounds(&self.project, &self.bodies);
                     let dx = self.project.solver.cell_size_mm;
                     let n: f64 = (0..3).map(|i| ((b.max[i] - b.min[i]) / dx).ceil().max(1.0)).product();
                     let (gpu, _) = peregrine_voxel::Grid { origin: [0.0; 3], dx, dims: [n as usize, 1, 1] }.memory_estimate();

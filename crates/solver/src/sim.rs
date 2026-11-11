@@ -12,6 +12,10 @@ pub struct PortReport {
     /// Mean static gauge pressure near the port (Pa).
     pub pressure_pa: f64,
     pub cells: usize,
+    /// Speed (m/s) of the mean velocity vector over the opening's cells.
+    pub mean_speed: f64,
+    /// Angle (degrees) between the mean velocity and the opening's normal (flow direction relative to the opening).
+    pub angle_deg: f64,
     /// Name of the port source this opening belongs to, if any.
     pub source: Option<String>,
 }
@@ -47,6 +51,8 @@ struct SourceRt {
     members: Vec<usize>,
     weights: Vec<f64>,
     areas: Vec<f64>, // m^2, discrete cross-section of each member
+    /// Per-member velocity correction so the delivered flow matches the commanded share.
+    gain: Vec<f64>,
     q_cmd: f64,      // L/min (forced splits)
     p_cmd: f64,      // Pa (plenum)
 }
@@ -147,8 +153,9 @@ impl Simulation {
     /// automatically to 2.5x the estimated peak so lattice velocities stay in the low-Mach range.
     pub fn new_with_ref(project: &Project, domain: &Domain, backend: Backend, ref_speed: f64) -> anyhow::Result<Simulation> {
         let g = &domain.grid;
-        let ref_speed = ref_speed.max(2.5 * Self::estimate_peak_speed(project, domain));
-        let units = Units::new(g.dx * 1e-3, ref_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity);
+        let auto = (2.5 * Self::estimate_peak_speed(project, domain)).max(3.0);
+        let ref_speed = if ref_speed <= 0.0 { auto } else { ref_speed.max(auto.min(2.5 * Self::estimate_peak_speed(project, domain))) };
+        let units = Units::new(g.dx * 1e-3, ref_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity).with_tau_floor(project.solver.min_tau);
         let mut infos = vec![];
         let mut meta = vec![];
         let mut dirs = vec![];
@@ -182,6 +189,7 @@ impl Simulation {
             open_faces: project.domain.faces.map(|f| f == FaceBc::Open),
             body_force: [0.0; 3],
             ports: infos.clone(),
+            regularized: true,
         };
         let ramp_base = infos.iter().zip(&meta).map(|(p, m)| match (p.bc, &m.1) {
             (PortBc::Velocity(u), PortKind::VelocityInlet { .. } | PortKind::FlowInlet { .. }) => Some(u),
@@ -219,7 +227,7 @@ impl Simulation {
                 (_, Some(q)) => 1.5 * 0.5 * project.fluid.density * (q / 60000.0 / sum_a.max(1e-12)).powi(2),
                 _ => 0.0,
             };
-            sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, members, weights, areas, q_cmd, p_cmd });
+            sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, gain: vec![1.0; members.len()], members, weights, areas, q_cmd, p_cmd });
         }
         let mut sim = Simulation { engine, units, ref_speed, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
@@ -309,7 +317,7 @@ impl Simulation {
                     let flows = split_flows(&g.areas, &g.weights, g.split, g.q_cmd);
                     for (i, &k) in g.members.iter().enumerate() {
                         let u = flows[i] / 60000.0 / g.areas[i].max(1e-12);
-                        updates.push((k, PortBc::Velocity(dir_vel(self.port_dir[k], self.units.vel_to_lat(u) * f as f64))));
+                        updates.push((k, PortBc::Velocity(dir_vel(self.port_dir[k], self.units.vel_to_lat(u) * g.gain[i] * f as f64))));
                     }
                 }
                 SplitMode::Plenum => {
@@ -341,6 +349,20 @@ impl Simulation {
     fn update_sources(&mut self) {
         for gi in 0..self.sources.len() {
             let (q, p_in) = self.source_measure(gi);
+            // forced splits: nudge each inlet's velocity until the flow it delivers matches its share
+            if self.sources[gi].split != SplitMode::Plenum {
+                let members = self.sources[gi].members.clone();
+                let flows = split_flows(&self.sources[gi].areas, &self.sources[gi].weights, self.sources[gi].split, self.sources[gi].q_cmd);
+                for (i, &k) in members.iter().enumerate() {
+                    let (_, u_in, n) = self.port_stats(k);
+                    let meas = self.units.vel_to_phys(u_in as f64) * n as f64 * self.units.dx * self.units.dx * 60000.0;
+                    if flows[i] > 1e-9 && meas > 1e-9 {
+                        let err = ((flows[i] - meas) / flows[i]).clamp(-0.5, 0.5);
+                        let g = &mut self.sources[gi].gain[i];
+                        *g = (*g * (1.0 + 0.25 * err)).clamp(0.5, 3.0);
+                    }
+                }
+            }
             let rho = self.units.rho;
             let g = &mut self.sources[gi];
             let sum_a: f64 = g.areas.iter().sum();
@@ -400,9 +422,29 @@ impl Simulation {
         self.engine.mac().iter().all(|m| m[0].is_finite() && m[1].is_finite())
     }
 
+    /// Mean velocity vector (m/s) over the cells of port `k`.
+    fn port_mean_velocity(&mut self, k: usize) -> [f64; 3] {
+        let idxs: Vec<usize> = self.port_cells.iter().filter(|c| c.1 == k).map(|c| c.0).collect();
+        let u = self.units;
+        let mac = self.engine.mac();
+        let mut v = [0.0f64; 3];
+        for &i in &idxs {
+            for a in 0..3 { v[a] += u.vel_to_phys(mac[i][a + 1] as f64); }
+        }
+        let n = idxs.len().max(1) as f64;
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+
     pub fn report(&mut self) -> Vec<PortReport> {
         (0..self.project_ports.len())
             .map(|k| {
+                let v = self.port_mean_velocity(k);
+                let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                // flow direction relative to the opening's axis (inward for inlets, outward for outlets)
+                let d = self.port_dir[k];
+                let sign = if self.project_ports[k].1.is_inlet() { 1.0 } else { -1.0 };
+                let cosang = if speed > 1e-9 { sign * (v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) / speed / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12) } else { 1.0 };
+                let angle_deg = cosang.clamp(-1.0, 1.0).acos().to_degrees();
                 let (rho, u_in, n) = self.port_stats(k);
                 let dx2 = self.units.dx * self.units.dx;
                 let flow = self.units.vel_to_phys(u_in as f64) * n as f64 * dx2 * 60000.0;
@@ -412,6 +454,8 @@ impl Simulation {
                     flow_l_min: flow,
                     pressure_pa: self.units.pressure(rho as f64),
                     cells: n,
+                    mean_speed: speed,
+                    angle_deg,
                     source: self.project_ports[k].1.source().map(|s| s.to_string()),
                 }
             })

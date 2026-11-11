@@ -2,7 +2,7 @@
 use peregrine_solver::gpu::GpuLbm;
 use peregrine_solver::lbm::*;
 
-fn config() -> LbmConfig {
+fn config(regularized: bool) -> LbmConfig {
     let (nx, ny, nz) = (40usize, 12usize, 12usize);
     let mut cells = vec![0u8; nx * ny * nz];
     for z in 0..nz {
@@ -28,6 +28,7 @@ fn config() -> LbmConfig {
         smagorinsky: 0.12,
         open_faces: [false, false, false, false, true, false],
         body_force: [0.0; 3],
+        regularized,
         ports: vec![
             PortInfo { bc: PortBc::Velocity([0.03, 0.0, 0.0]), inward: [1, 0, 0], normal: [0.0; 3] },
             PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0], normal: [0.0; 3] },
@@ -36,8 +37,17 @@ fn config() -> LbmConfig {
 }
 
 #[test]
-fn gpu_matches_cpu() {
-    let cfg = config();
+fn gpu_matches_cpu_trt() {
+    check(false);
+}
+
+#[test]
+fn gpu_matches_cpu_regularized() {
+    check(true);
+}
+
+fn check(regularized: bool) {
+    let cfg = config(regularized);
     let mut gpu = match GpuLbm::new(&cfg) {
         Ok(g) => g,
         Err(e) => {
