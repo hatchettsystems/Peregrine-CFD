@@ -280,6 +280,13 @@ fn main() -> eframe::Result {
             if a == "--hide" { if let Some(n) = args.get(i + 1) { if let Some(k) = app.bodies.iter().position(|b| &b.name == n) { app.visible[k] = false; } } }
             if a == "--frame" { if let Some(n) = args.get(i + 1) { if let Some(b) = app.bodies.iter().find(|b| &b.name == n) { let bb = b.mesh.bounds(); app.cam.frame(bb.min, bb.max); } } }
             if a == "--show-hidden" { app.show_hidden = true; app.refresh_candidates(); }
+            if a == "--check-leaks" {
+                app.check_leaks();
+                app.tab = Tab::Exceptions;
+                if let Some(c) = app.leak_notes.first().and_then(|m| parse_coords(m)) { app.cam.target = c; app.cam.dist = 45.0; }
+                app.mesh_mode = MeshMode::Ghost;
+                app.focus_issue = Some("Air leaks out of the duct".into());
+            }
             if a == "--tab" { match args.get(i + 1).map(|v| v.as_str()) { Some("ports") => app.tab = Tab::Ports, Some("results") => app.tab = Tab::Results, Some("exceptions") => app.tab = Tab::Exceptions, _ => {} } }
             if a == "--tutorial" { app.start_tutorial(); }
             if a == "--tutorial-selftest" {
