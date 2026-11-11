@@ -5,7 +5,7 @@ use peregrine_voxel::*;
 fn tube_domain() {
     let tube = shapes::hollow_tube(8.0, 4.0, 30.0);
     let caps = find_port_candidates(&tube, 1.0);
-    let ports: Vec<PortSpec> = caps.iter().map(|c| PortSpec { cap: c.cap.clone(), plug: c.cap.normal[0] < 0.0 }).collect();
+    let ports: Vec<PortSpec> = caps.iter().map(|c| PortSpec { cap: c.cap.clone(), plug: c.cap.normal[0] < 0.0, collar_mm: 0.0 }).collect();
     let mut b = tube.bounds().expanded(3.0);
     b.min[0] -= 1.0;
     let dx = 0.25;
@@ -39,7 +39,7 @@ fn curved_cap_gets_port_cells() {
     let cap = cap_from_loop(&inner.points, &tube).unwrap();
     let area = cap.area();
     let flat = find_port_candidates(&tube, 1.0).remove(0).cap;
-    let ports = vec![PortSpec { cap: flat, plug: true }, PortSpec { cap: cap.clone(), plug: false }];
+    let ports = vec![PortSpec { cap: flat, plug: true, collar_mm: 0.0 }, PortSpec { cap: cap.clone(), plug: false, collar_mm: 0.0 }];
     let mut b = tube.bounds().expanded(3.0);
     b.max[0] += 6.0;
     let dx = 0.3;
@@ -55,12 +55,12 @@ fn island_is_excluded_from_the_port_cells() {
     use peregrine_core::PortCap;
     let tube = shapes::hollow_tube(12.0, 8.0, 20.0);
     let mut cap = find_port_candidates(&tube, 1.0).into_iter().find(|c| c.cap.normal[0] < 0.0).unwrap().cap;
-    let full = PortSpec { cap: cap.clone(), plug: true };
+    let full = PortSpec { cap: cap.clone(), plug: true, collar_mm: 0.0 };
     // a 4x4 island in the middle of the 8x8 opening
     let h = 2.0;
     cap.holes = vec![vec![[0.0, -h, -h], [0.0, h, -h], [0.0, h, h], [0.0, -h, h]]];
     assert!((cap.area() - (64.0 - 16.0)).abs() < 1e-9, "area {}", cap.area());
-    let ring = PortSpec { cap, plug: true };
+    let ring = PortSpec { cap, plug: true, collar_mm: 0.0 };
     let mut b = tube.bounds().expanded(3.0);
     b.min[0] -= 1.0;
     let dx = 0.25;

@@ -20,7 +20,7 @@ fn outlet_fraction(seal_tol: f64) -> f64 {
             }
         }
     }
-    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: 0.0 }).collect();
     let mut bb = Aabb::empty();
     bb.union(&a.bounds());
     bb.union(&b.bounds());

@@ -27,7 +27,7 @@ fn curved_outlet_carries_the_flow() {
     project.ports.push(Port { name: "in".into(), body: "duct".into(), kind: PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, cap: inlet_cap });
     project.ports.push(Port { name: "out".into(), body: "duct".into(), kind: PortKind::PressureOutlet { pressure: 0.0 }, cap: outlet_cap });
     assert!(project.validate().is_empty(), "{:?}", project.validate());
-    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: 0.0 }).collect();
     let mut b = Aabb::empty();
     b.union(&tube.bounds());
     let mut bounds = b.expanded(4.0);

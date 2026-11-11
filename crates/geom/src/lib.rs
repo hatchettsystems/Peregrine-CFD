@@ -191,7 +191,7 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
         bail!("project has no ports; define at least one inlet and one outlet");
     }
     let meshes: Vec<&TriMesh> = active.iter().map(|b| &b.mesh).collect();
-    let ports: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let ports: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: project.domain.inlet_collar_mm }).collect();
     let bounds = project_bounds(project, bodies);
     // parts of one duct: seal small gaps between them
     let names: Vec<String> = active.iter().map(|b| b.name.clone()).collect();

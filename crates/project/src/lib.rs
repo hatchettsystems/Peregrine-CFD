@@ -179,11 +179,15 @@ pub struct DomainSettings {
     /// Gaps up to this size (mm) between two parts of the same duct are sealed. Larger gaps leak and are reported.
     #[serde(default = "default_seam_tolerance")]
     pub seam_tolerance_mm: f64,
+    /// Fan mount seal (mm): fluid cells within this distance of the rim of every inlet are closed, like the housing
+    /// of a mounted fan. Use when a fan mount leaks around the inlet because the fan body is not in the model. 0 = off.
+    #[serde(default)]
+    pub inlet_collar_mm: f64,
     /// Faces in order -X, +X, -Y, +Y, -Z, +Z.
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

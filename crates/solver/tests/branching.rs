@@ -67,7 +67,7 @@ fn run_kind(baffle: bool, dx: f64, steps: usize, kind: SourceKind) -> Out {
     project.ports.push(mk("in", PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, inlet.unwrap()));
     project.ports.push(mk("small", PortKind::PressureOutlet { pressure: 0.0 }, small.unwrap()));
     project.ports.push(mk("large", PortKind::PressureOutlet { pressure: 0.0 }, large.unwrap()));
-    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: 0.0 }).collect();
     let mut bounds = Aabb::empty();
     for m in &solids { bounds.union(&m.bounds()); }
     let refs: Vec<&TriMesh> = solids.iter().collect();

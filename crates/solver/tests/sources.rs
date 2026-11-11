@@ -37,7 +37,7 @@ fn setup(split: SplitMode) -> (Project, peregrine_voxel::Domain) {
         project.ports.push(Port { name, body: "duct".into(), kind, cap });
     }
     assert!(project.validate().is_empty(), "{:?}", project.validate());
-    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: 0.0 }).collect();
     let mut bounds = Aabb::empty();
     for m in [&a, &b] { bounds.union(&m.bounds()); }
     let meshes: Vec<&TriMesh> = vec![&a, &b];

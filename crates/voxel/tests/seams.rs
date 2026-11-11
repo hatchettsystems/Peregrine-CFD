@@ -12,7 +12,7 @@ fn two_part_duct(gap: f64, dx: f64, seal_tol: f64) -> (bool, usize) {
     for (m, inlet) in [(&a, true), (&b, false)] {
         for c in find_port_candidates(m, 1.0) {
             let want_x = if inlet { c.cap.normal[0] < 0.0 } else { c.cap.normal[0] > 0.0 };
-            if want_x { specs.push(PortSpec { cap: c.cap, plug: inlet }); }
+            if want_x { specs.push(PortSpec { cap: c.cap, plug: inlet, collar_mm: 0.0 }); }
         }
     }
     assert_eq!(specs.len(), 2);

@@ -112,6 +112,9 @@ pub struct PortSpec {
     pub cap: PortCap,
     /// Close the volume behind the cap (inlets, where a fan or wall sits).
     pub plug: bool,
+    /// Fan mount seal (mm): also close fluid cells in a collar of this width around the rim of the cap, as the
+    /// housing of a mounted fan would. 0 = only the thin sliver at the rim.
+    pub collar_mm: f64,
 }
 
 #[derive(Debug)]
@@ -186,11 +189,11 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
     }
     // shut openings first, so nothing can flow through them
     for cap in blockers {
-        mark_cap(&grid, &mut cells, cap, SOLID, true);
+        mark_cap(&grid, &mut cells, cap, SOLID, true, 0.0);
     }
     let mut counts = vec![0usize; ports.len()];
     for (k, p) in ports.iter().enumerate() {
-        counts[k] = mark_cap(&grid, &mut cells, &p.cap, PORT_BASE + k as u8, p.plug);
+        counts[k] = mark_cap(&grid, &mut cells, &p.cap, PORT_BASE + k as u8, p.plug, if p.plug { p.collar_mm } else { 0.0 });
     }
     // Flood fill from port cells through fluid.
     let mut reach = vec![false; grid.len()];
@@ -226,7 +229,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
 
 /// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
 /// with `plug`, the cells just in front are closed. Returns the number of cells marked.
-fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool) -> usize {
+fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool, collar_mm: f64) -> usize {
     if cap.is_surface() {
         return mark_surface_cap(grid, cells, cap, code, plug);
     }
@@ -259,19 +262,21 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool) 
             }
         }
     }
-    seal_rim(grid, cells, cap, &poly, plug || code == SOLID);
+    seal_rim(grid, cells, cap, &poly, plug || code == SOLID, 1.2 * dx, dx);
+    if collar_mm > 0.0 {
+        seal_rim(grid, cells, cap, &poly, true, collar_mm, collar_mm);
+    }
     count
 }
 
 /// Close the sliver of fluid cells just outside the rim of a planar cap. The cap polygon is the rim of the
 /// opening and a voxel grid never matches it exactly: without this, air slips between the port and the wall
 /// (around a fan inlet, or beside an outlet) and leaves through a path that is not a port.
-fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], both_sides: bool) {
+fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], both_sides: bool, ring: f64, depth: f64) {
     if std::env::var_os("PG_NO_RIM_SEAL").is_some() {
         return;
     }
     let dx = grid.dx;
-    let ring = 1.2 * dx;
     let mut bb = Aabb::empty();
     for v in &cap.polygon {
         bb.grow(*v);
@@ -279,7 +284,7 @@ fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], bot
     let bb = bb.expanded(ring + 2.0 * dx);
     let lo = [0, 1, 2].map(|i| (((bb.min[i] - grid.origin[i]) / dx).floor().max(0.0)) as usize);
     let hi = [0, 1, 2].map(|i| ((((bb.max[i] - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
-    let front = if both_sides { 2.0 * dx } else { 0.0 };
+    let front = if both_sides { depth.max(2.0 * dx) } else { 0.0 };
     for z in lo[2]..hi[2] {
         for y in lo[1]..hi[1] {
             for x in lo[0]..hi[0] {
@@ -289,7 +294,7 @@ fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], bot
                 }
                 let c = grid.center(x, y, z);
                 let d = cap.height(c);
-                if d < -dx || d >= front {
+                if d < -depth || d >= front {
                     continue;
                 }
                 let q = cap.project2d(c);
@@ -544,7 +549,7 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
 /// closed cavity. Compare the values: a pocket scores a tiny fraction of the largest.
 pub fn behind_volumes(solids: &[&TriMesh], caps: &[PortCap], bounds: &Aabb, dx: f64) -> Vec<f64> {
     let n = caps.len().min(250);
-    let ports: Vec<PortSpec> = caps.iter().take(n).map(|c| PortSpec { cap: c.clone(), plug: true }).collect();
+    let ports: Vec<PortSpec> = caps.iter().take(n).map(|c| PortSpec { cap: c.clone(), plug: true, collar_mm: 0.0 }).collect();
     let d = build_domain(solids, &ports, bounds, dx);
     let g = &d.grid;
     let [nx, ny, nz] = g.dims;

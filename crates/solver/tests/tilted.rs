@@ -16,7 +16,7 @@ fn run(angle_deg: f64) -> (f64, f64, bool) {
         let kind = if inlet { PortKind::SourceInlet { source: "fan".into(), weight: 1.0 } } else { PortKind::PressureOutlet { pressure: 0.0 } };
         project.ports.push(Port { name: format!("p{i}"), body: "duct".into(), kind, cap: c.cap });
     }
-    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet() }).collect();
+    let specs: Vec<PortSpec> = project.ports.iter().map(|p| PortSpec { cap: p.cap.clone(), plug: p.kind.is_inlet(), collar_mm: 0.0 }).collect();
     let mut b = Aabb::empty();
     b.union(&tube.bounds());
     let d = build_domain(&[&tube], &specs, &b.expanded(4.0), 0.5);
