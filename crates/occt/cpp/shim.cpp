@@ -64,7 +64,7 @@ static void set_err(char* err, int len, const std::string& m) {
 }
 
 static void mesh_into(const TopoDS_Shape& s, double deflection, Body& b) {
-    BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.5, Standard_True);
+    BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.3, Standard_True);
     for (TopExp_Explorer ex(s, TopAbs_FACE); ex.More(); ex.Next()) {
         TopoDS_Face face = TopoDS::Face(ex.Current());
         TopLoc_Location loc;

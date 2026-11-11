@@ -69,10 +69,41 @@ impl Camera {
 }
 
 /// Draw a shaded closed mesh with back-face culling, depth-sorted triangles.
+/// Smooth vertex normals (area-weighted average of the faces around each vertex), cached per mesh.
+/// Faces of a STEP part keep their own vertices, so a curved face is smoothed while an edge between two faces stays sharp.
+fn vertex_normals(mesh: &TriMesh) -> std::sync::Arc<Vec<V3>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Arc<Vec<V3>>>>> = OnceLock::new();
+    let key = (mesh.vertices.as_ptr() as usize, mesh.vertices.len(), mesh.triangles.len());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
+    let mut acc = vec![[0.0f64; 3]; mesh.vertices.len()];
+    for i in 0..mesh.triangles.len() {
+        let [a, b, c] = mesh.tri(i);
+        let n = cross(sub(b, a), sub(c, a)); // length = 2 x area
+        for &v in &mesh.triangles[i] {
+            let v = v as usize;
+            acc[v] = add(acc[v], n);
+        }
+    }
+    let out: Vec<V3> = acc.into_iter().map(|n| { let l = len(n); if l > 1e-12 { scale(n, 1.0 / l) } else { [0.0, 0.0, 1.0] } }).collect();
+    let arc = Arc::new(out);
+    let mut c = cache.lock().unwrap();
+    if c.len() > 256 { c.clear(); }
+    c.insert(key, arc.clone());
+    arc
+}
+
 pub fn draw_mesh(painter: &egui::Painter, rect: Rect, cam: &Camera, mesh: &TriMesh, base: Color32, alpha: u8, outline: bool) {
     let light = cam.light();
     let eye = cam.eye();
-    let mut items: Vec<(f64, [Pos2; 3], Color32)> = Vec::with_capacity(mesh.triangles.len());
+    let normals = vertex_normals(mesh);
+    let shade_of = |n: V3| 0.35 + 0.65 * dot(n, light).max(0.0) as f32;
+    let tint = |sh: f32| Color32::from_rgba_unmultiplied((base.r() as f32 * sh) as u8, (base.g() as f32 * sh) as u8, (base.b() as f32 * sh) as u8, alpha);
+    let mut items: Vec<(f64, [Pos2; 3], [Color32; 3])> = Vec::with_capacity(mesh.triangles.len());
     for i in 0..mesh.triangles.len() {
         let [a, b, c] = mesh.tri(i);
         let n = normalize(cross(sub(b, a), sub(c, a)));
@@ -81,16 +112,17 @@ pub fn draw_mesh(painter: &egui::Painter, rect: Rect, cam: &Camera, mesh: &TriMe
             continue;
         }
         let (Some((pa, da)), Some((pb, db)), Some((pc, dc))) = (cam.project(rect, a), cam.project(rect, b), cam.project(rect, c)) else { continue };
-        let shade = 0.35 + 0.65 * dot(n, light).max(0.0) as f32;
-        let col = Color32::from_rgba_unmultiplied((base.r() as f32 * shade) as u8, (base.g() as f32 * shade) as u8, (base.b() as f32 * shade) as u8, alpha);
-        items.push(((da + db + dc) / 3.0, [pa, pb, pc], col));
+        let t = mesh.triangles[i];
+        // smooth shading unless the vertex normal strays far from the face (a crease inside one face)
+        let col = |v: u32| { let vn = normals[v as usize]; tint(shade_of(if dot(vn, n) > 0.7 { vn } else { n })) };
+        items.push(((da + db + dc) / 3.0, [pa, pb, pc], [col(t[0]), col(t[1]), col(t[2])]));
     }
     items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     let mut m = Mesh::default();
     for (_, p, c) in &items {
         let base_i = m.vertices.len() as u32;
-        for q in p {
-            m.vertices.push(Vertex { pos: *q, uv: egui::epaint::WHITE_UV, color: *c });
+        for (q, col) in p.iter().zip(c) {
+            m.vertices.push(Vertex { pos: *q, uv: egui::epaint::WHITE_UV, color: *col });
         }
         m.indices.extend([base_i, base_i + 1, base_i + 2]);
         if m.vertices.len() > 60_000 {

@@ -28,6 +28,7 @@ fn main() {
         return;
     }
     let d = build_project_domain(&project, &bodies).unwrap();
+    println!("odd ray columns: {} (non-watertight indicator), enclosed cells removed {}", d.odd_columns, d.sealed_cells_removed);
     println!("auto-repaired {} gaps", d.repaired.len());
     let mut cl: std::collections::BTreeMap<(i32, i32, i32), usize> = Default::default();
     for p in &d.repaired { *cl.entry(((p[0] / 8.0).floor() as i32 * 8, (p[1] / 8.0).floor() as i32 * 8, (p[2] / 8.0).floor() as i32 * 8)).or_default() += 1; }

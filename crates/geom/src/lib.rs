@@ -45,7 +45,7 @@ pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
                 bodies.push(Body { name, role: BodyRole::Solid, mesh });
             }
             "step" | "stp" => {
-                let defl = (project.solver.cell_size_mm * 0.2).clamp(0.01, 0.1);
+                let defl = (project.solver.cell_size_mm * 0.12).clamp(0.02, 0.06);
                 for b in peregrine_occt::read_step(&f, defl).with_context(|| format!("reading {}", f.display()))? {
                     let name = clean_name(&b.name);
                     bodies.push(Body { name, role: BodyRole::Solid, mesh: b.mesh });
