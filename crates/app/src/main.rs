@@ -285,7 +285,7 @@ fn main() -> eframe::Result {
             if a == "--check-leaks" {
                 app.check_leaks();
                 app.tab = Tab::Exceptions;
-                if let Some(c) = app.leak_notes.first().and_then(|m| parse_coords(m)) { app.cam.target = c; app.cam.dist = 45.0; }
+                if let Some(c) = app.leak_notes.first().and_then(|m| parse_coords(m)) { app.cam.target = c; app.cam.dist = 75.0; }
                 app.mesh_mode = MeshMode::Ghost;
                 app.focus_issue = Some("Air leaks out of the duct".into());
             }
