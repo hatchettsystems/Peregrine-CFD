@@ -107,6 +107,16 @@ pub fn voxelize_inside(mesh: &TriMesh, grid: &Grid) -> (Vec<bool>, usize) {
     (inside, odd.into_inner())
 }
 
+thread_local! {
+    /// Set while a connectivity probe (see [`behind_volumes`]) builds its domain: the probe must see the geometry as it
+    /// is, without the wall-thickening sealers that the simulation domain uses.
+    static PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn probing() -> bool {
+    PROBE.with(|p| p.get())
+}
+
 #[derive(Clone, Debug)]
 pub struct PortSpec {
     pub cap: PortCap,
@@ -353,7 +363,7 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool, 
 /// straight through. Wherever two solid cells touch diagonally across a pair of fluid cells, one of the fluid
 /// cells is closed (the one that already touches more solid), which turns the corner contact into a face contact.
 fn close_diagonal_gaps(grid: &Grid, cells: &mut [u8]) {
-    if std::env::var_os("PG_NO_DIAG_CLOSE").is_some() {
+    if probing() || std::env::var_os("PG_NO_DIAG_CLOSE").is_some() {
         return;
     }
     let [nx, ny, nz] = grid.dims;
@@ -413,7 +423,7 @@ fn close_diagonal_gaps(grid: &Grid, cells: &mut [u8]) {
 /// opening and a voxel grid never matches it exactly: without this, air slips between the port and the wall
 /// (around a fan inlet, or beside an outlet) and leaves through a path that is not a port.
 fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], both_sides: bool, ring: f64, depth: f64) {
-    if std::env::var_os("PG_NO_RIM_SEAL").is_some() {
+    if probing() || std::env::var_os("PG_NO_RIM_SEAL").is_some() {
         return;
     }
     let dx = grid.dx;
@@ -788,7 +798,9 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
 pub fn behind_volumes(solids: &[&TriMesh], caps: &[PortCap], bounds: &Aabb, dx: f64) -> Vec<f64> {
     let n = caps.len().min(250);
     let ports: Vec<PortSpec> = caps.iter().take(n).map(|c| PortSpec { cap: c.clone(), plug: true, collar_mm: 0.0 }).collect();
+    PROBE.with(|p| p.set(true));
     let d = build_domain(solids, &ports, bounds, dx);
+    PROBE.with(|p| p.set(false));
     let g = &d.grid;
     let [nx, ny, nz] = g.dims;
     // label connected components of all non-solid cells (port cells belong to the air behind their cap)

@@ -163,10 +163,25 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
             let dx = (size[0] * size[1] * size[2] / 6.0e6).cbrt().clamp(0.4, 1.2);
             // plug islands too: air must not escape through a hub or boss region
             let caps: Vec<peregrine_core::PortCap> = duct_cands.iter().map(|c| { let mut k = c.cap.clone(); k.holes.clear(); k }).collect();
-            let vols = behind_volumes(&part_meshes, &caps, &bb, dx);
-            let vmax = vols.iter().cloned().filter(|v| v.is_finite()).fold(0.0, f64::max).max(1e-9);
+            // A thin neck between a pocket-like slot and the channel can be closed by one grid and open in another:
+            // probe three slightly different grids and take the best connection for each opening.
+            let mut vols = behind_volumes(&part_meshes, &caps, &bb, dx);
+            for f in [0.78, 1.3] {
+                let alt = behind_volumes(&part_meshes, &caps, &bb, dx * f);
+                for (v, a) in vols.iter_mut().zip(alt) {
+                    if a.is_finite() && (!v.is_finite() || a > *v) { *v = a; }
+                }
+            }
+            // Openings into the same channel system report the same volume. Normalise by the largest volume that at
+            // least two openings share (the duct interior), so a single cap that sits on open air (a huge volume of
+            // its own) cannot make every real opening look like a pocket.
+            let mut finite: Vec<f64> = vols.iter().cloned().filter(|v| v.is_finite()).collect();
+            finite.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let shared = finite.iter().cloned().find(|v| finite.iter().filter(|w| (**w - *v).abs() <= 0.01 * v.abs().max(1e-9)).count() >= 2);
+            let vmax = shared.unwrap_or_else(|| finite.first().cloned().unwrap_or(1.0)).max(1e-9);
+            if std::env::var_os("PG_DEBUG").is_some() { eprintln!("behind volumes (dx {dx:.2}): max {:.0}, shared {:?}, all {:?}", finite.first().cloned().unwrap_or(0.0), shared, vols.iter().map(|v| v.round()).collect::<Vec<_>>()); }
             for (c, v) in duct_cands.iter_mut().zip(vols) {
-                c.clearance = if v.is_finite() { v / vmax } else { 1.0 };
+                c.clearance = if v.is_finite() { (v / vmax).min(1.0) } else { 1.0 };
             }
         }
         for c in duct_cands {
@@ -359,9 +374,9 @@ pub fn sealed_regions(domain: &Domain) -> Vec<[f64; 5]> {
     domain.sealed_regions(25).iter().map(|r| [r.center[0], r.center[1], r.center[2], r.cells as f64, r.radius_mm]).collect()
 }
 
-/// True for an opening that admits air: visible from outside the duct and leading into a channel (not a pocket).
+/// True unless the opening is a pocket: hard to see from outside AND with no confirmed air behind it.
 pub fn is_real_opening(c: &PortCandidate) -> bool {
-    c.visibility >= 0.5 && c.clearance >= 0.5
+    c.clearance >= 0.5 || c.visibility >= 0.5
 }
 
 /// Make every planar opening that lies wholly inside another coplanar, same-facing opening an island of it.

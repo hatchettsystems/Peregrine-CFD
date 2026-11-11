@@ -412,7 +412,9 @@ impl App {
     fn refresh_candidates(&mut self) {
         self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None }, self.detect_curved);
         // an opening that admits air is visible from outside and leads into a channel, not a pocket
-        if !self.show_hidden { self.candidates.retain(|c| c.1.visibility >= 0.5 && c.1.clearance >= 0.5); }
+        // only openings that fail BOTH tests (hard to see from outside and no air behind) are hidden as pockets; the
+        // air-behind test depends on thin necks that a grid can close, so it must not hide an opening on its own
+        if !self.show_hidden { self.candidates.retain(|c| c.1.clearance >= 0.5 || c.1.visibility >= 0.5); }
         self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
         self.block_stale = true;
@@ -1643,7 +1645,7 @@ impl App {
                 None => "unassigned".to_string(),
             };
             let (body, c) = &self.candidates[i];
-            let hidden = if c.visibility < 0.5 { "  hidden" } else if c.clearance < 0.5 { "  pocket" } else { "" };
+            let hidden = if c.clearance < 0.5 && c.visibility < 0.5 { "  pocket" } else if c.visibility < 0.5 { "  not visible from outside" } else if c.clearance < 0.5 { "  air behind not confirmed" } else { "" };
             let text = format!("#{i}  {body}  {:.1} mm²{}{}  [{status}]", c.area, if c.cap.is_surface() { "  curved" } else { "" }, hidden);
             if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
         }
