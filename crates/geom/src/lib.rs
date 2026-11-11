@@ -2,7 +2,7 @@
 use anyhow::{bail, Context, Result};
 use peregrine_core::{find_port_candidates, stl, Aabb, PortCandidate, TriMesh};
 use peregrine_project::{BodyRole, DuctDef, Project};
-use peregrine_voxel::{behind_volumes, build_domain_ext, leak_check, Domain, PortSpec, PORT_BASE};
+use peregrine_voxel::{behind_volumes, build_domain_full, leak_check, Domain, PortSpec, PORT_BASE};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -201,7 +201,8 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
         .map(|d| d.parts.iter().filter_map(|p| names.iter().position(|n| n == p)).collect::<Vec<usize>>())
         .filter(|g| g.len() >= 2)
         .collect();
-    let d = build_domain_ext(&meshes, &groups, project.domain.seam_tolerance_mm, &ports, &bounds, project.solver.cell_size_mm);
+    let blockers: Vec<peregrine_core::PortCap> = project.blockers.iter().map(|b| b.cap.clone()).collect();
+    let d = build_domain_full(&meshes, &groups, project.domain.seam_tolerance_mm, &ports, &blockers, &bounds, project.solver.cell_size_mm);
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
         if *n == 0 {
             bail!("port '{}' covers no cells at {} mm; refine the grid or check the cap", p.name, project.solver.cell_size_mm);

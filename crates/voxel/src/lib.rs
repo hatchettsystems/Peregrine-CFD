@@ -134,6 +134,11 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
 /// that form that duct. A fluid cell squeezed between two DIFFERENT parts of the same duct, at most
 /// `seam_tol_mm` apart along an axis, is filled, so small gaps between parts do not leak.
 pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
+    build_domain_full(solids, groups, seam_tol_mm, ports, &[], bounds, dx)
+}
+
+/// Like [`build_domain_ext`], and every cap in `blockers` is filled solid (a shut opening: screw hole, vent...).
+pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm: f64, ports: &[PortSpec], blockers: &[PortCap], bounds: &Aabb, dx: f64) -> Domain {
     assert!(ports.len() <= (255 - PORT_BASE as usize), "too many ports");
     let grid = Grid::from_bounds(bounds, dx);
     let mut cells = vec![FLUID; grid.len()];
@@ -164,39 +169,13 @@ pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm:
         seal_seams(&grid, &mut cells, &label, &group_of, reach);
     }
     let [nx, ny, nz] = grid.dims;
+    // shut openings first, so nothing can flow through them
+    for cap in blockers {
+        mark_cap(&grid, &mut cells, cap, SOLID, true);
+    }
     let mut counts = vec![0usize; ports.len()];
     for (k, p) in ports.iter().enumerate() {
-        if p.cap.is_surface() {
-            counts[k] = mark_surface_cap(&grid, &mut cells, &p.cap, PORT_BASE + k as u8, p.plug);
-            continue;
-        }
-        let poly = p.cap.polygon_2d();
-        let holes = p.cap.holes_2d();
-        let mut bb = Aabb::empty();
-        for v in &p.cap.polygon {
-            bb.grow(*v);
-        }
-        let bb = bb.expanded(2.0 * dx);
-        let lo = [0, 1, 2].map(|i| (((bb.min[i] - grid.origin[i]) / dx).floor().max(0.0)) as usize);
-        let hi = [0, 1, 2].map(|i| ((((bb.max[i] - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
-        for z in lo[2]..hi[2] {
-            for y in lo[1]..hi[1] {
-                for x in lo[0]..hi[0] {
-                    let c = grid.center(x, y, z);
-                    if !p.cap.contains_in_opening(&poly, &holes, c) {
-                        continue;
-                    }
-                    let d = p.cap.height(c);
-                    let i = grid.idx(x, y, z);
-                    if d >= -dx && d < 0.0 && cells[i] == FLUID {
-                        cells[i] = PORT_BASE + k as u8;
-                        counts[k] += 1;
-                    } else if p.plug && d >= 0.0 && d < 2.0 * dx && cells[i] == FLUID {
-                        cells[i] = SOLID;
-                    }
-                }
-            }
-        }
+        counts[k] = mark_cap(&grid, &mut cells, &p.cap, PORT_BASE + k as u8, p.plug);
     }
     // Flood fill from port cells through fluid.
     let mut reach = vec![false; grid.len()];
@@ -228,6 +207,44 @@ pub fn build_domain_ext(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm:
         }
     }
     Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed }
+}
+
+/// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
+/// with `plug`, the cells just in front are closed. Returns the number of cells marked.
+fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool) -> usize {
+    if cap.is_surface() {
+        return mark_surface_cap(grid, cells, cap, code, plug);
+    }
+    let dx = grid.dx;
+    let mut count = 0;
+    let poly = cap.polygon_2d();
+    let holes = cap.holes_2d();
+    let mut bb = Aabb::empty();
+    for v in &cap.polygon {
+        bb.grow(*v);
+    }
+    let bb = bb.expanded(2.0 * dx);
+    let lo = [0, 1, 2].map(|i| (((bb.min[i] - grid.origin[i]) / dx).floor().max(0.0)) as usize);
+    let hi = [0, 1, 2].map(|i| ((((bb.max[i] - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
+    for z in lo[2]..hi[2] {
+        for y in lo[1]..hi[1] {
+            for x in lo[0]..hi[0] {
+                let c = grid.center(x, y, z);
+                if !cap.contains_in_opening(&poly, &holes, c) {
+                    continue;
+                }
+                let d = cap.height(c);
+                let i = grid.idx(x, y, z);
+                if d >= -dx && d < 0.0 && cells[i] == FLUID {
+                    cells[i] = code;
+                    count += 1;
+                } else if plug && d >= 0.0 && d < 2.0 * dx && cells[i] == FLUID {
+                    cells[i] = SOLID;
+                }
+            }
+        }
+    }
+    count
 }
 
 /// Mark the cells just inside a non-planar cap: fluid cells within one cell behind each cap triangle

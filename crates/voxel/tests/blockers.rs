@@ -1,0 +1,21 @@
+use peregrine_core::{find_port_candidates, shapes, Aabb};
+use peregrine_voxel::{build_domain_full, leak_check, PortSpec, PORT_BASE};
+
+/// A tube with an inlet at one end and its other end open: air escapes there unless the end is blocked.
+fn leaks(block_far_end: bool) -> bool {
+    let tube = shapes::hollow_tube(8.0, 4.0, 20.0);
+    let caps = find_port_candidates(&tube, 1.0);
+    let inlet = caps.iter().find(|c| c.cap.normal[0] < 0.0).unwrap().cap.clone();
+    let far = caps.iter().find(|c| c.cap.normal[0] > 0.0).unwrap().cap.clone();
+    let blockers = if block_far_end { vec![far] } else { vec![] };
+    let mut bb = Aabb::empty();
+    bb.union(&tube.bounds());
+    let d = build_domain_full(&[&tube], &[], 0.0, &[PortSpec { cap: inlet, plug: true }], &blockers, &bb.expanded(3.0), 0.5);
+    leak_check(&d, &[PORT_BASE]).is_some()
+}
+
+#[test]
+fn a_blocker_shuts_an_opening() {
+    assert!(leaks(false), "an unblocked open end must leak");
+    assert!(!leaks(true), "a blocked end must not leak");
+}

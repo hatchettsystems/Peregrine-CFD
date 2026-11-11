@@ -19,15 +19,72 @@ use std::sync::{Arc, Mutex};
 use viewport::Camera;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool { Orbit, Pan, PickPort, Slice, Rim, Draw }
+enum Tool { Orbit, Pan, PickPort, Slice, Rim, Draw, Block }
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab { Bodies, Ports, Results }
+enum Tab { Bodies, Ports, Results, Exceptions }
 /// What the active tab asks the tab shell to do after the frame.
 enum ShellCmd { New, Duplicate, Close(usize), Switch(usize) }
 
 /// An edge loop found by the Rim tool with its quality scores.
 #[derive(Clone)]
 struct RimInfo { l: peregrine_core::RimLoop, vis: f64, clear: f64 }
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Sev { Info, Warning, Error }
+
+/// One entry of the Exceptions tab: a short title, a severity and the full explanation.
+#[derive(Clone)]
+struct Issue { sev: Sev, title: String, detail: String }
+
+/// Turn a free-text solver / setup message into a titled issue (titles are fixed so the list reads the same every run).
+fn classify_issue(msg: &str) -> Issue {
+    let quoted = msg.split('\'').nth(1).map(|x| x.to_string());
+    let (sev, title) = if msg.contains("ESTIMATED") {
+        (Sev::Warning, format!("Estimated fan curve{}", quoted.map(|q| format!(": {q}")).unwrap_or_default()))
+    } else if msg.starts_with("Air can leave") {
+        (Sev::Warning, "Air leaks out of the duct".to_string())
+    } else if msg.starts_with("Reference speed raised") {
+        (Sev::Info, "Reference speed raised".to_string())
+    } else if msg.contains("too coarse") {
+        (Sev::Warning, "Cells too coarse for the physical viscosity".to_string())
+    } else if msg.starts_with("Viscosity is") {
+        (Sev::Warning, "Effective viscosity inflated".to_string())
+    } else if msg.contains("ray columns") {
+        (Sev::Warning, "Geometry may not be watertight".to_string())
+    } else if msg.contains("not accounted for") {
+        (Sev::Warning, "Flow does not balance".to_string())
+    } else {
+        (Sev::Warning, "Notice".to_string())
+    };
+    Issue { sev, title, detail: msg.to_string() }
+}
+
+/// Everything worth flagging about a run, ordered errors first.
+fn issues_of(s: &Snapshot) -> Vec<Issue> {
+    let mut v: Vec<Issue> = vec![];
+    if let Some(e) = &s.error { v.push(Issue { sev: Sev::Error, title: "Simulation failed".into(), detail: e.clone() }); }
+    for w in &s.warnings { v.push(classify_issue(w)); }
+    if s.inflation > 3.0 { v.push(classify_issue(&format!("Viscosity is {:.0}x physical at this cell size: patterns are qualitative, pressures overestimated.", s.inflation))); }
+    let q_in: f64 = s.report.iter().filter(|r| r.inlet).map(|r| r.flow_l_min).sum();
+    let net: f64 = s.report.iter().map(|r| r.flow_l_min).sum();
+    if q_in > 1e-6 && net.abs() > 0.08 * q_in && s.step > 2000 {
+        v.push(classify_issue(&format!("{:.1} L/min of the {:.1} L/min going in is not accounted for by your outlets. Air is probably leaving through duct openings you did not define as ports (or the run has not settled yet).", net.abs(), q_in)));
+    }
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|i| seen.insert(i.title.clone()));
+    v.sort_by(|a, b| b.sev.cmp(&a.sev));
+    v
+}
+
+fn chip(ui: &mut egui::Ui, text: &str, col: Color32) {
+    egui::Frame::new().fill(col).corner_radius(egui::CornerRadius::same(7)).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
+        ui.label(egui::RichText::new(text).size(10.5).strong().color(Color32::BLACK));
+    });
+}
+
+fn sev_color(s: Sev) -> Color32 {
+    match s { Sev::Error => Color32::from_rgb(0xE0, 0x5A, 0x4F), Sev::Warning => Color32::from_rgb(0xF2, 0xD0, 0x3A), Sev::Info => Color32::from_rgb(0x6C, 0xB4, 0xF0) }
+}
 
 #[derive(Clone)]
 struct TabInfo { title: String, running: bool }
@@ -91,6 +148,15 @@ struct App {
     screw_max_d: f64,
     detect_curved: bool,
     show_hidden: bool,
+    show_ports: bool,
+    line_cutoff: f32,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+    last_project: Option<(String, Project)>,
+    block_cands: Vec<(String, PortCandidate)>,
+    block_max_d: f64,
+    block_stale: bool,
+    sel_block: Option<usize>,
     draw_close_requested: bool,
     draw_undo_requested: bool,
     draw_clear_requested: bool,
@@ -151,6 +217,8 @@ fn main() -> eframe::Result {
             if a == "--hide" { if let Some(n) = args.get(i + 1) { if let Some(k) = app.bodies.iter().position(|b| &b.name == n) { app.visible[k] = false; } } }
             if a == "--frame" { if let Some(n) = args.get(i + 1) { if let Some(b) = app.bodies.iter().find(|b| &b.name == n) { let bb = b.mesh.bounds(); app.cam.frame(bb.min, bb.max); } } }
             if a == "--show-hidden" { app.show_hidden = true; app.refresh_candidates(); }
+            if a == "--tab" { match args.get(i + 1).map(|v| v.as_str()) { Some("ports") => app.tab = Tab::Ports, Some("results") => app.tab = Tab::Results, Some("exceptions") => app.tab = Tab::Exceptions, _ => {} } }
+            if a == "--tool" { match args.get(i + 1).map(|v| v.as_str()) { Some("block") => app.tool = Tool::Block, Some("draw") => app.tool = Tool::Draw, _ => {} } }
             if a == "--yaw" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.yaw = v.to_radians(); } }
             if a == "--pitch" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.pitch = v.to_radians(); } }
         }
@@ -191,6 +259,15 @@ impl App {
             screw_max_d: 6.0,
             detect_curved: true,
             show_hidden: false,
+            show_ports: true,
+            line_cutoff: 0.0,
+            undo: vec![],
+            redo: vec![],
+            last_project: None,
+            block_cands: vec![],
+            block_max_d: 12.0,
+            block_stale: true,
+            sel_block: None,
             draw_close_requested: false,
             draw_undo_requested: false,
             draw_clear_requested: false,
@@ -246,6 +323,7 @@ impl App {
         if !self.show_hidden { self.candidates.retain(|c| c.1.visibility >= 0.5 && c.1.clearance >= 0.5); }
         self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
+        self.block_stale = true;
     }
 
     /// Mesh of the duct that `body` belongs to (all its parts), or just the body itself.
@@ -317,6 +395,115 @@ impl App {
             }
             None => self.status = "Could not build a cap for that loop.".into(),
         }
+    }
+
+    // ---------- blockers (shut openings) ----------
+
+    fn blocker_at(&self, cap: &PortCap) -> Option<usize> {
+        let ctr = cap.centroid();
+        self.project.blockers.iter().position(|b| len(sub(b.cap.centroid(), ctr)) < 0.05 && dot(b.cap.normal, cap.normal) > 0.99)
+    }
+
+    /// Find the small openings (screw holes and the like) that can be shut.
+    fn refresh_block_cands(&mut self) {
+        let max_d = self.block_max_d;
+        let mut c = duct_port_candidates(&self.bodies, &self.project.ducts, 0.05, None, false);
+        c.retain(|x| x.1.equiv_diameter <= max_d);
+        self.block_cands = c;
+        self.block_stale = false;
+        self.sel_block = None;
+    }
+
+    fn add_blocker(&mut self, body: String, cap: PortCap) {
+        if self.blocker_at(&cap).is_some() { return; }
+        // a port that sat on this opening is replaced by the blocker
+        let ctr = cap.centroid();
+        self.project.ports.retain(|p| !(len(sub(p.cap.centroid(), ctr)) < 0.05 && dot(p.cap.normal, cap.normal) > 0.99));
+        let name = Self::unique_name(|n| self.project.blockers.iter().any(|b| b.name == n), "block");
+        self.project.blockers.push(peregrine_project::Blocker { name, body, cap });
+        self.sel_port = None;
+    }
+
+    fn remove_blocker(&mut self, i: usize) {
+        if i < self.project.blockers.len() { self.project.blockers.remove(i); }
+        self.sel_block = None;
+    }
+
+    fn add_rim_blocker(&mut self, li: usize) {
+        let (Some(info), Some(bi)) = (self.rim_loops.get(li).cloned(), self.rim_body) else { return };
+        let (duct, mesh) = self.duct_mesh_and_name(bi);
+        match cap_from_loop_with_grid(&info.l.points, &RayGrid::new(&mesh)) {
+            Some(cap) => {
+                let area = cap.area();
+                self.add_blocker(duct, cap);
+                self.rim_loops.clear();
+                self.rim_sel = None;
+                self.status = format!("Blocked a {:.1} mm² opening: it is now closed in the simulation.", area);
+            }
+            None => self.status = "Could not build a cap for that loop.".into(),
+        }
+    }
+
+    // ---------- undo / redo of the project (ports, sources, blockers, ducts, settings) ----------
+
+    /// Called every frame after the UI: when something in the project changed, remember the state before it.
+    fn track_changes(&mut self, ctx: &egui::Context) {
+        let active = ctx.input(|i| i.pointer.any_released() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_))));
+        if !active && self.last_project.is_some() { return; }
+        let now = format!("{:?}", self.project);
+        match &self.last_project {
+            None => self.last_project = Some((now, self.project.clone())),
+            Some((old, prev)) if *old != now => {
+                self.undo.push(prev.clone());
+                if self.undo.len() > 100 { self.undo.remove(0); }
+                self.redo.clear();
+                self.last_project = Some((now, self.project.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    fn reset_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.last_project = None;
+    }
+
+    fn apply_project(&mut self, p: Project) {
+        let reclass = format!("{:?}{:?}", p.ducts, p.geometry) != format!("{:?}{:?}", self.project.ducts, self.project.geometry);
+        self.project = p;
+        self.sel_port = None;
+        self.sel_block = None;
+        self.last_project = Some((format!("{:?}", self.project), self.project.clone()));
+        if reclass { self.reclassify(); }
+    }
+
+    fn undo_project(&mut self) {
+        if self.tool == Tool::Draw && !self.draw_pts.is_empty() { self.draw_undo(); return; }
+        self.track_changes_now();
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(self.project.clone());
+            self.apply_project(prev);
+            self.status = "Undo".into();
+        }
+    }
+
+    fn redo_project(&mut self) {
+        self.track_changes_now();
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.project.clone());
+            self.apply_project(next);
+            self.status = "Redo".into();
+        }
+    }
+
+    /// Record a pending change right away (so undo never skips an edit that has not been sampled yet).
+    fn track_changes_now(&mut self) {
+        let now = format!("{:?}", self.project);
+        if let Some((old, prev)) = &self.last_project {
+            if *old != now { self.undo.push(prev.clone()); self.redo.clear(); }
+        }
+        self.last_project = Some((now, self.project.clone()));
     }
 
     // ---------- hand-drawn edge loop ----------
@@ -446,6 +633,7 @@ impl App {
     }
 
     fn load_demo(&mut self) {
+        self.reset_history();
         self.project = Project::new("demo");
         self.project.solver.cell_size_mm = 0.5;
         self.project.solver.reference_speed = 12.0;
@@ -468,6 +656,7 @@ impl App {
     fn open_geometry(&mut self, path: PathBuf) {
         match load_bodies(&path, &self.project) {
             Ok(b) => {
+                self.reset_history();
                 let n = b.len();
                 self.project.geometry_file = Some(path.clone());
                 if self.project.name.starts_with("untitled") {
@@ -508,6 +697,7 @@ impl App {
     fn load_project_file(&mut self, p: PathBuf) {
         match Project::load(&p) {
             Ok(pr) => {
+                self.reset_history();
                 self.project = pr;
                 self.project_path = Some(p.clone());
                 if let Some(g) = self.project.geometry_file.clone() {
@@ -754,7 +944,7 @@ impl App {
 
     fn options_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice", Tool::Rim => "Curved Opening", Tool::Draw => "Draw Loop" }).strong());
+            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice", Tool::Rim => "Curved Opening", Tool::Draw => "Draw Loop", Tool::Block => "Blocker" }).strong());
             ui.separator();
             ui.label("Cell size");
             ui.add(egui::DragValue::new(&mut self.project.solver.cell_size_mm).speed(0.01).range(0.05..=2.0).suffix(" mm"));
@@ -786,7 +976,7 @@ impl App {
     fn tool_palette(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.vertical_centered(|ui| {
-            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Rim, "Curved opening: click the rim or the wall at a non-flat opening (R)"), (Tool::Draw, "Draw an edge loop by hand: click points along the rim (L)"), (Tool::Slice, "Slice (S)")] {
+            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Rim, "Curved opening: click the rim or the wall at a non-flat opening (R)"), (Tool::Draw, "Draw an edge loop by hand: click points along the rim (L)"), (Tool::Block, "Blocker: click a small hole to close it, or draw a loop and add it as a blocker (B)"), (Tool::Slice, "Slice (S)")] {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
                 let selected = self.tool == t;
                 let bg = if selected { theme::ACCENT } else if resp.hovered() { theme::WIDGET_HOVER } else { theme::WIDGET };
@@ -1117,6 +1307,13 @@ impl App {
             if ui.button("New velocity source").clicked() { let n = self.add_default_source(2); self.assign_to_source(t, &n); ui.close_menu(); }
         });
         if ui.button("Pressure outlet").clicked() { self.make_outlet(t); ui.close_menu(); }
+        if ui.button("Block (close this opening)").clicked() {
+            match t {
+                Target::Cand(i) => { if let Some((b, c)) = self.candidates.get(i).cloned() { self.add_blocker(b, c.cap); } }
+                Target::Port(i) => { let (b, c) = (self.project.ports[i].body.clone(), self.project.ports[i].cap.clone()); self.add_blocker(b, c); }
+            }
+            ui.close_menu();
+        }
         if let Target::Port(i) = t {
             ui.separator();
             if ui.button("Show in Ports panel").clicked() { self.sel_port = Some(i); self.tab = Tab::Ports; ui.close_menu(); }
@@ -1125,6 +1322,11 @@ impl App {
     }
 
     fn ports_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.undo.is_empty() || self.last_project.as_ref().map_or(false, |(d, _)| *d != format!("{:?}", self.project)), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() { self.undo_project(); }
+            if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Ctrl+Shift+Z or Ctrl+Y").clicked() { self.redo_project(); }
+            ui.label(egui::RichText::new(format!("{} step(s)", self.undo.len())).color(theme::TEXT_DIM));
+        });
         theme::section(ui, "Sources", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.menu_button("+ Fan", |ui| {
@@ -1145,6 +1347,35 @@ impl App {
         }
         theme::section(ui, "Openings", |ui| self.openings_ui(ui));
         theme::section(ui, "Outlets", |ui| self.outlets_ui(ui));
+        theme::section(ui, "Blockers", |ui| self.blockers_ui(ui));
+    }
+
+    fn blockers_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Shut a hole so no air passes (screw holes, unused vents). Use the Blocker tool (B) and click a hole, or right-click any opening > Block. A hole that is not found can be drawn with the Draw Loop tool (L) and added as a blocker.").color(theme::TEXT_DIM));
+        ui.horizontal(|ui| {
+            ui.label("Find holes up to");
+            if ui.add(egui::DragValue::new(&mut self.block_max_d).speed(0.2).range(0.5..=60.0).suffix(" mm")).changed() { self.block_stale = true; }
+            if ui.button("Find").clicked() { self.refresh_block_cands(); self.tool = Tool::Block; }
+        });
+        if self.block_stale && !self.bodies.is_empty() && self.tool == Tool::Block { self.refresh_block_cands(); }
+        let open: Vec<usize> = (0..self.block_cands.len()).filter(|&i| self.blocker_at(&self.block_cands[i].1.cap).is_none()).collect();
+        if !self.block_cands.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} small hole(s) open", open.len()));
+                if !open.is_empty() && ui.button("Block all").clicked() {
+                    for &i in &open { let (b, c) = self.block_cands[i].clone(); self.add_blocker(b, c.cap); }
+                }
+            });
+        }
+        let mut remove = None;
+        for (i, b) in self.project.blockers.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("x").color(Color32::from_rgb(0xE0, 0x4A, 0x4A)));
+                if ui.selectable_label(self.sel_block == Some(i), format!("{}  {:.1} mm²", b.name, b.cap.area())).clicked() { self.sel_block = Some(i); }
+                if ui.small_button("Remove").clicked() { remove = Some(i); }
+            });
+        }
+        if let Some(i) = remove { self.remove_blocker(i); }
     }
 
     fn sources_ui(&mut self, ui: &mut egui::Ui) {
@@ -1270,6 +1501,7 @@ impl App {
             ui.separator();
             ui.label(egui::RichText::new("Edge loops at your click").strong());
             let mut add: Option<usize> = None;
+            let mut block: Option<usize> = None;
             for li in 0..self.rim_loops.len() {
                 let info = &self.rim_loops[li];
                 let l = &info.l;
@@ -1278,9 +1510,11 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.rim_sel == Some(li), text).clicked() { self.rim_sel = Some(li); }
                     if self.rim_sel == Some(li) && ui.button("Add as opening").clicked() { add = Some(li); }
+                    if self.rim_sel == Some(li) && ui.button("Add as blocker").clicked() { block = Some(li); }
                 });
             }
             if let Some(li) = add { self.add_rim_opening(li); }
+            if let Some(li) = block { self.add_rim_blocker(li); }
             ui.separator();
         }
         ui.horizontal(|ui| {
@@ -1343,6 +1577,34 @@ impl App {
         if let Some(i) = remove { self.project.ports.remove(i); self.sel_port = None; }
     }
 
+    fn current_issues(&self) -> Vec<Issue> {
+        match &self.last { Some(s) => issues_of(&s.lock().unwrap()), None => vec![] }
+    }
+
+    fn issue_counts(&self) -> (usize, usize) {
+        let v = self.current_issues();
+        (v.iter().filter(|i| i.sev == Sev::Error).count(), v.iter().filter(|i| i.sev == Sev::Warning).count())
+    }
+
+    fn exceptions_panel(&mut self, ui: &mut egui::Ui) {
+        let issues = self.current_issues();
+        if issues.is_empty() {
+            ui.label(egui::RichText::new(if self.last.is_some() { "No warnings or errors." } else { "Nothing to report yet. Warnings and errors from a run appear here." }).color(theme::TEXT_DIM));
+            return;
+        }
+        ui.label(egui::RichText::new("Click an item to read the details.").color(theme::TEXT_DIM));
+        ui.add_space(2.0);
+        for (k, it) in issues.iter().enumerate() {
+            let id = ui.make_persistent_id(("issue", &it.title, k));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    chip(ui, match it.sev { Sev::Error => "ERROR", Sev::Warning => "WARNING", Sev::Info => "INFO" }, sev_color(it.sev));
+                    ui.label(egui::RichText::new(&it.title).strong());
+                })
+                .body(|ui| { ui.label(egui::RichText::new(&it.detail).color(theme::TEXT)); });
+        }
+    }
+
     fn results_panel(&mut self, ui: &mut egui::Ui) {
         let Some(snap) = self.last.clone() else {
             ui.label(egui::RichText::new("No results yet. Press Run.").color(theme::TEXT_DIM));
@@ -1352,9 +1614,15 @@ impl App {
         theme::section(ui, "Run", |ui| {
             ui.add(egui::ProgressBar::new(if s.total > 0 { s.step as f32 / s.total as f32 } else { 0.0 }).text(format!("{} / {}", s.step, s.total)).fill(theme::ACCENT));
             ui.label(format!("Engine: {}", s.engine));
-            if let Some(e) = &s.error { ui.colored_label(Color32::from_rgb(0xE0, 0x5A, 0x4F), e); }
-            for w in &s.warnings { ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), w); }
-            if s.inflation > 3.0 { ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), format!("Viscosity is {:.0}x physical at this cell size: patterns are qualitative, pressures overestimated.", s.inflation)); }
+            let iss = issues_of(&s);
+            if !iss.is_empty() {
+                let (e, w) = (iss.iter().filter(|i| i.sev == Sev::Error).count(), iss.iter().filter(|i| i.sev == Sev::Warning).count());
+                ui.horizontal(|ui| {
+                    if e > 0 { chip(ui, &format!("{e} error{}", if e == 1 { "" } else { "s" }), sev_color(Sev::Error)); }
+                    if w > 0 { chip(ui, &format!("{w} warning{}", if w == 1 { "" } else { "s" }), sev_color(Sev::Warning)); }
+                    if ui.link("Details").clicked() { self.tab = Tab::Exceptions; }
+                });
+            }
         });
         theme::section(ui, "Flow report", |ui| {
             egui::Grid::new("rep").striped(true).show(ui, |ui| {
@@ -1386,13 +1654,6 @@ impl App {
                 }
             });
         });
-        {
-            let q_in: f64 = s.report.iter().filter(|r| r.inlet).map(|r| r.flow_l_min).sum();
-            let net: f64 = s.report.iter().map(|r| r.flow_l_min).sum();
-            if q_in > 1e-6 && net.abs() > 0.08 * q_in && s.step > 2000 {
-                ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), format!("{:.1} L/min of the {:.1} L/min going in is not accounted for by your outlets. Air is probably leaving through duct openings you did not define as ports (or the run has not settled yet).", net.abs(), q_in));
-            }
-        }
         theme::section(ui, "Display", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Mesh");
@@ -1400,6 +1661,7 @@ impl App {
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Ghost, "Ghost");
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Hidden, "Hidden");
             });
+            ui.checkbox(&mut self.show_ports, "Show ports, openings and blockers").on_hover_text("Turn off to see only the geometry and the flow.");
             ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
             if self.show_lines {
                 ui.horizontal(|ui| {
@@ -1408,6 +1670,7 @@ impl App {
                     ui.selectable_value(&mut self.line_color, LineColor::Source, "Source");
                 });
                 ui.add(egui::Slider::new(&mut self.line_width, 0.5..=5.0).text("width"));
+                ui.add(egui::Slider::new(&mut self.line_cutoff, 0.0..=self.lines_vmax.max(0.5)).text("cutoff m/s")).on_hover_text("Hide every part of a streamline slower than this. 0 shows everything.");
                 ui.label(egui::RichText::new("Lines per source").color(theme::TEXT_DIM));
                 for src in &mut self.project.sources {
                     ui.horizontal(|ui| {
@@ -1487,20 +1750,42 @@ impl App {
             if !s.speed.is_empty() { draw_slice(&painter, rect, &self.cam, &s, self.field, self.slice_axis, self.slice_pos); }
         }
         if self.show_lines && !self.lines.is_empty() {
-            draw_streamlines(&painter, rect, &self.cam, &self.lines, self.line_color, self.lines_vmax, self.line_width);
+            draw_streamlines(&painter, rect, &self.cam, &self.lines, self.line_color, self.lines_vmax, self.line_width, self.line_cutoff);
         }
         // port caps: unassigned openings in grey, assigned ports coloured
+        let show_ports = self.show_ports;
         for (i, (_, c)) in self.candidates.iter().enumerate() {
+            if !show_ports { break; }
             if self.port_for_cand(i).is_some() { continue; }
             let sel = self.sel_cand == Some(i);
             viewport::draw_polygon(&painter, rect, &self.cam, &c.cap.polygon, Stroke::new(if sel { 2.5 } else { 1.0 }, if sel { theme::ACCENT } else { Color32::from_gray(200) }));
         }
         for (i, p) in self.project.ports.iter().enumerate() {
+            if !show_ports { break; }
             let col = if p.kind.is_inlet() { theme::INLET } else { theme::OUTLET };
             viewport::draw_polygon(&painter, rect, &self.cam, &p.cap.polygon, Stroke::new(if self.sel_port == Some(i) { 3.5 } else { 2.5 }, col));
             if let Some((pos, _)) = self.cam.project(rect, p.cap.centroid()) {
                 let label = match p.kind.source() { Some(sname) => format!("{} <- {}", p.name, sname), None => p.name.clone() };
                 painter.text(pos + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), col);
+            }
+        }
+        // blockers: shut openings (red, crossed)
+        if show_ports {
+            if self.tool == Tool::Block {
+                if self.block_stale && !self.bodies.is_empty() { self.refresh_block_cands(); }
+                for (i, (_, c)) in self.block_cands.iter().enumerate() {
+                    if self.blocker_at(&c.cap).is_some() { continue; }
+                    let sel = self.sel_block == Some(i);
+                    viewport::draw_polygon(&painter, rect, &self.cam, &c.cap.polygon, Stroke::new(if sel { 3.0 } else { 1.5 }, Color32::from_rgb(0x2D, 0xC8, 0xF0)));
+                }
+            }
+            let red = Color32::from_rgb(0xE0, 0x4A, 0x4A);
+            for (i, b) in self.project.blockers.iter().enumerate() {
+                viewport::draw_polygon(&painter, rect, &self.cam, &b.cap.polygon, Stroke::new(if self.sel_block == Some(i) { 3.5 } else { 2.0 }, red));
+                if let Some((pos, _)) = self.cam.project(rect, b.cap.centroid()) {
+                    painter.line_segment([pos + Vec2::new(-3.5, -3.5), pos + Vec2::new(3.5, 3.5)], Stroke::new(1.5, red));
+                    painter.line_segment([pos + Vec2::new(-3.5, 3.5), pos + Vec2::new(3.5, -3.5)], Stroke::new(1.5, red));
+                }
             }
         }
         // loops found by the Rim tool
@@ -1520,7 +1805,7 @@ impl App {
             }
         }
         // hover highlight, left-click select, right-click menu
-        let hover = if resp.hovered() { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
+        let hover = if resp.hovered() && self.show_ports && self.tool != Tool::Block { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
         if let (Some(t), Some(pos)) = (hover, resp.hover_pos()) {
             if let Some(cap) = self.target_cap(t) {
                 viewport::draw_polygon(&painter, rect, &self.cam, &cap.polygon, Stroke::new(3.0, theme::ACCENT));
@@ -1547,7 +1832,29 @@ impl App {
                 }
             }
         }
-        if resp.clicked() && self.tool == Tool::Draw {
+        if resp.clicked() && self.tool == Tool::Block {
+            if let Some(pp) = resp.interact_pointer_pos() {
+                // an existing blocker is removed, a small hole is closed
+                let hit = |cap: &PortCap, cam: &Camera| -> Option<f32> {
+                    let pts: Vec<Option<(Pos2, f64)>> = cap.polygon.iter().map(|p| cam.project(rect, *p)).collect();
+                    if pts.len() < 3 || pts.iter().any(|p| p.is_none()) { return None; }
+                    let poly: Vec<[f64; 2]> = pts.iter().map(|p| { let q = p.unwrap().0; [q.x as f64, q.y as f64] }).collect();
+                    let c = cam.project(rect, cap.centroid()).map(|x| x.0)?;
+                    if point_in_polygon(&poly, [pp.x as f64, pp.y as f64]) { Some(0.0) } else if c.distance(pp) < 16.0 { Some(c.distance(pp)) } else { None }
+                };
+                let rm = (0..self.project.blockers.len()).filter_map(|i| hit(&self.project.blockers[i].cap, &self.cam).map(|d| (d, i))).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let add = (0..self.block_cands.len()).filter(|&i| self.blocker_at(&self.block_cands[i].1.cap).is_none()).filter_map(|i| hit(&self.block_cands[i].1.cap, &self.cam).map(|d| (d, i))).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                match (rm, add) {
+                    (Some((dr, i)), a) if a.map_or(true, |x| dr <= x.0) => { let n = self.project.blockers[i].name.clone(); self.remove_blocker(i); self.status = format!("Removed blocker {n}."); }
+                    (_, Some((_, i))) => {
+                        let (body, c) = self.block_cands[i].clone();
+                        self.status = format!("Blocked a {:.1} mm hole. Click a red outline to remove it again.", c.equiv_diameter);
+                        self.add_blocker(body, c.cap);
+                    }
+                    _ => self.status = "No small hole there. Draw its edge with the Draw Loop tool (L) and press 'Add as blocker'.".into(),
+                }
+            }
+        } else if resp.clicked() && self.tool == Tool::Draw {
             if let Some(pp) = resp.interact_pointer_pos() {
                 match self.pick_body_tri(rect, pp) {
                     Some((bi, ti)) => {
@@ -1630,31 +1937,45 @@ fn source_color(i: usize) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
 }
 
-fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[Streamline], mode: LineColor, vmax: f32, width: f32) {
+fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[Streamline], mode: LineColor, vmax: f32, width: f32, cutoff: f32) {
     let mut shapes: Vec<Shape> = Vec::with_capacity(lines.len() * 8);
     for l in lines {
-        let pts: Vec<Option<Pos2>> = l.pts.iter().map(|p| cam.project(rect, [p[0] as f64, p[1] as f64, p[2] as f64]).map(|x| x.0)).collect();
-        let n = pts.len();
-        match mode {
-            LineColor::Source => {
-                let mut run: Vec<Pos2> = vec![];
-                for p in pts.iter().chain(std::iter::once(&None)) {
-                    match p {
-                        Some(q) => run.push(*q),
-                        None => { if run.len() > 1 { shapes.push(Shape::line(std::mem::take(&mut run), Stroke::new(width, source_color(l.source)))); } else { run.clear(); } }
+        // parts of the line that are fast enough to show (the whole line when there is no cutoff)
+        let mut runs: Vec<(usize, usize)> = vec![];
+        if cutoff <= 0.0 {
+            runs.push((0, l.pts.len()));
+        } else {
+            let mut start: Option<usize> = None;
+            for (i, &v) in l.speed.iter().enumerate() {
+                if v >= cutoff { if start.is_none() { start = Some(i); } } else if let Some(a) = start.take() { runs.push((a, i)); }
+            }
+            if let Some(a) = start { runs.push((a, l.speed.len())); }
+        }
+        for (a, b) in runs {
+            let pts: Vec<Option<Pos2>> = l.pts[a..b].iter().map(|p| cam.project(rect, [p[0] as f64, p[1] as f64, p[2] as f64]).map(|x| x.0)).collect();
+            let spd = &l.speed[a..b];
+            let n = pts.len();
+            match mode {
+                LineColor::Source => {
+                    let mut run: Vec<Pos2> = vec![];
+                    for p in pts.iter().chain(std::iter::once(&None)) {
+                        match p {
+                            Some(q) => run.push(*q),
+                            None => { if run.len() > 1 { shapes.push(Shape::line(std::mem::take(&mut run), Stroke::new(width, source_color(l.source)))); } else { run.clear(); } }
+                        }
                     }
                 }
-            }
-            LineColor::Speed => {
-                let mut i = 0;
-                while i + 1 < n {
-                    let j = (i + 4).min(n - 1);
-                    let seg: Vec<Pos2> = pts[i..=j].iter().flatten().copied().collect();
-                    if seg.len() == j - i + 1 {
-                        let v = l.speed[i..=j].iter().sum::<f32>() / (j - i + 1) as f32;
-                        shapes.push(Shape::line(seg, Stroke::new(width, theme::ramp(v / vmax))));
+                LineColor::Speed => {
+                    let mut i = 0;
+                    while i + 1 < n {
+                        let j = (i + 4).min(n - 1);
+                        let seg: Vec<Pos2> = pts[i..=j].iter().flatten().copied().collect();
+                        if seg.len() == j - i + 1 {
+                            let v = spd[i..=j].iter().sum::<f32>() / (j - i + 1) as f32;
+                            shapes.push(Shape::line(seg, Stroke::new(width, theme::ramp(v / vmax))));
+                        }
+                        i = j;
                     }
-                    i = j;
                 }
             }
         }
@@ -1756,6 +2077,11 @@ fn draw_tool_icon(p: &egui::Painter, r: Rect, t: Tool) {
             p.add(Shape::line(pts, s));
             p.circle_filled(c + Vec2::new(8.0, 0.0), 2.2, Color32::WHITE);
         }
+        Tool::Block => {
+            p.circle_stroke(c, 8.0, s);
+            p.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], s);
+            p.line_segment([c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)], s);
+        }
         Tool::Slice => {
             p.rect_stroke(Rect::from_center_size(c, Vec2::splat(16.0)), 0.0, s, egui::StrokeKind::Inside);
             p.line_segment([c - Vec2::new(8.0, -3.0), c + Vec2::new(8.0, 3.0)], s);
@@ -1827,7 +2153,11 @@ impl App {
         if std::mem::take(&mut self.draw_close_requested) { self.draw_close(); }
         if std::mem::take(&mut self.draw_undo_requested) { self.draw_undo(); }
         if std::mem::take(&mut self.draw_clear_requested) { self.draw_clear(); }
+        let kb = ctx.wants_keyboard_input();
+        let (mut do_undo, mut do_redo) = (false, false);
         ctx.input(|i| {
+            if !kb && i.modifiers.command && i.key_pressed(egui::Key::Z) { if i.modifiers.shift { do_redo = true; } else { do_undo = true; } }
+            if !kb && i.modifiers.command && i.key_pressed(egui::Key::Y) { do_redo = true; }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::T) { self.cmds.push(ShellCmd::New); }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::W) { self.cmds.push(ShellCmd::Close(self.tab_active)); }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Tab) && !self.tab_infos.is_empty() { self.cmds.push(ShellCmd::Switch((self.tab_active + 1) % self.tab_infos.len())); }
@@ -1838,6 +2168,7 @@ impl App {
             if i.key_pressed(egui::Key::S) { self.tool = Tool::Slice; }
             if i.key_pressed(egui::Key::R) { self.tool = Tool::Rim; }
             if i.key_pressed(egui::Key::L) { self.tool = Tool::Draw; }
+            if i.key_pressed(egui::Key::B) { self.tool = Tool::Block; self.block_stale = true; }
             if self.tool == Tool::Draw {
                 if i.key_pressed(egui::Key::Enter) { self.draw_close_requested = true; }
                 if i.key_pressed(egui::Key::Backspace) { self.draw_undo_requested = true; }
@@ -1847,6 +2178,8 @@ impl App {
                 self.mesh_mode = match self.mesh_mode { MeshMode::Shaded => MeshMode::Ghost, MeshMode::Ghost => MeshMode::Hidden, MeshMode::Hidden => MeshMode::Shaded };
             }
         });
+        if do_undo { self.undo_project(); }
+        if do_redo { self.redo_project(); }
         let bar = egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(8, 3)).stroke(Stroke::new(1.0, theme::BORDER));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("options").frame(bar).exact_height(30.0).show(ctx, |ui| self.options_bar(ui));
@@ -1860,10 +2193,16 @@ impl App {
         egui::SidePanel::right("dock").default_width(320.0).min_width(260.0)
             .frame(egui::Frame::new().fill(theme::APP_BG).inner_margin(egui::Margin::same(6)).stroke(Stroke::new(1.0, theme::BORDER))).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (t, n) in [(Tab::Bodies, "Bodies"), (Tab::Ports, "Ports"), (Tab::Results, "Results")] {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    let (n_err, n_warn) = self.issue_counts();
+                    for (t, n) in [(Tab::Bodies, "Bodies"), (Tab::Ports, "Ports"), (Tab::Results, "Results"), (Tab::Exceptions, "Exceptions")] {
                         let sel = self.tab == t;
                         let text = egui::RichText::new(n).color(if sel { Color32::WHITE } else { theme::TEXT_DIM });
                         if ui.add(egui::Button::new(text).fill(if sel { theme::BAR } else { theme::APP_BG }).stroke(Stroke::NONE)).clicked() { self.tab = t; }
+                        if t == Tab::Exceptions {
+                            if n_err > 0 { chip(ui, &n_err.to_string(), sev_color(Sev::Error)); }
+                            if n_warn > 0 { chip(ui, &n_warn.to_string(), sev_color(Sev::Warning)); }
+                        }
                     }
                 });
                 ui.separator();
@@ -1871,9 +2210,11 @@ impl App {
                     Tab::Bodies => self.bodies_panel(ui),
                     Tab::Ports => self.ports_panel(ui),
                     Tab::Results => self.results_panel(ui),
+                    Tab::Exceptions => self.exceptions_panel(ui),
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::CANVAS)).show(ctx, |ui| self.viewport_ui(ui));
+        self.track_changes(ctx);
     }
 }
 

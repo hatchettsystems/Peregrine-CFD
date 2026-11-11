@@ -205,6 +205,14 @@ impl Default for SolverSettings {
     }
 }
 
+/// A closed opening (screw hole, vent, unused slot): its cap is filled solid so no air passes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Blocker {
+    pub name: String,
+    pub body: String,
+    pub cap: PortCap,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -225,6 +233,9 @@ pub struct Project {
     pub ports: Vec<Port>,
     #[serde(default)]
     pub sources: Vec<Source>,
+    /// Openings the user has shut (screw holes and the like).
+    #[serde(default)]
+    pub blockers: Vec<Blocker>,
 }
 
 impl Project {
@@ -330,6 +341,7 @@ impl Project {
             ducts: vec![],
             ports: vec![],
             sources: vec![],
+            blockers: vec![],
         }
     }
     pub fn load(path: &Path) -> anyhow::Result<Project> {
