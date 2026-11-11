@@ -143,6 +143,10 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
     let [nx, ny, nz] = grid.dims;
     let mut counts = vec![0usize; ports.len()];
     for (k, p) in ports.iter().enumerate() {
+        if p.cap.is_surface() {
+            counts[k] = mark_surface_cap(&grid, &mut cells, &p.cap, PORT_BASE + k as u8, p.plug);
+            continue;
+        }
         let poly = p.cap.polygon_2d();
         let mut bb = Aabb::empty();
         for v in &p.cap.polygon {
@@ -200,4 +204,64 @@ pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: 
         }
     }
     Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed }
+}
+
+/// Mark the cells just inside a non-planar cap: fluid cells within one cell behind each cap triangle
+/// become port cells; for inlets the cells just in front are closed. Returns the number of port cells.
+fn mark_surface_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool) -> usize {
+    let dx = grid.dx;
+    let mut count = 0;
+    for pass in 0..2 {
+        if pass == 1 && !plug {
+            break;
+        }
+        for t in &cap.triangles {
+            let (e1, e2) = (sub(t[1], t[0]), sub(t[2], t[0]));
+            let cr = cross(e1, e2);
+            let area2 = len(cr);
+            if area2 < 1e-9 {
+                continue;
+            }
+            let n = scale(cr, 1.0 / area2);
+            let mut bb = Aabb::empty();
+            for v in t {
+                bb.grow(*v);
+            }
+            let bb = bb.expanded(2.0 * dx);
+            let lo = [0, 1, 2].map(|i| (((bb.min[i] - grid.origin[i]) / dx).floor().max(0.0)) as usize);
+            let hi = [0, 1, 2].map(|i| ((((bb.max[i] - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
+            for z in lo[2]..hi[2] {
+                for y in lo[1]..hi[1] {
+                    for x in lo[0]..hi[0] {
+                        let c = grid.center(x, y, z);
+                        let d = dot(sub(c, t[0]), n);
+                        if d < -dx || d >= 2.0 * dx {
+                            continue;
+                        }
+                        // barycentric test of the projection onto the triangle's plane
+                        let q = sub(sub(c, t[0]), scale(n, d));
+                        let (d11, d12, d22) = (dot(e1, e1), dot(e1, e2), dot(e2, e2));
+                        let (d1, d2) = (dot(q, e1), dot(q, e2));
+                        let det = d11 * d22 - d12 * d12;
+                        if det.abs() < 1e-18 {
+                            continue;
+                        }
+                        let u = (d22 * d1 - d12 * d2) / det;
+                        let v = (d11 * d2 - d12 * d1) / det;
+                        if u < -0.02 || v < -0.02 || u + v > 1.02 {
+                            continue;
+                        }
+                        let i = grid.idx(x, y, z);
+                        if pass == 0 && d < 0.0 && cells[i] == FLUID {
+                            cells[i] = code;
+                            count += 1;
+                        } else if pass == 1 && d >= 0.0 && cells[i] == FLUID {
+                            cells[i] = SOLID;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
 }

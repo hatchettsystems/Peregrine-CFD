@@ -348,7 +348,7 @@ mod tests {
     }
     #[test]
     fn source_validation() {
-        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]] };
+        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![] };
         let mut p = Project::new("g");
         p.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         p.ports.push(Port { name: "a".into(), body: "d".into(), kind: PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, cap: cap.clone() });
@@ -389,10 +389,22 @@ mod tests {
     }
 
     #[test]
+    fn curved_cap_survives_save_and_load() {
+        let tri = [[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.5, 1.0, 1.5]];
+        let cap = PortCap { origin: [0.1, 0.9, 0.4], normal: [1.0, 0.0, 0.0], polygon: vec![tri[0], tri[1], tri[2]], triangles: vec![tri] };
+        let mut p = Project::new("c");
+        p.ports.push(Port { name: "scoop".into(), body: "duct".into(), kind: PortKind::PressureOutlet { pressure: 0.0 }, cap });
+        let q: Project = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert!(q.ports[0].cap.is_surface());
+        assert_eq!(q.ports[0].cap.triangles.len(), 1);
+        assert!((q.ports[0].cap.area() - p.ports[0].cap.area()).abs() < 1e-12);
+    }
+
+    #[test]
     fn roundtrip() {
         let mut p = Project::new("t");
         p.ports.push(Port { name: "in".into(), body: "duct".into(), kind: PortKind::FanInlet { curve: vec![(0.0, 300.0), (100.0, 0.0)] },
-            cap: PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]] } });
+            cap: PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]], triangles: vec![] } });
         let s = toml::to_string_pretty(&p).unwrap();
         let q: Project = toml::from_str(&s).unwrap();
         assert_eq!(q.ports.len(), 1);

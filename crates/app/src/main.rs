@@ -7,7 +7,7 @@ mod viewport;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use peregrine_core::port_cap::point_in_polygon;
 use peregrine_core::vec3::{dot, len, sub};
-use peregrine_core::{shapes, PortCandidate, PortCap};
+use peregrine_core::{cap_from_loop, shapes, smooth_region_loops, PortCandidate, PortCap, TriMesh};
 use peregrine_geom::{apply_roles, build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use viewport::Camera;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool { Orbit, Pan, PickPort, Slice }
+enum Tool { Orbit, Pan, PickPort, Slice, Rim }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results }
 /// What the active tab asks the tab shell to do after the frame.
@@ -85,6 +85,10 @@ struct App {
     ctx_target: Option<Target>,
     hide_screws: bool,
     screw_max_d: f64,
+    rim_loops: Vec<peregrine_core::RimLoop>,
+    rim_sel: Option<usize>,
+    rim_body: Option<usize>,
+    manual_openings: Vec<(String, PortCandidate)>,
     sel_bodies: Vec<usize>,
     duct_name_buf: String,
     scroll_to_body: Option<usize>,
@@ -162,6 +166,10 @@ impl App {
             ctx_target: None,
             hide_screws: true,
             screw_max_d: 6.0,
+            rim_loops: vec![],
+            rim_sel: None,
+            rim_body: None,
+            manual_openings: vec![],
             sel_bodies: vec![],
             duct_name_buf: String::new(),
             scroll_to_body: None,
@@ -185,6 +193,8 @@ impl App {
         self.visible = vec![true; bodies.len()];
         self.bodies = bodies;
         self.sel_bodies.clear();
+        self.manual_openings.clear();
+        self.rim_loops.clear();
         self.reclassify();
         let b = peregrine_geom::domain_bounds(&self.bodies, 0.0);
         if b.is_valid() {
@@ -199,7 +209,59 @@ impl App {
 
     fn refresh_candidates(&mut self) {
         self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None });
+        self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
+    }
+
+    /// Mesh of the duct that `body` belongs to (all its parts), or just the body itself.
+    fn duct_mesh_and_name(&self, body: usize) -> (String, TriMesh) {
+        let name = self.bodies[body].name.clone();
+        if let Some(d) = self.project.duct_of(&name) {
+            let mut m = TriMesh::default();
+            for p in &d.parts {
+                if let Some(b) = self.bodies.iter().find(|b| &b.name == p) { m.append(&b.mesh); }
+            }
+            (d.name.clone(), m)
+        } else {
+            (name, self.bodies[body].mesh.clone())
+        }
+    }
+
+    /// The user clicked a surface with the Rim tool: list the closed edge loops that bound the smooth patch there.
+    fn rim_pick(&mut self, body: usize, tri: usize) {
+        let mut loops = smooth_region_loops(&self.bodies[body].mesh, tri, 25.0);
+        loops.retain(|l| l.perimeter >= 5.0);
+        loops.truncate(12);
+        self.rim_body = Some(body);
+        // a rim band has an outer and an inner edge; the inner (shorter) one outlines the opening
+        let pick = if loops.len() == 2 { loops.iter().enumerate().min_by(|a, b| a.1.perimeter.partial_cmp(&b.1.perimeter).unwrap()).map(|x| x.0) } else if loops.is_empty() { None } else { Some(0) };
+        self.rim_sel = pick;
+        self.status = if loops.is_empty() {
+            "No closed edge loop found at that surface. Click the rim of the opening or the wall just inside it.".into()
+        } else {
+            format!("{} edge loop(s) found. Select the one that outlines the opening and press 'Add as opening'.", loops.len())
+        };
+        self.rim_loops = loops;
+        self.tab = Tab::Ports;
+    }
+
+    fn add_rim_opening(&mut self, li: usize) {
+        let (Some(l), Some(bi)) = (self.rim_loops.get(li).cloned(), self.rim_body) else { return };
+        let (duct, mesh) = self.duct_mesh_and_name(bi);
+        match cap_from_loop(&l.points, &mesh) {
+            Some(cap) => {
+                let area = cap.area();
+                let perim = l.perimeter;
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: (4.0 * std::f64::consts::PI * area / (perim * perim)).min(1.0), equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), cap };
+                self.manual_openings.push((duct, cand));
+                self.refresh_candidates();
+                self.sel_cand = Some(self.candidates.len() - 1);
+                self.rim_loops.clear();
+                self.rim_sel = None;
+                self.status = format!("Added a {} opening ({:.1} mm²{}). Assign it to a source or make it an outlet.", if l.planarity_dev > 0.05 { "curved" } else { "flat" }, area, if l.planarity_dev > 0.05 { format!(", {:.1} mm off-plane", l.planarity_dev) } else { String::new() });
+            }
+            None => self.status = "Could not build a cap for that loop.".into(),
+        }
     }
 
     fn suggested_bodies(&self) -> Vec<usize> {
@@ -561,7 +623,7 @@ impl App {
 
     fn options_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice" }).strong());
+            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice", Tool::Rim => "Curved Opening" }).strong());
             ui.separator();
             ui.label("Cell size");
             ui.add(egui::DragValue::new(&mut self.project.solver.cell_size_mm).speed(0.01).range(0.05..=2.0).suffix(" mm"));
@@ -593,7 +655,7 @@ impl App {
     fn tool_palette(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.vertical_centered(|ui| {
-            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Slice, "Slice (S)")] {
+            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Rim, "Curved opening: click the rim or the wall at a non-flat opening (R)"), (Tool::Slice, "Slice (S)")] {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
                 let selected = self.tool == t;
                 let bg = if selected { theme::ACCENT } else if resp.hovered() { theme::WIDGET_HOVER } else { theme::WIDGET };
@@ -814,8 +876,12 @@ impl App {
 
     /// The visible part under the screen position (front-most triangle).
     fn pick_body(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        self.pick_body_tri(rect, pos).map(|x| x.0)
+    }
+
+    fn pick_body_tri(&self, rect: Rect, pos: Pos2) -> Option<(usize, usize)> {
         let proj = self.cam.projector(rect);
-        let mut best: Option<(f64, usize)> = None;
+        let mut best: Option<(f64, usize, usize)> = None;
         for (bi, b) in self.bodies.iter().enumerate() {
             if !self.visible[bi] || b.role == BodyRole::Ignore { continue; }
             let bb = b.mesh.bounds();
@@ -836,10 +902,10 @@ impl App {
                 let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
                 let posv = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
                 if neg && posv { continue; }
-                if best.map_or(true, |x| da < x.0) { best = Some((da, bi)); }
+                if best.map_or(true, |x| da < x.0) { best = Some((da, bi, ti)); }
             }
         }
-        best.map(|x| x.1)
+        best.map(|x| (x.1, x.2))
     }
 
     fn body_context_menu_ui(&mut self, ui: &mut egui::Ui, bi: usize) {
@@ -1050,7 +1116,24 @@ impl App {
         if self.candidates.is_empty() {
             ui.label(egui::RichText::new("None. Duct bodies need planar faces with openings.").color(theme::TEXT_DIM));
         }
-        ui.label(egui::RichText::new("Tip: right-click an opening in the 3D view to assign it.").color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new("Tip: right-click an opening in the 3D view to assign it. For a curved (non-flat) opening use the Curved Opening tool (R) and click its rim.").color(theme::TEXT_DIM));
+        if !self.rim_loops.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Edge loops at your click").strong());
+            let mut add: Option<usize> = None;
+            for li in 0..self.rim_loops.len() {
+                let l = &self.rim_loops[li];
+                let kind = if l.planarity_dev > 0.05 { format!("curved, {:.1} mm off-plane", l.planarity_dev) } else { "flat".to_string() };
+                let which = if self.rim_loops.len() == 2 { if self.rim_loops.iter().all(|o| o.perimeter >= l.perimeter) { " (outer edge)" } else { " (inner edge: the opening)" } } else { "" };
+                let text = format!("loop {}{which}  {:.0} mm around  ({kind})", li + 1, l.perimeter);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.rim_sel == Some(li), text).clicked() { self.rim_sel = Some(li); }
+                    if self.rim_sel == Some(li) && ui.button("Add as opening").clicked() { add = Some(li); }
+                });
+            }
+            if let Some(li) = add { self.add_rim_opening(li); }
+            ui.separator();
+        }
         ui.horizontal(|ui| {
             let mut changed = ui.checkbox(&mut self.hide_screws, "Hide small round holes").changed();
             if self.hide_screws {
@@ -1066,7 +1149,7 @@ impl App {
                 None => "unassigned".to_string(),
             };
             let (body, c) = &self.candidates[i];
-            let text = format!("#{i}  {body}  {:.1} mm²  [{status}]", c.area);
+            let text = format!("#{i}  {body}  {:.1} mm²{}  [{status}]", c.area, if c.cap.is_surface() { "  curved" } else { "" });
             if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
         }
         if let Some(i) = self.sel_cand {
@@ -1261,6 +1344,11 @@ impl App {
                 painter.text(pos + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), col);
             }
         }
+        // loops found by the Rim tool
+        for (li, l) in self.rim_loops.iter().enumerate() {
+            let sel = self.rim_sel == Some(li);
+            viewport::draw_polygon(&painter, rect, &self.cam, &l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
+        }
         // hover highlight, left-click select, right-click menu
         let hover = if resp.hovered() { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
         if let (Some(t), Some(pos)) = (hover, resp.hover_pos()) {
@@ -1289,7 +1377,14 @@ impl App {
                 }
             }
         }
-        if resp.clicked() {
+        if resp.clicked() && self.tool == Tool::Rim {
+            if let Some(pp) = resp.interact_pointer_pos() {
+                match self.pick_body_tri(rect, pp) {
+                    Some((bi, ti)) => self.rim_pick(bi, ti),
+                    None => self.status = "Click on a part's surface near the curved opening.".into(),
+                }
+            }
+        } else if resp.clicked() {
             if let Some(pp) = resp.interact_pointer_pos() {
                 if let Some(t) = self.hit_test(rect, pp) {
                     self.select_target(t);
@@ -1463,6 +1558,11 @@ fn draw_tool_icon(p: &egui::Painter, r: Rect, t: Tool) {
             p.circle_stroke(c, 8.0, s);
             p.circle_filled(c, 2.5, Color32::WHITE);
         }
+        Tool::Rim => {
+            // a wavy (non-planar) loop
+            let pts: Vec<Pos2> = (0..=24).map(|k| { let a = k as f32 / 24.0 * std::f32::consts::TAU; c + Vec2::new(8.5 * a.cos(), 5.5 * a.sin() + 2.5 * (2.0 * a).cos()) }).collect();
+            p.add(Shape::line(pts, s));
+        }
         Tool::Slice => {
             p.rect_stroke(Rect::from_center_size(c, Vec2::splat(16.0)), 0.0, s, egui::StrokeKind::Inside);
             p.line_segment([c - Vec2::new(8.0, -3.0), c + Vec2::new(8.0, 3.0)], s);
@@ -1540,6 +1640,7 @@ impl App {
             if i.key_pressed(egui::Key::H) { self.tool = Tool::Pan; }
             if i.key_pressed(egui::Key::P) { self.tool = Tool::PickPort; }
             if i.key_pressed(egui::Key::S) { self.tool = Tool::Slice; }
+            if i.key_pressed(egui::Key::R) { self.tool = Tool::Rim; }
             if i.key_pressed(egui::Key::M) {
                 self.mesh_mode = match self.mesh_mode { MeshMode::Shaded => MeshMode::Ghost, MeshMode::Ghost => MeshMode::Hidden, MeshMode::Hidden => MeshMode::Shaded };
             }

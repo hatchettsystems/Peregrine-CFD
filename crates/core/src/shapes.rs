@@ -62,3 +62,28 @@ pub fn hollow_tube(outer: f64, inner: f64, length: f64) -> TriMesh {
     }
     m
 }
+
+/// Round hollow tube along +X from x=0 to about `length`, whose far end is cut in a saddle shape
+/// (x = length + amp*cos(2*theta)), so the opening there is NOT planar. `seg` segments around.
+pub fn scooped_round_tube(r_out: f64, r_in: f64, length: f64, amp: f64, seg: usize) -> TriMesh {
+    let mut m = TriMesh::default();
+    // rings: 0 = outer@0, 1 = inner@0, 2 = outer@L, 3 = inner@L
+    for ring in 0..4 {
+        let r = if ring % 2 == 0 { r_out } else { r_in };
+        for i in 0..seg {
+            let th = std::f64::consts::TAU * i as f64 / seg as f64;
+            let x = if ring < 2 { 0.0 } else { length + amp * (2.0 * th).cos() };
+            m.vertices.push([x, r * th.cos(), r * th.sin()]);
+        }
+    }
+    let idx = |ring: usize, i: usize| (ring * seg + i % seg) as u32;
+    for i in 0..seg {
+        let th = std::f64::consts::TAU * (i as f64 + 0.5) / seg as f64;
+        let radial = [0.0, th.cos(), th.sin()];
+        quad(&mut m, idx(0, i), idx(0, i + 1), idx(2, i + 1), idx(2, i), radial); // outer wall
+        quad(&mut m, idx(1, i), idx(1, i + 1), idx(3, i + 1), idx(3, i), scale(radial, -1.0)); // inner wall
+        quad(&mut m, idx(0, i), idx(0, i + 1), idx(1, i + 1), idx(1, i), [-1.0, 0.0, 0.0]); // flat end
+        quad(&mut m, idx(2, i), idx(2, i + 1), idx(3, i + 1), idx(3, i), [1.0, 0.0, 0.0]); // curved end (rim)
+    }
+    m
+}

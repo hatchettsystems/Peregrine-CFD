@@ -154,7 +154,7 @@ pub fn find_port_candidates(mesh: &TriMesh, min_area: f64) -> Vec<PortCandidate>
                 c = add(c, *p);
             }
             let c = scale(c, 1.0 / h.len() as f64);
-            let cap = PortCap { origin: c, normal: r.normal, polygon: h.clone() };
+            let cap = PortCap { origin: c, normal: r.normal, polygon: h.clone(), triangles: vec![] };
             let area = cap.area();
             if area >= min_area {
                 let mut perim = 0.0;

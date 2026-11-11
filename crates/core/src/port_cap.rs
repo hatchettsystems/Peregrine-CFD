@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 pub struct PortCap {
     pub origin: V3,
     pub normal: V3,
-    /// Boundary loop of the opening (mm), roughly in the cap plane.
+    /// Boundary loop of the opening (mm). In the cap plane for planar openings; a 3D curve otherwise.
     pub polygon: Vec<V3>,
+    /// For non-planar openings: a triangulated surface spanning `polygon`, each triangle wound so its
+    /// normal points out of the duct. Empty for planar openings.
+    #[serde(default)]
+    pub triangles: Vec<[V3; 3]>,
 }
 
 impl PortCap {
@@ -22,7 +26,15 @@ impl PortCap {
         self.polygon.iter().map(|p| { let d = sub(*p, self.origin); [dot(d, u), dot(d, v)] }).collect()
     }
 
+    /// True for curved/skewed openings described by a surface instead of a plane.
+    pub fn is_surface(&self) -> bool {
+        !self.triangles.is_empty()
+    }
+
     pub fn area(&self) -> f64 {
+        if self.is_surface() {
+            return self.triangles.iter().map(|t| 0.5 * len(cross(sub(t[1], t[0]), sub(t[2], t[0])))).sum();
+        }
         let p = self.polygon_2d();
         let mut a = 0.0;
         for i in 0..p.len() {

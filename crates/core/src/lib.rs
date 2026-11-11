@@ -3,6 +3,7 @@
 pub mod mesh;
 pub mod planar;
 pub mod port_cap;
+pub mod rim;
 pub mod shapes;
 pub mod stl;
 pub mod vec3;
@@ -10,3 +11,4 @@ pub mod vec3;
 pub use mesh::{Aabb, TriMesh};
 pub use planar::{find_port_candidates, planar_regions, PlanarRegion, PortCandidate};
 pub use port_cap::PortCap;
+pub use rim::{cap_from_loop, smooth_region_loops, triangulate_loop, RimLoop};

@@ -36,6 +36,9 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
     if n == 0 || cap.polygon.len() < 3 {
         return vec![];
     }
+    if cap.is_surface() {
+        return seed_points_surface(cap, n, dx);
+    }
     let poly = cap.polygon_2d();
     let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
     let mut ctr = [0.0; 2];
@@ -100,6 +103,53 @@ pub fn seed_points(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
         h *= 0.8;
     }
     inner.into_iter().chain(ring).map(to3).collect()
+}
+
+/// Seeds for a curved opening: low-discrepancy points over the cap triangles (area weighted) plus a ring
+/// along its edge, all moved 1.5 cells into the duct.
+fn seed_points_surface(cap: &PortCap, n: usize, dx: f64) -> Vec<V3> {
+    let frac = |x: f64| x - x.floor();
+    let tris = &cap.triangles;
+    let areas: Vec<f64> = tris.iter().map(|t| 0.5 * len(cross(sub(t[1], t[0]), sub(t[2], t[0])))).collect();
+    let total: f64 = areas.iter().sum();
+    if total < 1e-12 {
+        return vec![];
+    }
+    let mut cum = Vec::with_capacity(areas.len());
+    let mut acc = 0.0;
+    for a in &areas {
+        acc += a;
+        cum.push(acc);
+    }
+    let ring_n = if n >= 8 { (n / 4).max(6) } else { 0 };
+    let mut out = vec![];
+    for i in 0..(n - ring_n) {
+        let u = frac(0.5 + i as f64 * 0.754_877_666_246_692_7) * total;
+        let ti = cum.partition_point(|&c| c < u).min(tris.len() - 1);
+        let (a, b) = (frac(0.5 + i as f64 * 0.618_033_988_749_894_9), frac(0.5 + i as f64 * 0.414_213_562_373_095));
+        let (ra, rb) = (a.sqrt(), b);
+        let t = tris[ti];
+        let p = add(add(scale(t[0], 1.0 - ra), scale(t[1], ra * (1.0 - rb))), scale(t[2], ra * rb));
+        // step back along the opening's mean normal (not the local one) so seeds do not drift sideways
+        out.push(sub(p, scale(cap.normal, 1.5 * dx)));
+    }
+    if ring_n > 0 {
+        let m = cap.polygon.len();
+        let seg: Vec<f64> = (0..m).map(|i| len(sub(cap.polygon[(i + 1) % m], cap.polygon[i]))).collect();
+        let perim: f64 = seg.iter().sum();
+        let ctr = cap.centroid();
+        for k in 0..ring_n {
+            let mut t = perim * (k as f64 + 0.5) / ring_n as f64;
+            let mut i = 0;
+            while i + 1 < m && t > seg[i] { t -= seg[i]; i += 1; }
+            let f = if seg[i] > 0.0 { t / seg[i] } else { 0.0 };
+            let (a, b) = (cap.polygon[i], cap.polygon[(i + 1) % m]);
+            let q = add(a, scale(sub(b, a), f));
+            let inset = normalize(sub(ctr, q));
+            out.push(sub(add(q, scale(inset, 1.5 * dx)), scale(cap.normal, 1.5 * dx)));
+        }
+    }
+    out
 }
 
 fn cell_index(f: &VelocityField, p: V3) -> Option<usize> {
@@ -238,8 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn seeds_cover_a_curved_opening() {
+        use peregrine_core::{cap_from_loop, shapes, smooth_region_loops};
+        let tube = shapes::scooped_round_tube(6.0, 4.0, 30.0, 1.5, 64).welded(1e-6);
+        let seed = (0..tube.triangles.len()).find(|&i| {
+            let [a, b, c] = tube.tri(i);
+            let ctr = scale(add(add(a, b), c), 1.0 / 3.0);
+            let r = (ctr[1] * ctr[1] + ctr[2] * ctr[2]).sqrt();
+            ctr[0] > 27.0 && r > 4.3 && r < 5.7
+        }).unwrap();
+        let loops = smooth_region_loops(&tube, seed, 25.0);
+        let inner = loops.iter().min_by(|a, b| a.perimeter.partial_cmp(&b.perimeter).unwrap()).unwrap();
+        let cap = cap_from_loop(&inner.points, &tube).unwrap();
+        for n in [4usize, 20, 60] {
+            let s = seed_points(&cap, n, 0.5);
+            assert!(s.len() as f64 >= 0.8 * n as f64 && s.len() <= n, "n {n}: {}", s.len());
+            for p in &s {
+                let r = (p[1] * p[1] + p[2] * p[2]).sqrt();
+                assert!(r <= 4.05, "seed outside the bore: r {r}");
+                assert!(p[0] < 30.0 + 1.5, "seed in front of the cap: {p:?}");
+            }
+        }
+    }
+
+    #[test]
     fn seeds_fill_the_opening() {
-        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, -5.0, -5.0], [0.0, 5.0, -5.0], [0.0, 5.0, 5.0], [0.0, -5.0, 5.0]] };
+        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0, -5.0, -5.0], [0.0, 5.0, -5.0], [0.0, 5.0, 5.0], [0.0, -5.0, 5.0]], triangles: vec![] };
         for n in [1usize, 5, 20, 60] {
             let s = seed_points(&cap, n, 0.5);
             assert!(!s.is_empty() && s.len() <= n, "n {n}: {}", s.len());
