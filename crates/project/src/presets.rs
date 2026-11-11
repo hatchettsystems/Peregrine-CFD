@@ -54,7 +54,7 @@ pub fn fan_presets() -> Vec<FanPreset> {
         FanPreset { name: "Delta BFB0524HH 5015 blower 24V", kind: Blower, qmax_lpm: 4.6 * CFM, pmax_pa: 0.90 * INH2O, verified: false, note: "Flow 4.6 CFM from DigiKey; pressure ESTIMATED" },
         FanPreset { name: "Delta 4028 blower", kind: Blower, qmax_lpm: 3.0 * CFM, pmax_pa: 0.80 * INH2O, verified: false, note: "ESTIMATE: no datasheet found; enter your fan's values" },
         FanPreset { name: "WS7040 blower 24V", kind: Blower, qmax_lpm: 250.0, pmax_pa: 6500.0, verified: false, note: "Pressure 6.5 kPa free-blowing (seller listing); flow ESTIMATED" },
-        FanPreset { name: "WS9040 blower 24V (larger WS7040)", kind: Blower, qmax_lpm: 400.0, pmax_pa: 8500.0, verified: false, note: "ESTIMATE: scaled up from the WS7040 (no datasheet found); enter your fan's values" },
+        FanPreset { name: "WS9290B blower 24V (larger WS7040)", kind: Blower, qmax_lpm: 400.0, pmax_pa: 8500.0, verified: false, note: "ESTIMATE: scaled up from the WS7040 (no datasheet found); enter your fan's values" },
         FanPreset { name: "4010 blower 24V (typical)", kind: Blower, qmax_lpm: 2.0 * CFM, pmax_pa: 0.60 * INH2O, verified: false, note: "ESTIMATE: typical class value; enter your fan's values" },
         FanPreset { name: "Sunon 50x15 axial 12V (MF50151V1-1000U)", kind: Axial, qmax_lpm: 17.0 * CFM, pmax_pa: 0.230 * INH2O, verified: true, note: "DigiKey listing: 17.0 CFM, 0.230 inH2O" },
         FanPreset { name: "40x10 axial 24V (Orion OD4010 / NMB 04010SS)", kind: Axial, qmax_lpm: 6.7 * CFM, pmax_pa: 0.2 * INH2O, verified: true, note: "Distributor listings: 6.7 CFM, 0.2 inH2O (one datasheet says 0.1)" },
