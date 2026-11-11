@@ -175,6 +175,7 @@ struct Snapshot {
     sources: Vec<SourceReport>,
     inflation: f64,
     warnings: Vec<String>,
+    sealed: Vec<[f64; 5]>,
     finished: bool,
     error: Option<String>,
     version: u64,
@@ -210,6 +211,8 @@ struct App {
     show_hidden: bool,
     tut: Option<usize>,
     leak_notes: Vec<String>,
+    sealed_check: Vec<[f64; 5]>,
+    show_sealed: bool,
     plug_radius: f64,
     show_markers: bool,
     focus_issue: Option<String>,
@@ -343,6 +346,8 @@ impl App {
             show_hidden: false,
             tut: None,
             leak_notes: vec![],
+            sealed_check: vec![],
+            show_sealed: false,
             plug_radius: 3.0,
             show_markers: true,
             focus_issue: None,
@@ -828,6 +833,7 @@ impl App {
                 let mut base_warnings = presets::preset_warnings(&project);
                 if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { base_warnings.push(w); }
                 if let Some(w) = peregrine_geom::repair_note(&domain) { base_warnings.push(w); }
+                let sealed_regions = peregrine_geom::sealed_regions(&domain);
                 if domain.odd_columns > 0 {
                     base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
                 }
@@ -850,6 +856,7 @@ impl App {
                         s.inflation = sim.units.viscosity_inflation();
                         s.ref_speed = sim.ref_speed;
                         s.step = 0;
+                        s.sealed = sealed_regions.clone();
                         s.warnings = base_warnings.clone();
                         s.warnings.extend(notes.clone());
                         if sim.ref_speed > ref_speed * 1.01 {
@@ -1694,10 +1701,11 @@ impl App {
         match build_project_domain(&self.project, &self.bodies) {
             Ok(d) => {
                 self.leak_notes.clear();
+                self.sealed_check = peregrine_geom::sealed_regions(&d);
                 if let Some(n) = peregrine_geom::repair_note(&d) { self.leak_notes.push(n); }
                 match peregrine_geom::leak_warning(&self.project, &d) {
                     Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes.push(m); }
-                    None => self.status = if d.repaired.is_empty() { "No leaks: the duct is sealed except at its ports.".into() } else { format!("Sealed {} small gap(s) automatically; no leaks left.", d.repaired.len()) },
+                    None => self.status = if d.sealed_idx.is_empty() { "No leaks: the duct is sealed except at its ports.".into() } else { format!("Sealed {} small gap region(s) automatically; no leaks left.", self.sealed_check.len()) },
                 }
             }
             Err(e) => self.status = format!("Leak check failed: {e:#}"),
@@ -1728,6 +1736,7 @@ impl App {
         ui.add_space(2.0);
         let mut locate: Option<[f64; 3]> = None;
         let mut seal: Option<[f64; 3]> = None;
+        let mut toggle_sealed = false;
         let mut plug_r = self.plug_radius;
         let focus = self.focus_issue.take();
         for (k, it) in issues.iter().enumerate() {
@@ -1746,6 +1755,9 @@ impl App {
                     if let Some(p) = at {
                         ui.horizontal(|ui| {
                             if ui.button("Show in 3D view").on_hover_text("Centre the view on the marker for this item").clicked() { locate = Some(p); }
+                            if it.title.starts_with("Small gaps sealed") {
+                                if ui.button(if self.show_sealed { "Hide regions" } else { "Show regions" }).clicked() { toggle_sealed = true; }
+                            }
                             if it.title.starts_with("Air leaks") {
                                 if ui.button("Seal this leak").on_hover_text("Adds a small solid plug at the marker and checks again").clicked() { seal = Some(p); }
                                 ui.add(egui::DragValue::new(&mut plug_r).speed(0.1).range(0.5..=15.0).prefix("r ").suffix(" mm"));
@@ -1755,6 +1767,7 @@ impl App {
                 });
         }
         self.plug_radius = plug_r;
+        if toggle_sealed { self.show_sealed = !self.show_sealed; }
         if let Some(p) = seal { self.add_plug(p); }
         if let Some(p) = locate { self.cam.target = p; self.status = format!("Centred on ({:.1}, {:.1}, {:.1}) mm.", p[0], p[1], p[2]); }
     }
@@ -1815,6 +1828,7 @@ impl App {
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Ghost, "Ghost");
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Hidden, "Hidden");
             });
+            ui.checkbox(&mut self.show_sealed, "Show auto-sealed regions").on_hover_text("Outline the places where tiny gaps were closed automatically (grouped into regions).");
             ui.checkbox(&mut self.show_markers, "Show warning markers").on_hover_text("A clickable marker in the 3D view wherever a warning or error points at a place.");
             ui.checkbox(&mut self.show_ports, "Show ports, openings and blockers").on_hover_text("Turn off to see only the geometry and the flow.");
             ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
@@ -1958,10 +1972,24 @@ impl App {
             let sel = self.rim_sel == Some(li);
             viewport::draw_polygon(&painter, rect, &self.cam, &l.l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
         }
+        // regions closed automatically (opt-in)
+        if self.show_sealed {
+            let regions: Vec<[f64; 5]> = match &self.last { Some(s) if !s.lock().unwrap().sealed.is_empty() => s.lock().unwrap().sealed.clone(), _ => self.sealed_check.clone() };
+            let col = Color32::from_rgb(0xE0, 0x5A, 0xE0);
+            for r in &regions {
+                let c = [r[0], r[1], r[2]];
+                if let Some((q, _)) = self.cam.project(rect, c) {
+                    let edge = self.cam.project(rect, [c[0] + r[4].max(1.0), c[1], c[2]]).map_or(8.0, |(e, _)| q.distance(e)).clamp(7.0, 60.0);
+                    painter.circle_filled(q, edge, Color32::from_rgba_unmultiplied(0xE0, 0x5A, 0xE0, 40));
+                    painter.circle_stroke(q, edge, Stroke::new(1.5, col));
+                    painter.text(q + Vec2::new(edge + 3.0, -edge), Align2::LEFT_TOP, format!("sealed {} cells", r[3] as usize), FontId::proportional(10.0), col);
+                }
+            }
+        }
         // markers for warnings and errors that point at a place
         let markers: Vec<(Pos2, Issue)> = if self.show_markers {
             let all = self.current_issues();
-            all.iter().filter_map(|it| issue_point(it, &all, &self.project).and_then(|p| self.cam.project(rect, p)).map(|(q, _)| (q, it.clone()))).collect()
+            all.iter().filter(|it| !it.title.starts_with("Small gaps sealed")).filter_map(|it| issue_point(it, &all, &self.project).and_then(|p| self.cam.project(rect, p)).map(|(q, _)| (q, it.clone()))).collect()
         } else { vec![] };
         let hover_pos = resp.hover_pos();
         for (q, it) in &markers {

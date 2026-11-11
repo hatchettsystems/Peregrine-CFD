@@ -204,10 +204,11 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
     let blockers: Vec<peregrine_core::PortCap> = project.blockers.iter().map(|b| b.cap.clone()).collect();
     let plugs: Vec<([f64; 3], f64)> = project.plugs.iter().map(|p| (p.center, p.radius_mm)).collect();
     let mut d = build_domain_full(&meshes, &groups, project.domain.seam_tolerance_mm, project.domain.gap_seal_mm, &ports, &blockers, &plugs, &bounds, project.solver.cell_size_mm);
+    let inlets: Vec<u8> = project.ports.iter().enumerate().filter(|(_, p)| p.kind.is_inlet()).map(|(k, _)| PORT_BASE + k as u8).collect();
     if project.domain.auto_seal_leaks {
-        let inlets: Vec<u8> = project.ports.iter().enumerate().filter(|(_, p)| p.kind.is_inlet()).map(|(k, _)| PORT_BASE + k as u8).collect();
-        d.repaired = peregrine_voxel::auto_seal_leaks(&mut d, &inlets, 600, 2.6);
+        d.repaired = peregrine_voxel::auto_seal_leaks(&mut d, &inlets, 150, 2.6);
     }
+    peregrine_voxel::keep_relevant_seals(&mut d, &inlets);
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
         if *n == 0 {
             bail!("port '{}' covers no cells at {} mm; refine the grid or check the cap", p.name, project.solver.cell_size_mm);
@@ -321,11 +322,25 @@ pub fn leak_warning(project: &Project, domain: &Domain) -> Option<String> {
 
 /// What the automatic sealer did, if anything (shown as an informational note with a marker).
 pub fn repair_note(domain: &Domain) -> Option<String> {
-    let first = domain.repaired.first()?;
+    let regions = domain.sealed_regions(25);
+    let first = regions.first()?;
+    let cells: usize = regions.iter().map(|r| r.cells).sum();
+    let vol: f64 = regions.iter().map(|r| r.volume_mm3).sum();
+    let mut lines = String::new();
+    for (k, r) in regions.iter().take(8).enumerate() {
+        lines.push_str(&format!("\n  {}. near ({:.1}, {:.1}, {:.1}) mm, about {:.1} mm across, {:.1} mm³", k + 1, r.center[0], r.center[1], r.center[2], 2.0 * r.radius_mm, r.volume_mm3));
+    }
+    if regions.len() > 8 { lines.push_str(&format!("\n  ... and {} more regions", regions.len() - 8)); }
+    let _ = first;
     Some(format!(
-        "Auto-sealed {} small gap(s) (up to about 2.5 mm) that let air out of the duct, the first near ({:.1}, {:.1}, {:.1}) mm. Real openings are never closed automatically: define them as ports or blockers. Turn this off with 'auto_seal_leaks = false' in the project's [domain] section.",
-        domain.repaired.len(), first[0], first[1], first[2]
+        "Auto-sealed small gaps (thin air gaps between solid surfaces) in {} region(s), {} cells, {:.0} mm³ in total. No gap that thin should exist in a real part, so they were closed.{}\nReal openings are never closed automatically: define them as ports or blockers. Tick 'Show auto-sealed regions' in the Results display options to see them, or turn the sealer off with gap_seal_mm = 0 / auto_seal_leaks = false in the project's [domain] section.",
+        regions.len(), cells, vol, lines
     ))
+}
+
+/// The regions the automatic sealers closed (centre x/y/z in mm, cell count, radius mm), for display.
+pub fn sealed_regions(domain: &Domain) -> Vec<[f64; 5]> {
+    domain.sealed_regions(25).iter().map(|r| [r.center[0], r.center[1], r.center[2], r.cells as f64, r.radius_mm]).collect()
 }
 
 /// True for an opening that admits air: visible from outside the duct and leading into a channel (not a pocket).

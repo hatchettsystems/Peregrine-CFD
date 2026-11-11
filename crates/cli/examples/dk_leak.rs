@@ -9,7 +9,7 @@ fn main() {
     let cands = duct_port_candidates(&bodies, &project.ducts, 0.05, None, false);
     let mut n = 0;
     for (b, c) in &cands {
-        if c.circularity > 0.75 && c.equiv_diameter <= 6.0 {
+        if std::env::var_os("AUTOBLOCK").is_some() && c.circularity > 0.75 && c.equiv_diameter <= 6.0 {
             let ctr = c.cap.centroid();
             if project.ports.iter().any(|p| (p.cap.centroid()[0] - ctr[0]).abs() < 0.2 && (p.cap.centroid()[1] - ctr[1]).abs() < 0.2 && (p.cap.centroid()[2] - ctr[2]).abs() < 0.2) { continue; }
             if project.blockers.iter().any(|k| (k.cap.centroid()[0] - ctr[0]).abs() < 0.2 && (k.cap.centroid()[1] - ctr[1]).abs() < 0.2 && (k.cap.centroid()[2] - ctr[2]).abs() < 0.2) { continue; }
@@ -29,7 +29,8 @@ fn main() {
     }
     let d = build_project_domain(&project, &bodies).unwrap();
     println!("odd ray columns: {} (non-watertight indicator), enclosed cells removed {}", d.odd_columns, d.sealed_cells_removed);
-    println!("auto-repaired {} gaps", d.repaired.len());
+    println!("auto-repaired {} leak repairs; gap-sealed cells {}; regions {}", d.repaired.len(), d.sealed_idx.len(), d.sealed_regions(25).len());
+    for r in d.sealed_regions(25).iter().take(8) { println!("   region ({:.1},{:.1},{:.1}) r {:.1} mm cells {}", r.center[0], r.center[1], r.center[2], r.radius_mm, r.cells); }
     let mut cl: std::collections::BTreeMap<(i32, i32, i32), usize> = Default::default();
     for p in &d.repaired { *cl.entry(((p[0] / 8.0).floor() as i32 * 8, (p[1] / 8.0).floor() as i32 * 8, (p[2] / 8.0).floor() as i32 * 8)).or_default() += 1; }
     let mut v: Vec<_> = cl.into_iter().collect();

@@ -129,6 +129,76 @@ pub struct Domain {
     pub sealed_cells_removed: usize,
     /// Places (mm) where [`auto_seal_leaks`] closed a small leak.
     pub repaired: Vec<V3>,
+    /// Every cell the gap sealer and the leak repair closed (for reporting regions).
+    pub sealed_idx: Vec<u32>,
+}
+
+/// A cluster of cells that were closed automatically.
+#[derive(Clone, Debug)]
+pub struct SealedRegion {
+    pub center: V3,
+    pub cells: usize,
+    pub volume_mm3: f64,
+    pub radius_mm: f64,
+}
+
+impl Domain {
+    /// The automatically closed cells grouped into regions (nearby cells merge; at most `max_regions` are returned).
+    pub fn sealed_regions(&self, max_regions: usize) -> Vec<SealedRegion> {
+        use std::collections::HashMap;
+        if self.sealed_idx.is_empty() {
+            return vec![];
+        }
+        let g = &self.grid;
+        let mut bin = (3.0 / g.dx).ceil().max(2.0) as i64; // cells per bin
+        loop {
+            let mut bins: HashMap<(i64, i64, i64), (V3, usize)> = HashMap::new();
+            for &i in &self.sealed_idx {
+                let [x, y, z] = g.xyz(i as usize);
+                let key = (x as i64 / bin, y as i64 / bin, z as i64 / bin);
+                let c = g.center(x, y, z);
+                let e = bins.entry(key).or_insert(([0.0; 3], 0));
+                e.0 = add(e.0, c);
+                e.1 += 1;
+            }
+            // merge touching bins
+            let keys: Vec<(i64, i64, i64)> = bins.keys().copied().collect();
+            let idx_of: HashMap<(i64, i64, i64), usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+            let mut parent: Vec<usize> = (0..keys.len()).collect();
+            fn find(p: &mut Vec<usize>, a: usize) -> usize { let mut a = a; while p[a] != a { p[a] = p[p[a]]; a = p[a]; } a }
+            for (i, k) in keys.iter().enumerate() {
+                for dz in -1..=1 { for dy in -1..=1 { for dx in -1..=1 {
+                    if let Some(&j) = idx_of.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
+                        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                        if a != b { parent[a] = b; }
+                    }
+                } } }
+            }
+            let mut groups: HashMap<usize, (V3, usize, Vec<V3>)> = HashMap::new();
+            for (i, k) in keys.iter().enumerate() {
+                let r = find(&mut parent, i);
+                let (sum, n) = bins[k];
+                let e = groups.entry(r).or_insert(([0.0; 3], 0, vec![]));
+                e.0 = add(e.0, sum);
+                e.1 += n;
+                e.2.push(scale(sum, 1.0 / n as f64));
+            }
+            if groups.len() <= max_regions || bin > 64 {
+                let cell_vol = g.dx * g.dx * g.dx;
+                let mut out: Vec<SealedRegion> = groups
+                    .into_values()
+                    .map(|(sum, n, bcs)| {
+                        let center = scale(sum, 1.0 / n as f64);
+                        let radius = bcs.iter().map(|b| len(sub(*b, center))).fold(0.0, f64::max) + 0.5 * bin as f64 * g.dx;
+                        SealedRegion { center, cells: n, volume_mm3: n as f64 * cell_vol, radius_mm: radius }
+                    })
+                    .collect();
+                out.sort_by(|a, b| b.cells.cmp(&a.cells));
+                return out;
+            }
+            bin *= 2;
+        }
+    }
 }
 
 pub fn build_domain(solids: &[&TriMesh], ports: &[PortSpec], bounds: &Aabb, dx: f64) -> Domain {
@@ -171,12 +241,13 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
                 }
             }
         }
-        seal_seams(&grid, &mut cells, &label, &group_of, reach, false);
+        let _ = seal_seams(&grid, &mut cells, &label, &group_of, reach, false);
     }
+    let mut sealed_idx: Vec<u32> = vec![];
     if gap_all_mm > 0.0 {
         // aggressive: close any gap up to this size between two different parts, duct or not
-        let reach = ((gap_all_mm / dx).ceil() as usize).max(1);
-        seal_seams(&grid, &mut cells, &label, &[], reach, true);
+        let reach = ((gap_all_mm / dx + 1e-6).floor() as usize).max(1);
+        sealed_idx = seal_seams(&grid, &mut cells, &label, &[], reach, true).into_iter().map(|i| i as u32).collect();
     }
     close_diagonal_gaps(&grid, &mut cells);
     let [nx, ny, nz] = grid.dims;
@@ -232,7 +303,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             removed += 1;
         }
     }
-    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![] }
+    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![], sealed_idx }
 }
 
 /// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
@@ -592,6 +663,7 @@ pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], max_repairs: usi
                     let i = g.idx(x, y, z);
                     if domain.cells[i] == FLUID && len(sub(g.center(x, y, z), c)) <= r {
                         domain.cells[i] = SOLID;
+                        domain.sealed_idx.push(i as u32);
                         filled += 1;
                     }
                 }
@@ -605,8 +677,68 @@ pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], max_repairs: usi
     done
 }
 
+/// Keep only the sealed cells that matter to the duct: those connected (through other sealed cells) to the air
+/// the inlets can reach. Thin gaps between unrelated parts (a motor, a rail) stay closed but are not reported.
+pub fn keep_relevant_seals(domain: &mut Domain, inlet_codes: &[u8]) {
+    if domain.sealed_idx.is_empty() {
+        return;
+    }
+    let g = &domain.grid;
+    let [nx, ny, nz] = g.dims;
+    let n = g.len();
+    // air reachable from the inlets (ports are walls)
+    let mut reach = vec![false; n];
+    let mut stack: Vec<usize> = vec![];
+    for i in 0..n {
+        if inlet_codes.contains(&domain.cells[i]) {
+            let [x, y, z] = g.xyz(i);
+            for (dx, dy, dz) in [(-1i32, 0i32, 0i32), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+                let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                if xx < 0 || yy < 0 || zz < 0 || xx as usize >= nx || yy as usize >= ny || zz as usize >= nz { continue; }
+                let j = g.idx(xx as usize, yy as usize, zz as usize);
+                if !reach[j] && domain.cells[j] == FLUID { reach[j] = true; stack.push(j); }
+            }
+        }
+    }
+    while let Some(i) = stack.pop() {
+        let [x, y, z] = g.xyz(i);
+        for (dx, dy, dz) in [(-1i32, 0i32, 0i32), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+            let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+            if xx < 0 || yy < 0 || zz < 0 || xx as usize >= nx || yy as usize >= ny || zz as usize >= nz { continue; }
+            let j = g.idx(xx as usize, yy as usize, zz as usize);
+            if !reach[j] && domain.cells[j] == FLUID { reach[j] = true; stack.push(j); }
+        }
+    }
+    let mut in_s = vec![false; n];
+    for &i in &domain.sealed_idx { in_s[i as usize] = true; }
+    let mut keep = vec![false; n];
+    let mut q: Vec<usize> = vec![];
+    let touches_reach = |i: usize| -> bool {
+        let [x, y, z] = g.xyz(i);
+        for (dx, dy, dz) in [(-1i32, 0i32, 0i32), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+            let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+            if xx < 0 || yy < 0 || zz < 0 || xx as usize >= nx || yy as usize >= ny || zz as usize >= nz { continue; }
+            if reach[g.idx(xx as usize, yy as usize, zz as usize)] { return true; }
+        }
+        false
+    };
+    for &i in &domain.sealed_idx {
+        if touches_reach(i as usize) { keep[i as usize] = true; q.push(i as usize); }
+    }
+    while let Some(i) = q.pop() {
+        let [x, y, z] = g.xyz(i);
+        for dz in -1i32..=1 { for dy in -1i32..=1 { for dx in -1i32..=1 {
+            let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+            if xx < 0 || yy < 0 || zz < 0 || xx as usize >= nx || yy as usize >= ny || zz as usize >= nz { continue; }
+            let j = g.idx(xx as usize, yy as usize, zz as usize);
+            if in_s[j] && !keep[j] { keep[j] = true; q.push(j); }
+        } } }
+    }
+    domain.sealed_idx.retain(|&i| keep[i as usize]);
+}
+
 /// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).
-fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) {
+fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) -> Vec<usize> {
     let [nx, ny, nz] = grid.dims;
     let mut fill: Vec<usize> = vec![];
     let step_dirs: [(i32, i32, i32); 3] = [(1, 0, 0), (0, 1, 0), (0, 0, 1)];
@@ -635,7 +767,7 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                         None
                     };
                     if let (Some(a), Some(b)) = (find(-1), find(1)) {
-                        if a != b && a != u16::MAX && b != u16::MAX && (any_pair || (group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize])) {
+                        if any_pair || (a != b && a != u16::MAX && b != u16::MAX && group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize]) {
                             fill.push(i);
                             break 'axes;
                         }
@@ -644,9 +776,10 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
             }
         }
     }
-    for i in fill {
+    for &i in &fill {
         cells[i] = SOLID;
     }
+    fill
 }
 
 /// For each cap, the volume (mm^3) of the connected air just behind it, with every cap plugged. Air behind a
