@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="120" alt="Peregrine CFD logo"></p>
+
 # Peregrine CFD
 
 Airflow simulation for 3D-printer part-cooling ducts, written in Rust.

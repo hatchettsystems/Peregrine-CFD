@@ -45,6 +45,11 @@ impl Camera {
         let focal = rect.height() as f64 * 0.5 / (35f64.to_radians() * 0.5).tan();
         Some((Pos2::new(rect.center().x + (x / z * focal) as f32, rect.center().y - (y / z * focal) as f32), z))
     }
+    /// Precomputed projection for projecting many points in one frame (picking).
+    pub fn projector(&self, rect: Rect) -> Projector {
+        let (r, u, f) = self.axes();
+        Projector { r, u, f, eye: self.eye(), focal: rect.height() as f64 * 0.5 / (35f64.to_radians() * 0.5).tan(), center: rect.center() }
+    }
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx as f64 * 0.008;
         self.pitch = (self.pitch + dy as f64 * 0.008).clamp(-1.5, 1.5);
@@ -104,5 +109,25 @@ pub fn draw_polygon(painter: &egui::Painter, rect: Rect, cam: &Camera, pts: &[V3
     let pp: Vec<Pos2> = pts.iter().filter_map(|p| cam.project(rect, *p).map(|x| x.0)).collect();
     if pp.len() == pts.len() && pp.len() > 2 {
         painter.add(Shape::closed_line(pp, stroke));
+    }
+}
+
+pub struct Projector {
+    r: V3,
+    u: V3,
+    f: V3,
+    pub eye: V3,
+    focal: f64,
+    center: Pos2,
+}
+
+impl Projector {
+    pub fn project(&self, p: V3) -> Option<(Pos2, f64)> {
+        let d = sub(p, self.eye);
+        let (x, y, z) = (dot(d, self.r), dot(d, self.u), dot(d, self.f));
+        if z < 1e-3 {
+            return None;
+        }
+        Some((Pos2::new(self.center.x + (x / z * self.focal) as f32, self.center.y - (y / z * self.focal) as f32), z))
     }
 }

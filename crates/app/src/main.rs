@@ -8,7 +8,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stro
 use peregrine_core::port_cap::point_in_polygon;
 use peregrine_core::vec3::{dot, len, sub};
 use peregrine_core::{shapes, PortCandidate, PortCap};
-use peregrine_geom::{build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
+use peregrine_geom::{apply_roles, build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
 use peregrine_post::streamlines::{self as sl, SeedSpec, Streamline, VelocityField};
@@ -85,6 +85,10 @@ struct App {
     ctx_target: Option<Target>,
     hide_screws: bool,
     screw_max_d: f64,
+    sel_bodies: Vec<usize>,
+    duct_name_buf: String,
+    scroll_to_body: Option<usize>,
+    ctx_body: Option<usize>,
     mesh_mode: MeshMode,
     show_lines: bool,
     show_slice: bool,
@@ -101,10 +105,11 @@ struct App {
 }
 
 fn main() -> eframe::Result {
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1360.0, 820.0]).with_title("Peregrine CFD"),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1360.0, 820.0]).with_title("Peregrine CFD");
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon256.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+    let opts = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Peregrine CFD", opts, Box::new(|cc| {
         theme::apply(&cc.egui_ctx);
         let mut app = App::new();
@@ -157,6 +162,10 @@ impl App {
             ctx_target: None,
             hide_screws: true,
             screw_max_d: 6.0,
+            sel_bodies: vec![],
+            duct_name_buf: String::new(),
+            scroll_to_body: None,
+            ctx_body: None,
             mesh_mode: MeshMode::Shaded,
             show_lines: true,
             show_slice: false,
@@ -173,11 +182,9 @@ impl App {
     }
 
     fn set_bodies(&mut self, bodies: Vec<Body>) {
-        for b in &mut self.bodies {
-            let _ = b;
-        }
         self.visible = vec![true; bodies.len()];
         self.bodies = bodies;
+        self.sel_bodies.clear();
         self.reclassify();
         let b = peregrine_geom::domain_bounds(&self.bodies, 0.0);
         if b.is_valid() {
@@ -186,15 +193,64 @@ impl App {
     }
 
     fn reclassify(&mut self) {
-        for b in &mut self.bodies {
-            b.role = self.project.geometry.classify(&b.name);
-        }
+        apply_roles(&self.project, &mut self.bodies, false);
         self.refresh_candidates();
     }
 
     fn refresh_candidates(&mut self) {
-        self.candidates = duct_port_candidates(&self.bodies, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None });
+        self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None });
         self.sel_cand = None;
+    }
+
+    fn suggested_bodies(&self) -> Vec<usize> {
+        (0..self.bodies.len()).filter(|&i| self.project.is_suggested(&self.bodies[i].name)).collect()
+    }
+
+    /// Select body `i` (replacing the selection, or toggling it when `add`), and reveal it in the Bodies list.
+    fn select_body(&mut self, i: usize, add: bool) {
+        if add {
+            if let Some(p) = self.sel_bodies.iter().position(|&x| x == i) { self.sel_bodies.remove(p); } else { self.sel_bodies.push(i); }
+        } else {
+            self.sel_bodies = vec![i];
+        }
+        self.scroll_to_body = Some(i);
+        self.tab = Tab::Bodies;
+        if let Some(&first) = self.sel_bodies.first() {
+            let n = &self.bodies[first].name;
+            self.duct_name_buf = n.rsplit_once(':').filter(|(_, t)| t.chars().all(|c| c.is_ascii_digit())).map_or(n.clone(), |(h, _)| h.to_string());
+        }
+    }
+
+    fn define_duct_from(&mut self, idx: &[usize], name: &str) {
+        let parts: Vec<String> = idx.iter().map(|&i| self.bodies[i].name.clone()).collect();
+        if parts.is_empty() { return; }
+        let n = self.project.define_duct(name, &parts);
+        self.status = format!("Defined duct '{n}' from {} part(s). Its openings are in the Ports tab.", parts.len());
+        self.reclassify();
+    }
+
+    fn remove_from_ducts(&mut self, idx: &[usize]) {
+        for &i in idx {
+            let n = self.bodies[i].name.clone();
+            for d in &mut self.project.ducts { d.parts.retain(|p| p != &n); }
+            self.project.geometry.ignored.remove(&n);
+        }
+        self.project.ducts.retain(|d| !d.parts.is_empty());
+        self.reclassify();
+    }
+
+    fn ignore_bodies(&mut self, idx: &[usize]) {
+        self.remove_from_ducts(idx);
+        for &i in idx { self.project.geometry.ignored.insert(self.bodies[i].name.clone()); }
+        self.reclassify();
+    }
+
+    fn add_to_duct(&mut self, idx: &[usize], duct: &str) {
+        let add: Vec<String> = idx.iter().map(|&i| self.bodies[i].name.clone()).collect();
+        for d in &mut self.project.ducts { d.parts.retain(|p| !add.contains(p)); }
+        if let Some(d) = self.project.ducts.iter_mut().find(|d| d.name == duct) { d.parts.extend(add); }
+        self.project.ducts.retain(|d| !d.parts.is_empty());
+        self.reclassify();
     }
 
     fn load_demo(&mut self) {
@@ -210,6 +266,7 @@ impl App {
             Body { name: "nozzle".into(), role: BodyRole::Solid, mesh: nozzle },
         ];
         self.set_bodies(bodies);
+        self.define_duct_from(&[0], "duct");
         self.project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 8.0 }, split: SplitMode::ByArea, preset: None, streamlines: 40 });
         self.add_port_from(0, "inlet_1", PortKind::SourceInlet { source: "fan".into(), weight: 1.0 });
         self.add_port_from(1, "outlet_1", PortKind::PressureOutlet { pressure: 0.0 });
@@ -225,7 +282,9 @@ impl App {
                     if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) { self.project.name = stem.to_string(); }
                 }
                 self.set_bodies(b);
-                self.status = format!("Loaded {n} bodies from {}", path.display());
+                self.tab = Tab::Bodies;
+                let hints = self.suggested_bodies().len();
+                self.status = format!("Loaded {n} bodies. Next: pick the duct part(s) in the Bodies tab or click them in the 3D view, then 'Define as duct'{}.", if hints > 0 { format!(" ({hints} likely duct part(s) are highlighted)") } else { String::new() });
             }
             Err(e) => self.status = format!("Import failed: {e:#}"),
         }
@@ -262,7 +321,14 @@ impl App {
                 if let Some(g) = self.project.geometry_file.clone() {
                     let full = if g.is_absolute() { g } else { p.parent().unwrap_or(std::path::Path::new(".")).join(g) };
                     match load_bodies(&full, &self.project) {
-                        Ok(b) => self.set_bodies(b),
+                        Ok(b) => {
+                            // projects saved before ducts were user-defined relied on name rules: keep them working
+                            if self.project.ducts.is_empty() && !self.project.ports.is_empty() {
+                                let names: Vec<String> = b.iter().map(|x| x.name.clone()).collect();
+                                self.project.ducts = self.project.effective_ducts(&names);
+                            }
+                            self.set_bodies(b);
+                        }
                         Err(e) => self.status = format!("Geometry: {e:#}"),
                     }
                 }
@@ -470,7 +536,7 @@ impl App {
                 }
             });
             ui.menu_button("Geometry", |ui| {
-                if ui.button("Re-run role rules").clicked() { self.project.geometry.overrides.clear(); self.reclassify(); ui.close_menu(); }
+                if ui.button("Select suggested parts").clicked() { self.sel_bodies = self.suggested_bodies(); self.tab = Tab::Bodies; ui.close_menu(); }
                 if ui.button("Re-detect port candidates").clicked() { self.refresh_candidates(); ui.close_menu(); }
             });
             ui.menu_button("Simulation", |ui| {
@@ -540,40 +606,123 @@ impl App {
     }
 
     fn bodies_panel(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Bodies", |ui| {
+        let sel = self.sel_bodies.clone();
+        theme::section(ui, "Parts", |ui| {
             if self.bodies.is_empty() {
                 ui.label(egui::RichText::new("No geometry. File > Open Geometry...").color(theme::TEXT_DIM));
+                return;
             }
-            let mut changed = false;
-            for i in 0..self.bodies.len() {
+            if self.project.ducts.is_empty() {
+                ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), "No duct defined yet. Select the duct part(s) here or click them in the 3D view (Ctrl-click for several), then press 'Define as duct'.");
+            } else {
+                ui.label(egui::RichText::new("Click a part in the 3D view to find it here. Ctrl-click selects several.").color(theme::TEXT_DIM));
+            }
+            let sugg = self.suggested_bodies();
+            if !sugg.is_empty() {
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("★ {} part(s) look like ducts", sugg.len())).color(Color32::from_rgb(0xE8, 0xB8, 0x4A)));
+                    if ui.small_button("Select them").clicked() { self.sel_bodies = sugg.clone(); }
+                });
+            }
+            let mut clicked: Option<(usize, bool)> = None;
+            for i in 0..self.bodies.len() {
+                let name = self.bodies[i].name.clone();
+                let selected = sel.contains(&i);
+                let suggested = self.project.is_suggested(&name);
+                let role = self.bodies[i].role;
+                let duct = self.project.duct_of(&name).map(|d| d.name.clone());
+                let row = ui.horizontal(|ui| {
                     let eye = if self.visible[i] { "o" } else { "-" };
                     if ui.small_button(eye).on_hover_text("Visibility").clicked() { self.visible[i] = !self.visible[i]; }
-                    let name = self.bodies[i].name.clone();
-                    ui.label(egui::RichText::new(&name).strong());
-                    let mut role = self.bodies[i].role;
-                    egui::ComboBox::from_id_salt(("role", i)).width(70.0).selected_text(format!("{role:?}")).show_ui(ui, |ui| {
-                        for r in [BodyRole::Duct, BodyRole::Solid, BodyRole::Ignore] { ui.selectable_value(&mut role, r, format!("{r:?}")); }
+                    let color = if suggested { Color32::from_rgb(0xE8, 0xB8, 0x4A) } else { theme::TEXT };
+                    let r = ui.selectable_label(selected, egui::RichText::new(&name).color(color));
+                    let badge = match (role, &duct) {
+                        (BodyRole::Duct, Some(d)) => egui::RichText::new(format!("duct: {d}")).color(Color32::from_rgb(0x8F, 0xB4, 0xD9)),
+                        (BodyRole::Ignore, _) => egui::RichText::new("ignored").color(theme::TEXT_DIM),
+                        _ if suggested => egui::RichText::new("★ suggested").color(Color32::from_rgb(0xE8, 0xB8, 0x4A)),
+                        _ => egui::RichText::new("solid").color(theme::TEXT_DIM),
+                    };
+                    ui.label(badge.size(10.5));
+                    r
+                });
+                if self.scroll_to_body == Some(i) { row.response.scroll_to_me(Some(egui::Align::Center)); }
+                if row.inner.clicked() { clicked = Some((i, ui.input(|x| x.modifiers.ctrl || x.modifiers.command))); }
+            }
+            self.scroll_to_body = None;
+            if let Some((i, add)) = clicked { self.select_body(i, add); }
+        });
+        if !self.sel_bodies.is_empty() {
+            theme::section(ui, &format!("Selection ({})", self.sel_bodies.len()), |ui| {
+                let sel = self.sel_bodies.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Duct name");
+                    ui.add(egui::TextEdit::singleline(&mut self.duct_name_buf).desired_width(120.0));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Define as duct").color(Color32::WHITE)).fill(theme::ACCENT)).on_hover_text("Treat the selected parts as ONE duct (use several parts for a duct made of multiple pieces)").clicked() {
+                        let name = self.duct_name_buf.clone();
+                        self.define_duct_from(&sel, &name);
+                    }
+                    if !self.project.ducts.is_empty() {
+                        ui.menu_button("Add to duct", |ui| {
+                            let names: Vec<String> = self.project.ducts.iter().map(|d| d.name.clone()).collect();
+                            for n in names { if ui.button(&n).clicked() { self.add_to_duct(&sel, &n); ui.close_menu(); } }
+                        });
+                    }
+                    if ui.button("Solid").on_hover_text("Obstacle that blocks air (nozzle, heater block, fan housing...)").clicked() { self.remove_from_ducts(&sel); }
+                    if ui.button("Ignore").on_hover_text("Leave out of the simulation").clicked() { self.ignore_bodies(&sel); }
+                });
+            });
+        }
+        theme::section(ui, "Ducts", |ui| {
+            if self.project.ducts.is_empty() {
+                ui.label(egui::RichText::new("None yet.").color(theme::TEXT_DIM));
+            }
+            let mut rename: Option<(String, String)> = None;
+            let mut delete: Option<String> = None;
+            let mut remove_part: Option<(usize, String)> = None;
+            for di in 0..self.project.ducts.len() {
+                let name = self.project.ducts[di].name.clone();
+                let parts = self.project.ducts[di].parts.clone();
+                egui::Frame::group(ui.style()).fill(theme::DEEP).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let id = ui.make_persistent_id(("ductname", di));
+                        let mut buf: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| name.clone());
+                        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                        if r.lost_focus() {
+                            let nb = buf.trim().to_string();
+                            if !nb.is_empty() && nb != name && !self.project.ducts.iter().any(|d| d.name == nb) { rename = Some((name.clone(), nb)); }
+                            buf = name.clone();
+                        } else if !r.has_focus() { buf = name.clone(); }
+                        ui.data_mut(|d| d.insert_temp(id, buf));
+                        ui.label(egui::RichText::new(format!("{} part(s)", parts.len())).color(theme::TEXT_DIM));
+                        if ui.small_button("x").on_hover_text("Delete duct (parts become solids)").clicked() { delete = Some(name.clone()); }
                     });
-                    if role != self.bodies[i].role {
-                        self.project.geometry.overrides.insert(name, role);
-                        changed = true;
+                    for p in &parts {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("  {p}"));
+                            if ui.small_button("-").on_hover_text("Remove this part from the duct").clicked() { remove_part = Some((di, p.clone())); }
+                        });
                     }
                 });
             }
-            if changed { self.reclassify(); }
-        });
-        theme::section(ui, "Role rules (regex)", |ui| {
-            let mut changed = false;
-            for r in &mut self.project.geometry.rules {
-                ui.horizontal(|ui| {
-                    changed |= ui.add(egui::TextEdit::singleline(&mut r.pattern).desired_width(150.0).font(FontId::monospace(11.0))).changed();
-                    egui::ComboBox::from_id_salt(&r.pattern).width(60.0).selected_text(format!("{:?}", r.role)).show_ui(ui, |ui| {
-                        for k in [BodyRole::Duct, BodyRole::Solid, BodyRole::Ignore] { changed |= ui.selectable_value(&mut r.role, k, format!("{k:?}")).changed(); }
-                    });
-                });
+            if let Some((o, n)) = rename {
+                for d in &mut self.project.ducts { if d.name == o { d.name = n.clone(); } }
+                for p in &mut self.project.ports { if p.body == o { p.body = n.clone(); } }
+                self.refresh_candidates();
             }
-            if changed { self.reclassify(); }
+            if let Some((di, part)) = remove_part {
+                self.project.ducts[di].parts.retain(|p| p != &part);
+                self.project.ducts.retain(|d| !d.parts.is_empty());
+                self.reclassify();
+            }
+            if let Some(n) = delete { self.project.ducts.retain(|d| d.name != n); self.reclassify(); }
+        });
+        theme::section(ui, "Name hints (regex)", |ui| {
+            ui.label(egui::RichText::new("Parts whose name matches are highlighted as likely ducts. Only a hint; you decide.").color(theme::TEXT_DIM));
+            for r in &mut self.project.geometry.rules {
+                ui.add(egui::TextEdit::singleline(&mut r.pattern).desired_width(200.0).font(FontId::monospace(11.0)));
+            }
         });
     }
 
@@ -663,6 +812,60 @@ impl App {
         self.sel_port = None;
     }
 
+    /// The visible part under the screen position (front-most triangle).
+    fn pick_body(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        let proj = self.cam.projector(rect);
+        let mut best: Option<(f64, usize)> = None;
+        for (bi, b) in self.bodies.iter().enumerate() {
+            if !self.visible[bi] || b.role == BodyRole::Ignore { continue; }
+            let bb = b.mesh.bounds();
+            // cheap reject: screen box of the bounding box
+            let corners = [[bb.min[0], bb.min[1], bb.min[2]], [bb.max[0], bb.min[1], bb.min[2]], [bb.min[0], bb.max[1], bb.min[2]], [bb.max[0], bb.max[1], bb.min[2]], [bb.min[0], bb.min[1], bb.max[2]], [bb.max[0], bb.min[1], bb.max[2]], [bb.min[0], bb.max[1], bb.max[2]], [bb.max[0], bb.max[1], bb.max[2]]];
+            let pc: Vec<Pos2> = corners.iter().filter_map(|c| proj.project(*c).map(|x| x.0)).collect();
+            if pc.len() == 8 {
+                let (mut lo, mut hi) = (Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN));
+                for q in &pc { lo.x = lo.x.min(q.x); lo.y = lo.y.min(q.y); hi.x = hi.x.max(q.x); hi.y = hi.y.max(q.y); }
+                if pos.x < lo.x - 2.0 || pos.x > hi.x + 2.0 || pos.y < lo.y - 2.0 || pos.y > hi.y + 2.0 { continue; }
+            }
+            for ti in 0..b.mesh.triangles.len() {
+                let [a, bb2, c] = b.mesh.tri(ti);
+                let (Some((pa, da)), Some((pb, _)), Some((pc2, _))) = (proj.project(a), proj.project(bb2), proj.project(c)) else { continue };
+                // point in 2D triangle
+                let sign = |p1: Pos2, p2: Pos2, p3: Pos2| (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+                let (d1, d2, d3) = (sign(pos, pa, pb), sign(pos, pb, pc2), sign(pos, pc2, pa));
+                let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+                let posv = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+                if neg && posv { continue; }
+                if best.map_or(true, |x| da < x.0) { best = Some((da, bi)); }
+            }
+        }
+        best.map(|x| x.1)
+    }
+
+    fn body_context_menu_ui(&mut self, ui: &mut egui::Ui, bi: usize) {
+        let name = self.bodies[bi].name.clone();
+        let sel: Vec<usize> = if self.sel_bodies.contains(&bi) { self.sel_bodies.clone() } else { vec![bi] };
+        ui.label(egui::RichText::new(format!("Part '{}'{}", name, if sel.len() > 1 { format!("  (+{} selected)", sel.len() - 1) } else { String::new() })).strong());
+        if let Some(d) = self.project.duct_of(&name) { ui.label(egui::RichText::new(format!("in duct '{}'", d.name)).color(theme::TEXT_DIM)); }
+        ui.separator();
+        if ui.button("Define as new duct").clicked() {
+            let default_name = self.duct_name_buf.clone();
+            self.define_duct_from(&sel, if default_name.is_empty() { &name } else { &default_name });
+            ui.close_menu();
+        }
+        if !self.project.ducts.is_empty() {
+            ui.menu_button("Add to duct", |ui| {
+                let names: Vec<String> = self.project.ducts.iter().map(|d| d.name.clone()).collect();
+                for n in names { if ui.button(&n).clicked() { self.add_to_duct(&sel, &n); ui.close_menu(); } }
+            });
+        }
+        if self.project.duct_of(&name).is_some() && ui.button("Remove from duct").clicked() { self.remove_from_ducts(&sel); ui.close_menu(); }
+        if ui.button("Solid obstacle").clicked() { self.remove_from_ducts(&sel); ui.close_menu(); }
+        if ui.button("Ignore").clicked() { self.ignore_bodies(&sel); ui.close_menu(); }
+        ui.separator();
+        if ui.button("Show in Bodies list").clicked() { self.select_body(bi, false); ui.close_menu(); }
+    }
+
     fn hit_test(&self, rect: Rect, pos: Pos2) -> Option<Target> {
         let mut items: Vec<(Target, &PortCap)> = vec![];
         for (i, (_, c)) in self.candidates.iter().enumerate() { items.push((Target::Cand(i), &c.cap)); }
@@ -685,7 +888,7 @@ impl App {
 
     fn context_menu_ui(&mut self, ui: &mut egui::Ui) {
         let Some(t0) = self.ctx_target else {
-            ui.label("Right-click an opening to assign it.");
+            if let Some(bi) = self.ctx_body { self.body_context_menu_ui(ui, bi); } else { ui.label("Right-click an opening to assign it, or a part to define a duct."); }
             return;
         };
         let t = self.resolve(t0);
@@ -733,6 +936,9 @@ impl App {
             }
             self.sources_ui(ui);
         });
+        if self.project.ducts.is_empty() {
+            ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), "Define a duct first (Bodies tab) so its openings can be found.");
+        }
         theme::section(ui, "Openings", |ui| self.openings_ui(ui));
         theme::section(ui, "Outlets", |ui| self.outlets_ui(ui));
     }
@@ -1016,11 +1222,20 @@ impl App {
         // geometry
         for (i, b) in self.bodies.iter().enumerate() {
             if self.mesh_mode == MeshMode::Hidden || !self.visible[i] || b.role == BodyRole::Ignore { continue; }
-            let (col, alpha) = match (b.role, self.mesh_mode) {
-                (BodyRole::Duct, MeshMode::Ghost) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
-                (_, MeshMode::Ghost) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
-                (BodyRole::Duct, _) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 150),
-                _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
+            let selected = self.sel_bodies.contains(&i);
+            let suggested = self.project.is_suggested(&b.name);
+            let ghost = self.mesh_mode == MeshMode::Ghost;
+            let (col, alpha) = if selected {
+                (Color32::from_rgb(0x4D, 0xA3, 0xFF), if ghost { 90 } else { 210 })
+            } else if suggested {
+                (Color32::from_rgb(0xE8, 0xB8, 0x4A), if ghost { 70 } else { 200 })
+            } else {
+                match (b.role, ghost) {
+                    (BodyRole::Duct, true) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
+                    (_, true) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
+                    (BodyRole::Duct, false) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 150),
+                    _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
+                }
             };
             viewport::draw_mesh(&painter, rect, &self.cam, &b.mesh, col, alpha, false);
         }
@@ -1061,15 +1276,38 @@ impl App {
             painter.rect_filled(r, 2.0, Color32::from_black_alpha(200));
             painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
         }
+        // part under the cursor (when no opening is hovered): name label
+        if hover.is_none() && resp.hovered() && self.mesh_mode != MeshMode::Hidden {
+            if let Some(pos) = resp.hover_pos() {
+                if let Some(bi) = self.pick_body(rect, pos) {
+                    let b = &self.bodies[bi];
+                    let tag = match self.project.duct_of(&b.name) { Some(d) => format!("  (duct: {})", d.name), None if self.project.is_suggested(&b.name) => "  (★ looks like a duct)".to_string(), None => String::new() };
+                    let galley = painter.layout_no_wrap(format!("{}{}", b.name, tag), FontId::proportional(11.0), Color32::WHITE);
+                    let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), galley.size() + Vec2::new(10.0, 6.0));
+                    painter.rect_filled(r, 2.0, Color32::from_black_alpha(200));
+                    painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
+                }
+            }
+        }
         if resp.clicked() {
-            if let Some(t) = resp.interact_pointer_pos().and_then(|pp| self.hit_test(rect, pp)) {
-                self.select_target(t);
-                self.tab = Tab::Ports;
+            if let Some(pp) = resp.interact_pointer_pos() {
+                if let Some(t) = self.hit_test(rect, pp) {
+                    self.select_target(t);
+                    self.tab = Tab::Ports;
+                } else if let Some(bi) = self.pick_body(rect, pp) {
+                    let add = ui.input(|x| x.modifiers.ctrl || x.modifiers.command);
+                    self.select_body(bi, add);
+                } else {
+                    self.sel_bodies.clear();
+                }
             }
         }
         if resp.secondary_clicked() {
-            self.ctx_target = resp.interact_pointer_pos().and_then(|pp| self.hit_test(rect, pp));
+            let pp = resp.interact_pointer_pos();
+            self.ctx_target = pp.and_then(|pp| self.hit_test(rect, pp));
+            self.ctx_body = if self.ctx_target.is_none() { pp.and_then(|pp| self.pick_body(rect, pp)) } else { None };
             if let Some(t) = self.ctx_target { self.select_target(t); }
+            if let Some(bi) = self.ctx_body { if !self.sel_bodies.contains(&bi) { self.select_body(bi, false); } }
         }
         resp.context_menu(|ui| self.context_menu_ui(ui));
         // axis gizmo

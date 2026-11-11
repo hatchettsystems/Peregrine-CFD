@@ -1,7 +1,7 @@
 //! Loading bodies from geometry files and assembling the voxel domain for a project.
 use anyhow::{bail, Context, Result};
 use peregrine_core::{find_port_candidates, stl, Aabb, PortCandidate, TriMesh};
-use peregrine_project::{BodyRole, Project};
+use peregrine_project::{BodyRole, DuctDef, Project};
 use peregrine_voxel::{build_domain, Domain, PortSpec};
 use std::path::Path;
 
@@ -42,33 +42,72 @@ pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
             "stl" => {
                 let name = f.file_stem().and_then(|s| s.to_str()).unwrap_or("body").to_string();
                 let mesh = stl::read_stl(&f).with_context(|| format!("reading {}", f.display()))?;
-                let role = project.geometry.classify(&name);
-                bodies.push(Body { name, role, mesh });
+                bodies.push(Body { name, role: BodyRole::Solid, mesh });
             }
             "step" | "stp" => {
                 let defl = (project.solver.cell_size_mm * 0.2).clamp(0.01, 0.1);
                 for b in peregrine_occt::read_step(&f, defl).with_context(|| format!("reading {}", f.display()))? {
                     let name = clean_name(&b.name);
-                    let role = project.geometry.classify(&name);
-                    bodies.push(Body { name, role, mesh: b.mesh });
+                    bodies.push(Body { name, role: BodyRole::Solid, mesh: b.mesh });
                 }
             }
             _ => bail!("unsupported geometry file: {}", f.display()),
         }
     }
+    apply_roles(project, &mut bodies, true);
     Ok(bodies)
 }
 
-/// Port candidates (planar holes) of every Duct body, as (body name, candidate).
+/// Set each body's role from the project: parts of a defined duct are `Duct`, the ignore list is `Ignore`,
+/// everything else is a solid obstacle. With `legacy_hints`, a project that never defined ducts falls back to
+/// treating bodies whose name looks like a duct as ducts (command line and old project files).
+pub fn apply_roles(project: &Project, bodies: &mut [Body], legacy_hints: bool) {
+    let names: Vec<String> = bodies.iter().map(|b| b.name.clone()).collect();
+    let ducts = if legacy_hints { project.effective_ducts(&names) } else { project.ducts.clone() };
+    for b in bodies.iter_mut() {
+        b.role = if project.geometry.ignored.contains(&b.name) || project.geometry.overrides.get(&b.name) == Some(&BodyRole::Ignore) {
+            BodyRole::Ignore
+        } else if ducts.iter().any(|d| d.parts.contains(&b.name)) {
+            BodyRole::Duct
+        } else {
+            BodyRole::Solid
+        };
+    }
+}
+
+/// Port candidates (planar holes) of every duct, as (duct name, candidate). A duct may be made of several
+/// parts: openings are found on all parts together, and the openings where two parts join (equal and
+/// opposite, coincident) are removed because they are internal.
 /// `hide_round_below`: skip small round holes (screw holes) with an equivalent diameter up to this (mm).
-pub fn duct_port_candidates(bodies: &[Body], min_area: f64, hide_round_below: Option<f64>) -> Vec<(String, PortCandidate)> {
+pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, hide_round_below: Option<f64>) -> Vec<(String, PortCandidate)> {
+    use peregrine_core::vec3::{dot, len, sub};
     let mut out = vec![];
-    for b in bodies.iter().filter(|b| b.role == BodyRole::Duct) {
-        for c in find_port_candidates(&b.mesh, min_area) {
-            if hide_round_below.map_or(false, |d| c.is_screw_hole(d)) {
-                continue;
+    for d in ducts {
+        let mut mesh = TriMesh::default();
+        for part in &d.parts {
+            if let Some(b) = bodies.iter().find(|b| &b.name == part) {
+                mesh.append(&b.mesh);
             }
-            out.push((b.name.clone(), c));
+        }
+        if mesh.triangles.is_empty() {
+            continue;
+        }
+        let cands = find_port_candidates(&mesh, min_area);
+        let mut keep = vec![true; cands.len()];
+        for i in 0..cands.len() {
+            for j in (i + 1)..cands.len() {
+                let (a, b) = (&cands[i], &cands[j]);
+                let joint = dot(a.cap.normal, b.cap.normal) < -0.99 && len(sub(a.cap.centroid(), b.cap.centroid())) < 0.1 && (a.area - b.area).abs() <= 0.02 * a.area.max(b.area);
+                if joint {
+                    keep[i] = false;
+                    keep[j] = false;
+                }
+            }
+        }
+        for (c, k) in cands.into_iter().zip(keep) {
+            if k && !hide_round_below.map_or(false, |dm| c.is_screw_hole(dm)) {
+                out.push((d.name.clone(), c));
+            }
         }
     }
     out
@@ -136,6 +175,50 @@ mod tests {
         let bodies = load_bodies(&f, &Project::new("t")).unwrap();
         let duct = bodies.iter().find(|b| b.name == "duct").unwrap();
         assert_eq!(duct.role, BodyRole::Duct);
-        assert_eq!(duct_port_candidates(&bodies, 1.0, None).len(), 2);
+        let names: Vec<String> = bodies.iter().map(|b| b.name.clone()).collect();
+        let ducts = Project::new("t").effective_ducts(&names);
+        assert_eq!(duct_port_candidates(&bodies, &ducts, 1.0, None).len(), 2);
+    }
+
+    #[test]
+    fn multi_part_duct_cancels_the_internal_joint() {
+        use peregrine_core::shapes;
+        let mut a = shapes::hollow_tube(8.0, 4.0, 15.0);
+        let mut b = shapes::hollow_tube(8.0, 4.0, 15.0);
+        b.translate([15.0, 0.0, 0.0]);
+        a.translate([0.0, 0.0, 0.0]);
+        let bodies = vec![
+            Body { name: "part A".into(), role: BodyRole::Solid, mesh: a },
+            Body { name: "part B".into(), role: BodyRole::Solid, mesh: b },
+        ];
+        // as two separate ducts each part shows both of its ends
+        let separate = vec![
+            DuctDef { name: "A".into(), parts: vec!["part A".into()] },
+            DuctDef { name: "B".into(), parts: vec!["part B".into()] },
+        ];
+        assert_eq!(duct_port_candidates(&bodies, &separate, 1.0, None).len(), 4);
+        // as one two-part duct the joint disappears and only the two real ends remain
+        let joined = vec![DuctDef { name: "duct".into(), parts: vec!["part A".into(), "part B".into()] }];
+        let c = duct_port_candidates(&bodies, &joined, 1.0, None);
+        assert_eq!(c.len(), 2, "{:?}", c.iter().map(|x| x.1.cap.centroid()).collect::<Vec<_>>());
+        let xs: Vec<f64> = c.iter().map(|x| x.1.cap.centroid()[0]).collect();
+        assert!(xs.iter().any(|x| x.abs() < 1e-3) && xs.iter().any(|x| (x - 30.0).abs() < 1e-3), "{xs:?}");
+    }
+
+    #[test]
+    fn roles_follow_user_ducts() {
+        use peregrine_core::shapes;
+        let mut p = Project::new("t");
+        let mut bodies = vec![
+            Body { name: "duct".into(), role: BodyRole::Solid, mesh: shapes::hollow_tube(8.0, 4.0, 10.0) },
+            Body { name: "Part1".into(), role: BodyRole::Solid, mesh: shapes::solid_box([0.0; 3], [1.0; 3]) },
+        ];
+        // explicit mode: a duct-looking name alone does nothing
+        apply_roles(&p, &mut bodies, false);
+        assert!(bodies.iter().all(|b| b.role == BodyRole::Solid));
+        p.define_duct("mine", &["Part1".to_string()]);
+        apply_roles(&p, &mut bodies, false);
+        assert_eq!(bodies[1].role, BodyRole::Duct);
+        assert_eq!(bodies[0].role, BodyRole::Solid);
     }
 }

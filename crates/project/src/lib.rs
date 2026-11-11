@@ -22,19 +22,32 @@ pub struct RoleRule {
     pub role: BodyRole,
 }
 
+/// A duct is one or more bodies (parts) treated as a single air passage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DuctDef {
+    pub name: String,
+    /// Names of the bodies that make up this duct.
+    pub parts: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GeometrySettings {
+    /// Name patterns that only HIGHLIGHT likely duct bodies; the user decides what is a duct.
     pub rules: Vec<RoleRule>,
-    /// Explicit per-body role, overrides rules.
+    /// Legacy per-body role overrides (used for hints and old projects).
     #[serde(default)]
     pub overrides: BTreeMap<String, BodyRole>,
+    /// Bodies excluded from the simulation entirely.
+    #[serde(default)]
+    pub ignored: std::collections::BTreeSet<String>,
 }
 
 impl Default for GeometrySettings {
     fn default() -> Self {
         GeometrySettings {
+            ignored: Default::default(),
             rules: vec![
-                RoleRule { pattern: r"(?i)^duct([_\- ]\w+)?$".into(), role: BodyRole::Duct },
+                RoleRule { pattern: r"(?i)(duct|shroud|scoop|tunnel|channel)".into(), role: BodyRole::Duct },
                 RoleRule { pattern: r"(?i)(fan|blower)".into(), role: BodyRole::Solid },
             ],
             overrides: BTreeMap::new(),
@@ -195,6 +208,9 @@ pub struct Project {
     pub domain: DomainSettings,
     #[serde(default)]
     pub solver: SolverSettings,
+    /// Ducts defined by the user (each made of one or more bodies).
+    #[serde(default)]
+    pub ducts: Vec<DuctDef>,
     #[serde(default)]
     pub ports: Vec<Port>,
     #[serde(default)]
@@ -202,6 +218,63 @@ pub struct Project {
 }
 
 impl Project {
+    /// The duct a body belongs to, if the user has put it in one.
+    pub fn duct_of(&self, body: &str) -> Option<&DuctDef> {
+        self.ducts.iter().find(|d| d.parts.iter().any(|p| p == body))
+    }
+
+    /// Role of a body from the user's choices (ducts, ignore list); everything else is a solid obstacle.
+    pub fn role_of(&self, body: &str) -> BodyRole {
+        if self.duct_of(body).is_some() {
+            BodyRole::Duct
+        } else if self.geometry.ignored.contains(body) {
+            BodyRole::Ignore
+        } else {
+            BodyRole::Solid
+        }
+    }
+
+    /// True when the body's name looks like a duct and the user has not assigned it yet (a highlight hint).
+    pub fn is_suggested(&self, body: &str) -> bool {
+        self.duct_of(body).is_none() && !self.geometry.ignored.contains(body) && self.geometry.classify(body) == BodyRole::Duct
+    }
+
+    /// Ducts to use for opening detection. Projects (or tests) that never defined ducts fall back to one duct
+    /// per body whose name looks like a duct, so older files and scripts keep working.
+    pub fn effective_ducts(&self, body_names: &[String]) -> Vec<DuctDef> {
+        if !self.ducts.is_empty() {
+            return self.ducts.clone();
+        }
+        body_names
+            .iter()
+            .filter(|n| self.geometry.classify(n) == BodyRole::Duct && !self.geometry.ignored.contains(*n))
+            .map(|n| DuctDef { name: n.clone(), parts: vec![n.clone()] })
+            .collect()
+    }
+
+    /// Put `parts` into a new duct named `name` (removing them from other ducts). Returns the final name.
+    pub fn define_duct(&mut self, name: &str, parts: &[String]) -> String {
+        for d in &mut self.ducts {
+            d.parts.retain(|p| !parts.contains(p));
+        }
+        self.ducts.retain(|d| !d.parts.is_empty());
+        let mut final_name = name.trim().to_string();
+        if final_name.is_empty() {
+            final_name = "duct".into();
+        }
+        let base = final_name.clone();
+        let mut n = 2;
+        while self.ducts.iter().any(|d| d.name == final_name) {
+            final_name = format!("{base} {n}");
+            n += 1;
+        }
+        for p in parts {
+            self.geometry.ignored.remove(p);
+        }
+        self.ducts.push(DuctDef { name: final_name.clone(), parts: parts.to_vec() });
+        final_name
+    }
+
     /// Indices of the ports that belong to `source`.
     pub fn members(&self, source: &str) -> Vec<usize> {
         (0..self.ports.len()).filter(|&i| self.ports[i].kind.source() == Some(source)).collect()
@@ -244,6 +317,7 @@ impl Project {
             fluid: Default::default(),
             domain: Default::default(),
             solver: Default::default(),
+            ducts: vec![],
             ports: vec![],
             sources: vec![],
         }
@@ -267,7 +341,10 @@ mod tests {
             assert_eq!(g.classify(n), BodyRole::Duct, "{n}");
         }
         assert_eq!(g.classify("nozzle"), BodyRole::Solid);
-        assert_eq!(g.classify("ductwork_cover"), BodyRole::Solid);
+        // hints are deliberately loose: the user makes the final call
+        assert_eq!(g.classify("ductwork_cover"), BodyRole::Duct);
+        assert_eq!(g.classify("Part Cooling Shroud"), BodyRole::Duct);
+        assert_eq!(g.classify("heater block"), BodyRole::Solid);
     }
     #[test]
     fn source_validation() {
@@ -283,6 +360,32 @@ mod tests {
         let s = toml::to_string_pretty(&p).unwrap();
         let q: Project = toml::from_str(&s).unwrap();
         assert_eq!(q.sources.len(), 2);
+    }
+
+    #[test]
+    fn ducts_are_user_defined_and_names_only_suggest() {
+        let mut p = Project::new("d");
+        // a name hint highlights but does not decide
+        assert!(p.is_suggested("duct_L"));
+        assert_eq!(p.role_of("duct_L"), BodyRole::Solid);
+        let n = p.define_duct("left", &["a1276918-Duct".to_string(), "lip".to_string()]);
+        assert_eq!(n, "left");
+        assert_eq!(p.role_of("a1276918-Duct"), BodyRole::Duct);
+        assert_eq!(p.role_of("lip"), BodyRole::Duct);
+        assert_eq!(p.duct_of("lip").unwrap().parts.len(), 2);
+        assert!(!p.is_suggested("a1276918-Duct"));
+        // a part can only live in one duct
+        p.define_duct("other", &["lip".to_string()]);
+        assert_eq!(p.duct_of("lip").unwrap().name, "other");
+        assert_eq!(p.duct_of("a1276918-Duct").unwrap().name, "left");
+        // duplicate names get a suffix
+        assert_eq!(p.define_duct("left", &["x".to_string()]), "left 2");
+        // fallback for projects that never defined ducts
+        let q = Project::new("old");
+        let names = vec!["duct_1".to_string(), "nozzle".to_string()];
+        let e = q.effective_ducts(&names);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].name, "duct_1");
     }
 
     #[test]

@@ -14,6 +14,8 @@ const USAGE: &str = "peregrine <command>
   ports <project.toml>             list port candidates (planar openings) of the duct bodies
   set-port <project.toml> <#> <name> <kind>
                                    define a port from candidate #; kind = velocity=<m/s> | flow=<L/min> | outlet=<Pa> | source=<name>
+  set-duct <project.toml> <name> <part,part,...>
+                                   define a duct made of one or more bodies (by name)
   fans                             list the built-in fan library
   set-source <project.toml> <name> <spec> [area|weights|plenum]
                                    define a source; spec = flow=<L/min> | velocity=<m/s> | fan=<library name or part> | fan=q:dp,q:dp,...
@@ -35,6 +37,16 @@ fn real_main() -> Result<()> {
         Some("set-port") => {
             if args.len() < 5 { bail!("{USAGE}"); }
             set_port(Path::new(&args[1]), args[2].parse()?, &args[3], &args[4])
+        }
+        Some("set-duct") => {
+            if args.len() < 4 { bail!("{USAGE}"); }
+            let path = Path::new(&args[1]);
+            let mut project = Project::load(path)?;
+            let parts: Vec<String> = args[3].split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            let name = project.define_duct(&args[2], &parts);
+            project.save(path)?;
+            println!("duct '{name}' = {}", parts.join(" + "));
+            Ok(())
         }
         Some("fans") => {
             for p in presets::fan_presets() {
@@ -97,11 +109,12 @@ fn demo(dir: &Path) -> Result<()> {
 }
 
 fn ports(project_path: &Path) -> Result<()> {
-    let (_, bodies) = load(project_path)?;
+    let (project, bodies) = load(project_path)?;
     for b in &bodies {
-        println!("body {:<16} role {:?}  ({} triangles)", b.name, b.role, b.mesh.triangles.len());
+        let duct = project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()).into_iter().find(|d| d.parts.contains(&b.name)).map(|d| d.name);
+        println!("body {:<24} {}  ({} triangles)", b.name, duct.map_or("solid".to_string(), |d| format!("part of duct '{d}'")), b.mesh.triangles.len());
     }
-    let c = duct_port_candidates(&bodies, 0.5, Some(SCREW_MAX_D));
+    let c = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D));
     if c.is_empty() {
         println!("no port candidates found (a duct needs planar faces with openings)");
     }
@@ -115,7 +128,7 @@ fn ports(project_path: &Path) -> Result<()> {
 
 fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result<()> {
     let (mut project, bodies) = load(project_path)?;
-    let c = duct_port_candidates(&bodies, 0.5, Some(SCREW_MAX_D));
+    let c = duct_port_candidates(&bodies, &project.effective_ducts(&bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>()), 0.5, Some(SCREW_MAX_D));
     let (body, cand) = c.get(index).with_context(|| format!("no candidate #{index}"))?;
     let (k, v) = kind.split_once('=').context("kind must look like velocity=5")?;
     let kind = match k {
