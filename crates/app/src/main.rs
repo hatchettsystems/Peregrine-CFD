@@ -310,12 +310,13 @@ impl App {
                         sim.advance(n);
                         done += n;
                         if sim.unstable() {
+                            let spot = sim.hotspot();
                             attempt += 1;
                             if attempt > 2 {
-                                anyhow::bail!("solution became unstable at step {done} even with reference speed {:.0} m/s. Check the geometry for tiny gaps, reduce the flow, or refine the cell size.", sim.ref_speed);
+                                anyhow::bail!("solution became unstable at step {done} even with reference speed {:.0} m/s. Fastest cell: {spot}. Check the geometry for tiny gaps, reduce the flow, or refine the cell size.", sim.ref_speed);
                             }
                             ref_speed = sim.ref_speed * 1.6;
-                            notes.push(format!("Run became unstable at step {done}; restarted with reference speed {ref_speed:.1} m/s (attempt {attempt})."));
+                            notes.push(format!("Run became unstable at step {done} (fastest cell {spot}); restarted with reference speed {ref_speed:.1} m/s (attempt {attempt})."));
                             continue 'attempts;
                         }
                         let u = sim.units;

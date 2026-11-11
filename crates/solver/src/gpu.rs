@@ -125,7 +125,7 @@ impl GpuLbm {
             dims: [cfg.dims[0] as u32, cfg.dims[1] as u32, cfg.dims[2] as u32, n as u32],
             tau0_cs: [cfg.tau0, cfg.smagorinsky, 0.0, 0.0],
             force: [cfg.body_force[0], cfg.body_force[1], cfg.body_force[2], 0.0],
-            flags: [open_mask, n_port_cells, cfg.regularized as u32, 0],
+            flags: [open_mask, n_port_cells, cfg.regularized as u32, cfg.sponge_cells as u32],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("params"), contents: bytemuck::bytes_of(&params), usage: wgpu::BufferUsages::UNIFORM });
 

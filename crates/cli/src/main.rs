@@ -200,6 +200,7 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) 
             sim.advance(n);
             done += n;
             if sim.unstable() {
+                println!("instability at step {done}: fastest cell {}", sim.hotspot());
                 attempt += 1;
                 if attempt > 2 {
                     bail!("solution became unstable at step {done} even with reference speed {:.0} m/s. Check the geometry for tiny gaps, reduce the flow, or refine the cell size.", sim.ref_speed);

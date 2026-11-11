@@ -40,6 +40,7 @@ fn check(regularized: bool) {
         open_faces: [false; 6],
         body_force: [0.0; 3],
         regularized,
+        sponge_cells: 0,
         ports: vec![
             PortInfo { bc: PortBc::Velocity([u_in, 0.0, 0.0]), inward: [1, 0, 0], normal: [0.0; 3] },
             PortInfo { bc: PortBc::Pressure(1.0), inward: [-1, 0, 0], normal: [0.0; 3] },

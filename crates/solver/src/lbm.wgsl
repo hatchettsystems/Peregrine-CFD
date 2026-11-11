@@ -71,7 +71,18 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
                 else { iz = iz + step; }
                 if (ix >= 0 && ix < i32(nx) && iy >= 0 && iy < i32(ny) && iz >= 0 && iz < i32(nz)) {
                     let j = u32(ix) + nx * (u32(iy) + ny * u32(iz));
-                    if (cells[j] == 0u) { val = f_in[i * n + j]; }
+                    if (cells[j] == 0u) {
+                        // pressure boundary: rho = 1 with the neighbour's velocity plus its non-equilibrium part
+                        var rj = 0.0;
+                        var mj = vec3<f32>(0.0);
+                        for (var k = 0u; k < Q; k = k + 1u) {
+                            let fk = f_in[k * n + j];
+                            rj = rj + fk;
+                            mj = mj + vec3<f32>(f32(CX[k]), f32(CY[k]), f32(CZ[k])) * fk;
+                        }
+                        let uj = mj / rj;
+                        val = feq(i, 1.0, uj) + (f_in[i * n + j] - feq(i, rj, uj));
+                    }
                 }
             }
             fi[i] = val;
@@ -105,6 +116,18 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cs > 0.0) {
         let s = pxx * pxx + pyy * pyy + pzz * pzz + 2.0 * (pxy * pxy + pxz * pxz + pyz * pyz);
         tau = 0.5 * (tau0 + sqrt(tau0 * tau0 + 18.0 * 1.41421356 * cs * cs * sqrt(s) * inv));
+    }
+    let sponge = i32(P.flags.w);
+    if (sponge > 0) {
+        var dmin = 1000000;
+        let dist = array<i32, 6>(x, i32(nx) - 1 - x, y, i32(ny) - 1 - y, z, i32(nz) - 1 - z);
+        for (var f = 0u; f < 6u; f = f + 1u) {
+            if (((P.flags.x >> f) & 1u) == 1u) { dmin = min(dmin, dist[f]); }
+        }
+        if (dmin < sponge) {
+            let w = f32(sponge - dmin) / f32(sponge);
+            tau = tau + w * w * (1.0 - tau);
+        }
     }
     let omega = 1.0 / tau;
     let tau_m = 0.5 + 0.1875 / (tau - 0.5);

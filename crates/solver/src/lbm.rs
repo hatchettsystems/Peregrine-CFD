@@ -119,6 +119,8 @@ pub struct LbmConfig {
     pub ports: Vec<PortInfo>,
     /// Regularized collision (filters non-hydrodynamic moments; stable at much lower viscosity than TRT).
     pub regularized: bool,
+    /// Thickness (cells) of the viscous sponge layer along open domain faces (0 = off).
+    pub sponge_cells: usize,
 }
 
 pub struct Lbm {
@@ -163,6 +165,7 @@ impl Lbm {
         let open = self.cfg.open_faces;
         let has_force = force != [0.0; 3];
         let regularized = self.cfg.regularized;
+        let sponge = self.cfg.sponge_cells as i32;
         self.fnew.par_chunks_mut(Q).zip(self.mac_new.par_chunks_mut(1)).enumerate().for_each(|(idx, (out, mout))| {
             if cells[idx] != 0 {
                 return;
@@ -184,7 +187,19 @@ impl Lbm {
                             inner[ax] += if fc % 2 == 0 { 1 } else { -1 };
                             let ok = inner[ax] >= 0 && inner[ax] < [nx, ny, nz][ax] as i32;
                             let j = if ok { inner[0] as usize + nx * (inner[1] as usize + ny * inner[2] as usize) } else { idx };
-                            if cells[j] == 0 { f[j * Q + i] } else { f[idx * Q + opp(i)] }
+                            if cells[j] == 0 {
+                                // pressure boundary: ambient density (rho = 1) with the neighbour's velocity,
+                                // plus its non-equilibrium part. Pins the far-field pressure so mass cannot drift.
+                                let mut rj = 0.0f32;
+                                let mut mj = [0.0f32; 3];
+                                for k in 0..Q {
+                                    let fk = f[j * Q + k];
+                                    rj += fk;
+                                    for a in 0..3 { mj[a] += C[k][a] as f32 * fk; }
+                                }
+                                let uj = [mj[0] / rj, mj[1] / rj, mj[2] / rj];
+                                feq(i, 1.0, uj) + (f[j * Q + i] - feq(i, rj, uj))
+                            } else { f[idx * Q + opp(i)] }
                         } else {
                             f[idx * Q + opp(i)]
                         }
@@ -225,6 +240,18 @@ impl Lbm {
                         }
                     }
                     tau = 0.5 * (tau0 + (tau0 * tau0 + 18.0 * std::f32::consts::SQRT_2 * cs * cs * s.sqrt() * inv).sqrt());
+                }
+            }
+            if sponge > 0 {
+                // viscous buffer along open faces absorbs disturbances before they reach the boundary
+                let dist = [x, nx as i32 - 1 - x, y, ny as i32 - 1 - y, z, nz as i32 - 1 - z];
+                let mut dmin = i32::MAX;
+                for f in 0..6 {
+                    if open[f] { dmin = dmin.min(dist[f]); }
+                }
+                if dmin < sponge {
+                    let w = (sponge - dmin) as f32 / sponge as f32;
+                    tau += w * w * (1.0 - tau);
                 }
             }
             let omega = 1.0 / tau;

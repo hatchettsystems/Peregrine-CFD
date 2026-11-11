@@ -74,6 +74,10 @@ pub struct Simulation {
     /// Reference speed (m/s) that fixed the time step; may be higher than the project's setting.
     pub ref_speed: f64,
     pub dims: [usize; 3],
+    /// Grid origin (mm) and cell size (mm), for reporting where things happen.
+    origin_mm: [f64; 3],
+    dx_mm: f64,
+    face_open: [bool; 6],
     cells: Vec<u8>,
     ports: Vec<PortInfo>,
     port_cells: Vec<(usize, usize, usize)>,
@@ -190,6 +194,7 @@ impl Simulation {
             body_force: [0.0; 3],
             ports: infos.clone(),
             regularized: true,
+            sponge_cells: if project.domain.padding_mm > 0.0 { ((0.6 * project.domain.padding_mm / g.dx).round() as usize).clamp(4, 40) } else { 0 },
         };
         let ramp_base = infos.iter().zip(&meta).map(|(p, m)| match (p.bc, &m.1) {
             (PortBc::Velocity(u), PortKind::VelocityInlet { .. } | PortKind::FlowInlet { .. }) => Some(u),
@@ -229,7 +234,7 @@ impl Simulation {
             };
             sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, gain: vec![1.0; members.len()], members, weights, areas, q_cmd, p_cmd });
         }
-        let mut sim = Simulation { engine, units, ref_speed, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
+        let mut sim = Simulation { engine, units, ref_speed, dims: g.dims, origin_mm: g.origin, dx_mm: g.dx, face_open: project.domain.faces.map(|f| f == FaceBc::Open), cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
         sim.apply_sources();
         Ok(sim)
@@ -411,6 +416,51 @@ impl Simulation {
         let cells = &self.cells;
         let mac = self.engine.mac();
         mac.iter().zip(cells).filter(|(_, &c)| c == 0).map(|(m, _)| (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt()).fold(0.0, f32::max)
+    }
+
+    /// Describes where the fastest (or first non-finite) fluid cell is, to help find the cause of an instability.
+    pub fn hotspot(&mut self) -> String {
+        let [nx, ny, nz] = self.dims;
+        let u = self.units;
+        let cells = self.cells.clone();
+        let mac = self.engine.mac();
+        let mut best = (-1.0f32, 0usize, false);
+        for (i, m) in mac.iter().enumerate() {
+            if cells[i] != 0 { continue; }
+            let finite = m[0].is_finite() && m[1].is_finite() && m[2].is_finite() && m[3].is_finite();
+            let sp = if finite { (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() } else { f32::INFINITY };
+            if (!finite && !best.2) || (finite == !best.2 && sp > best.0) { best = (sp, i, !finite); }
+        }
+        let i = best.1;
+        let (x, y, z) = (i % nx, (i / nx) % ny, i / (nx * ny));
+        let mm = |a: usize, k: usize| self.origin_mm[k] + (a as f64 + 0.5) * self.dx_mm;
+        // proximity checks (within 3 cells)
+        let faces = [(x, 0, "-X"), (nx - 1 - x, 1, "+X"), (y, 2, "-Y"), (ny - 1 - y, 3, "+Y"), (z, 4, "-Z"), (nz - 1 - z, 5, "+Z")];
+        let mut near = String::from("in free fluid");
+        for (d, f, name) in faces {
+            if d <= 3 { near = format!("next to the {} domain face ({})", name, if self.face_open[f] { "open" } else { "wall" }); break; }
+        }
+        if near == "in free fluid" {
+            'search: for dz in -3i32..=3 { for dy in -3i32..=3 { for dx in -3i32..=3 {
+                let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 { continue; }
+                let c = cells[xx as usize + nx * (yy as usize + ny * zz as usize)];
+                if c >= 2 {
+                    let name = &self.project_ports[(c - 2) as usize].0;
+                    near = format!("next to port '{name}'");
+                    break 'search;
+                }
+            } } }
+        }
+        if near == "in free fluid" {
+            'w: for dz in -2i32..=2 { for dy in -2i32..=2 { for dx in -2i32..=2 {
+                let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 { continue; }
+                if cells[xx as usize + nx * (yy as usize + ny * zz as usize)] == 1 { near = "next to a wall".into(); break 'w; }
+            } } }
+        }
+        let speed = if best.2 { "non-finite".to_string() } else { format!("{:.1} m/s", u.vel_to_phys(best.0 as f64)) };
+        format!("{} at ({:.1}, {:.1}, {:.1}) mm, {}", speed, mm(x, 0), mm(y, 1), mm(z, 2), near)
     }
 
     /// True when the run has blown up or lattice speeds are far into the compressible range.
