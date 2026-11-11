@@ -295,7 +295,7 @@ pub fn build_project_domain(project: &Project, bodies: &[Body]) -> Result<Domain
     let mut d = build_domain_full(&meshes, &groups, project.domain.seam_tolerance_mm, project.domain.gap_seal_mm, &ports, &blockers, &plugs, &bounds, project.solver.cell_size_mm);
     let inlets: Vec<u8> = project.ports.iter().enumerate().filter(|(_, p)| p.kind.is_inlet()).map(|(k, _)| PORT_BASE + k as u8).collect();
     if project.domain.auto_seal_leaks {
-        d.repaired = peregrine_voxel::auto_seal_leaks(&mut d, &inlets, &outlet_zones(project), 150, 2.6);
+        d.repaired = peregrine_voxel::auto_seal_leaks(&mut d, &inlets, &outlet_zones(project), 150, 1.0);
     }
     peregrine_voxel::keep_relevant_seals(&mut d, &inlets);
     for (p, n) in project.ports.iter().zip(&d.port_cell_counts) {
@@ -458,9 +458,15 @@ pub fn repair_note(domain: &Domain) -> Option<String> {
     if regions.len() > 8 { lines.push_str(&format!("\n  ... and {} more regions", regions.len() - 8)); }
     let _ = first;
     Some(format!(
-        "Auto-sealed small gaps (thin air gaps between solid surfaces) in {} region(s), {} cells, {:.0} mm³ in total. No gap that thin should exist in a real part, so they were closed.{}\nReal openings are never closed automatically: define them as ports or blockers. Tick 'Show auto-sealed regions' in the Results display options to see them, or turn the sealer off with gap_seal_mm = 0 / auto_seal_leaks = false in the project's [domain] section.",
+        "Auto-sealed small gaps (thin air gaps between solid surfaces, under about 1 mm) in {} region(s), {} cells, {:.0} mm³ in total. No gap that thin should exist in a real part, so they were closed.{}\nReal openings are never closed automatically: define them as ports or blockers. Tick 'Show auto-sealed regions' in the Results display options to see them, or turn the sealer off with gap_seal_mm = 0 / auto_seal_leaks = false in the project's [domain] section.",
         regions.len(), cells, vol, lines
     ))
+}
+
+/// A warning when walls had to be restored because the cells are coarser than they are thick.
+pub fn thin_wall_note(domain: &Domain) -> Option<String> {
+    if domain.thin_restored < 150 { return None; }
+    Some(format!("The cells ({:.2} mm) are coarser than some walls are thick: {} cells of thin wall had to be restored so the duct stays closed. Walls and slots that thin are only roughly represented; a smaller cell size (about a third of the thinnest wall) will resolve them properly.", domain.grid.dx, domain.thin_restored))
 }
 
 /// Thin gaps that were left open because they are long or wide enough to be intentional (shown for review).

@@ -143,6 +143,8 @@ pub struct Domain {
     pub sealed_idx: Vec<u32>,
     /// Thin gaps that were NOT closed because they are long or wide enough to be an intentional opening.
     pub review_idx: Vec<u32>,
+    /// Cells of walls thinner than a cell that had to be restored (a sign the grid is too coarse).
+    pub thin_restored: usize,
 }
 
 /// A cluster of cells that were closed automatically.
@@ -252,7 +254,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             }
         }
     }
-    restore_thin_walls(&grid, &mut cells, &label, solids);
+    let thin_restored = restore_thin_walls(&grid, &mut cells, &label, solids);
     if seam_tol_mm > 0.0 && groups.iter().any(|g| g.len() >= 2) {
         let reach = ((seam_tol_mm / dx).ceil() as usize).max(1);
         let mut group_of = vec![usize::MAX; solids.len()];
@@ -269,8 +271,9 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
     let mut review_idx: Vec<u32> = vec![];
     if gap_all_mm > 0.0 {
         // aggressive: close any gap up to this size between two different parts, duct or not
-        let reach = ((gap_all_mm / dx + 1e-6).floor() as usize).max(1);
-        let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], reach, true);
+        // a gap of a millimetre or more is intentional; at a resolution too coarse to tell, do not guess
+        let reach = (gap_all_mm / dx + 1e-6).floor() as usize;
+        let (filled, review) = if reach == 0 { (vec![], vec![]) } else { seal_seams(&grid, &mut cells, &label, &[], reach, true) };
         sealed_idx = filled.into_iter().map(|i| i as u32).collect();
         review_idx = review.into_iter().map(|i| i as u32).collect();
     }
@@ -328,7 +331,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
             removed += 1;
         }
     }
-    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![], sealed_idx, review_idx }
+    Domain { grid, cells, port_cell_counts: counts, odd_columns, sealed_cells_removed: removed, repaired: vec![], sealed_idx, review_idx, thin_restored }
 }
 
 /// Mark the cells just inside a cap (planar or curved) with `code` (a port code, or SOLID to shut it);
@@ -377,9 +380,9 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool, 
 /// one cell is missed wherever no centre falls inside it, and the duct is then open there. Wherever a surface passes
 /// through a cell and that cell and both of its neighbours across the surface are fluid, the sheet was lost: that one
 /// cell is closed. Walls that were captured (a solid cell on at least one side) are left exactly as they are.
-fn restore_thin_walls(grid: &Grid, cells: &mut [u8], label: &[u16], solids: &[&TriMesh]) {
+fn restore_thin_walls(grid: &Grid, cells: &mut [u8], label: &[u16], solids: &[&TriMesh]) -> usize {
     if probing() || std::env::var_os("PG_NO_THIN_WALLS").is_some() {
-        return;
+        return 0;
     }
     let dx = grid.dx;
     let [nx, ny, nz] = grid.dims;
@@ -441,9 +444,11 @@ fn restore_thin_walls(grid: &Grid, cells: &mut [u8], label: &[u16], solids: &[&T
         ex.sort();
         eprintln!("thin-wall restore adds {} cells, e.g. {:?}", add.len(), ex);
     }
+    let mut restored = 0;
     for i in add {
-        if cells[i] == FLUID { cells[i] = SOLID; }
+        if cells[i] == FLUID { cells[i] = SOLID; restored += 1; }
     }
+    restored
 }
 
 /// Make every thin wall face-connected. A wall one cell thick at a slant becomes a staircase of cells that touch
@@ -1084,7 +1089,7 @@ mod diag_tests {
             let row = |cells: &[u8]| (0..grid.dims[0]).any(|x| cells[grid.idx(x, grid.dims[1] / 2, grid.dims[2] / 2)] == SOLID);
             if !row(&cells) { lost_without += 1; }
             let label = vec![0u16; grid.len()];
-            restore_thin_walls(&grid, &mut cells, &label, &[&sheet]);
+            let _ = restore_thin_walls(&grid, &mut cells, &label, &[&sheet]);
             assert!(row(&cells), "sheet at offset {off} vanished");
         }
         assert!(lost_without > 0, "the test must include sheets that the plain test loses");

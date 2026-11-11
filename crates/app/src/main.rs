@@ -46,6 +46,8 @@ fn classify_issue(msg: &str) -> Issue {
         (Sev::Warning, "Air leaks out of the duct".to_string())
     } else if msg.starts_with("Reference speed raised") {
         (Sev::Info, "Reference speed raised".to_string())
+    } else if msg.contains("coarser than some walls") {
+        (Sev::Warning, "Cells coarser than the thinnest walls".to_string())
     } else if msg.starts_with("Possible intentional") {
         (Sev::Warning, "Possible intentional openings left unsealed".to_string())
     } else if msg.starts_with("Auto-sealed") {
@@ -824,7 +826,19 @@ impl App {
     fn can_run(&self) -> Result<(), String> {
         if self.bodies.is_empty() { return Err("no geometry loaded".into()); }
         let problems = self.project.validate();
-        if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) }
+        if !problems.is_empty() { return Err(problems.join("; ")); }
+        // the grid must fit on the graphics card
+        if self.backend != Backend::Cpu {
+            let b = project_bounds(&self.project, &self.bodies);
+            let dx = self.project.solver.cell_size_mm;
+            let n: f64 = (0..3).map(|i| ((b.max[i] - b.min[i]) / dx).ceil().max(1.0)).product();
+            let gpu_gb = n * 77.0 / 1e9;
+            if gpu_gb > 7.0 {
+                let ok_dx = dx * (gpu_gb / 6.5).cbrt();
+                return Err(format!("a {dx:.2} mm grid is {:.0} M cells and needs about {gpu_gb:.1} GB of graphics memory (an 8 GB card has about 7 GB free). Use a cell size of {ok_dx:.2} mm or larger, or crop the model.", n / 1e6));
+            }
+        }
+        Ok(())
     }
 
     fn start_run(&mut self) {
@@ -843,6 +857,7 @@ impl App {
                 if let Some(w) = peregrine_geom::leak_warning(&project, &domain) { base_warnings.push(w); }
                 if let Some(w) = peregrine_geom::repair_note(&domain) { base_warnings.push(w); }
                 if let Some(w) = peregrine_geom::review_note(&domain) { base_warnings.push(w); }
+                if let Some(w) = peregrine_geom::thin_wall_note(&domain) { base_warnings.push(w); }
                 let sealed_regions = peregrine_geom::sealed_regions(&domain);
                 if domain.odd_columns > 0 {
                     base_warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
@@ -1770,6 +1785,7 @@ impl App {
                 self.sealed_check = peregrine_geom::sealed_regions(&d);
                 if let Some(n) = peregrine_geom::repair_note(&d) { self.leak_notes.push(n); }
                 if let Some(n) = peregrine_geom::review_note(&d) { self.leak_notes.push(n); }
+                if let Some(n) = peregrine_geom::thin_wall_note(&d) { self.leak_notes.push(n); }
                 match peregrine_geom::leak_warning(&self.project, &d) {
                     Some(m) => { self.status = "Leak found: see the marker and the Exceptions tab.".into(); self.leak_notes.push(m); }
                     None => self.status = if d.sealed_idx.is_empty() { "No leaks: the duct is sealed except at its ports.".into() } else { format!("Sealed {} small gap region(s) automatically; no leaks left.", self.sealed_check.len()) },

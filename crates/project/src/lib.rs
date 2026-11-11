@@ -131,7 +131,7 @@ pub struct Source {
 }
 
 fn default_true() -> bool { true }
-fn default_gap_seal() -> f64 { 1.5 }
+fn default_gap_seal() -> f64 { 0.9 }
 fn default_seam_tolerance() -> f64 {
     0.5
 }
@@ -189,7 +189,7 @@ pub struct DomainSettings {
     /// Real assemblies are tight where the CAD has small clearances. 0 = off.
     #[serde(default = "default_gap_seal")]
     pub gap_seal_mm: f64,
-    /// Automatically close small leaks (up to ~2.5 mm wide) found between the inlets and the edge of the domain.
+    /// Automatically close small leaks (about 1 mm wide at most; anything larger is intentional) found between the inlets and the edge of the domain.
     /// On by default; what was closed is reported in the Exceptions tab. Set false to turn off.
     #[serde(default = "default_true")]
     pub auto_seal_leaks: bool,
@@ -197,7 +197,7 @@ pub struct DomainSettings {
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, gap_seal_mm: 1.5, auto_seal_leaks: true, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, gap_seal_mm: 0.9, auto_seal_leaks: true, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
