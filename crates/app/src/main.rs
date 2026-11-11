@@ -2,6 +2,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod theme;
+mod tutorial;
 mod viewport;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
@@ -23,7 +24,7 @@ enum Tool { Orbit, Pan, PickPort, Slice, Rim, Draw, Block }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results, Exceptions }
 /// What the active tab asks the tab shell to do after the frame.
-enum ShellCmd { New, Duplicate, Close(usize), Switch(usize) }
+enum ShellCmd { New, Duplicate, Close(usize), Switch(usize), Tutorial }
 
 /// An edge loop found by the Rim tool with its quality scores.
 #[derive(Clone)]
@@ -148,6 +149,7 @@ struct App {
     screw_max_d: f64,
     detect_curved: bool,
     show_hidden: bool,
+    tut: Option<usize>,
     show_ports: bool,
     line_cutoff: f32,
     undo: Vec<Project>,
@@ -218,6 +220,14 @@ fn main() -> eframe::Result {
             if a == "--frame" { if let Some(n) = args.get(i + 1) { if let Some(b) = app.bodies.iter().find(|b| &b.name == n) { let bb = b.mesh.bounds(); app.cam.frame(bb.min, bb.max); } } }
             if a == "--show-hidden" { app.show_hidden = true; app.refresh_candidates(); }
             if a == "--tab" { match args.get(i + 1).map(|v| v.as_str()) { Some("ports") => app.tab = Tab::Ports, Some("results") => app.tab = Tab::Results, Some("exceptions") => app.tab = Tab::Exceptions, _ => {} } }
+            if a == "--tutorial" { app.start_tutorial(); }
+            if a == "--tutorial-selftest" {
+                app.start_tutorial();
+                for act in [tutorial::Act::DefineDuct, tutorial::Act::AddFan, tutorial::Act::AssignInlet, tutorial::Act::MakeOutlet, tutorial::Act::BlockHole] { app.tutorial_act(act); }
+                eprintln!("selftest: ducts={} candidates={} ports={:?} blockers={} sources={}", app.project.ducts.len(), app.candidates.len(), app.project.ports.iter().map(|p| (p.name.clone(), p.kind.is_inlet())).collect::<Vec<_>>(), app.project.blockers.len(), app.project.sources.len());
+                eprintln!("can_run: {:?}", app.can_run());
+                if std::env::args().any(|x| x == "--run") { app.backend = Backend::Cpu; app.tutorial_act(tutorial::Act::Run); app.tab = Tab::Results; } else { std::process::exit(0); }
+            }
             if a == "--tool" { match args.get(i + 1).map(|v| v.as_str()) { Some("block") => app.tool = Tool::Block, Some("draw") => app.tool = Tool::Draw, _ => {} } }
             if a == "--yaw" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.yaw = v.to_radians(); } }
             if a == "--pitch" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.pitch = v.to_radians(); } }
@@ -230,6 +240,8 @@ fn main() -> eframe::Result {
                 app.start_run();
             }
         }
+        // first launch with nothing to open: offer the tutorial
+        if std::env::args().len() == 1 && !tutorial::tutorial_done() { app.start_tutorial(); }
         Ok(Box::new(Shell { docs: vec![app], active: 0, counter: 1 }))
     }))
 }
@@ -259,6 +271,7 @@ impl App {
             screw_max_d: 6.0,
             detect_curved: true,
             show_hidden: false,
+            tut: None,
             show_ports: true,
             line_cutoff: 0.0,
             undo: vec![],
@@ -938,6 +951,9 @@ impl App {
             ui.menu_button("Help", |ui| {
                 ui.label("Peregrine CFD - duct airflow (LBM)");
                 ui.label("Left-drag orbit, right/middle-drag pan, wheel zoom.");
+                ui.separator();
+                if ui.button("Run tutorial").on_hover_text("Opens a sample duct in a new tab and walks through every major feature").clicked() { self.cmds.push(ShellCmd::Tutorial); ui.close_menu(); }
+                ui.label("Shortcuts: O orbit, H pan, R curved opening, L draw loop, B blocker, M mesh mode, Ctrl+Z undo.");
             });
         });
     }
@@ -2214,6 +2230,7 @@ impl App {
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::CANVAS)).show(ctx, |ui| self.viewport_ui(ui));
+        self.tutorial_ui(ctx);
         self.track_changes(ctx);
     }
 }
@@ -2266,6 +2283,7 @@ impl eframe::App for Shell {
                 ShellCmd::Duplicate => { let d = self.docs[self.active].duplicate(); self.docs.push(d); self.active = self.docs.len() - 1; }
                 ShellCmd::Close(i) => self.close(i),
                 ShellCmd::Switch(i) => { if i < self.docs.len() { self.active = i; } }
+                ShellCmd::Tutorial => { let mut d = self.new_doc(); d.start_tutorial(); self.docs.push(d); self.active = self.docs.len() - 1; }
             }
         }
     }

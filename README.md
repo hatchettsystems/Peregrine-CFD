@@ -38,3 +38,7 @@ WS7040, 4010 blower and axial, 2510 axial, 50x15 axial. Each curve is generated 
 pressure and maximum free-air flow (distributor/datasheet listings), not from a measured curve. Entries marked
 *estimate* have no datasheet figure behind them (Delta 4028, WS7040 flow, 4010 blower, Delta 5015 pressure):
 the app warns when you use one. Replace them with your fan's datasheet or measured values.
+
+## First run
+
+On first launch Peregrine opens a built-in tutorial with a sample duct that walks through every major feature (duct definition, sources, ports, curved openings, blockers, undo, running, streamlines, exceptions). Use **Skip tutorial** to leave it, and **Help > Run tutorial** to start it again.
