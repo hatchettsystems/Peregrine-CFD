@@ -36,13 +36,10 @@ fn config(regularized: bool) -> LbmConfig {
     }
 }
 
+/// One test (not two) on purpose: creating several GPU devices concurrently crashes some Windows drivers.
 #[test]
-fn gpu_matches_cpu_trt() {
+fn gpu_matches_cpu() {
     check(false);
-}
-
-#[test]
-fn gpu_matches_cpu_regularized() {
     check(true);
 }
 
