@@ -21,13 +21,36 @@ fn main() {
         return;
     }
     cc::Build::new().cpp(true).file("cpp/shim.cpp").include(&include).std("c++17").warnings(false).compile("peregrine_occt_shim");
-    if let Some(l) = lib {
+    if let Some(l) = &lib {
         println!("cargo:rustc-link-search=native={}", l.display());
     }
-    for name in [
-        "TKXDESTEP", "TKXCAF", "TKLCAF", "TKCAF", "TKCDF", "TKSTEP", "TKSTEPAttr", "TKSTEPBase", "TKSTEP209", "TKXSBase",
-        "TKMesh", "TKBO", "TKPrim", "TKTopAlgo", "TKGeomAlgo", "TKBRep", "TKGeomBase", "TKG3d", "TKG2d", "TKMath", "TKService", "TKernel",
-    ] {
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").map_or(false, |o| o == "windows");
+    let mut libs: Vec<String> = vec![];
+    if windows {
+        // Toolkit names changed between OCCT releases (TKXDESTEP -> TKDESTEP in 7.9), so link every
+        // toolkit import library that is installed.
+        if let Some(l) = &lib {
+            if let Ok(rd) = std::fs::read_dir(l) {
+                for e in rd.flatten() {
+                    let f = e.file_name().to_string_lossy().into_owned();
+                    if f.starts_with("TK") && f.ends_with(".lib") {
+                        libs.push(f.trim_end_matches(".lib").to_string());
+                    }
+                }
+            }
+        }
+        if libs.is_empty() {
+            panic!("no TK*.lib found; set OCCT_ROOT to the vcpkg installed/x64-windows directory");
+        }
+    } else {
+        for name in [
+            "TKXDESTEP", "TKXCAF", "TKLCAF", "TKCAF", "TKCDF", "TKSTEP", "TKSTEPAttr", "TKSTEPBase", "TKSTEP209", "TKXSBase",
+            "TKMesh", "TKBO", "TKPrim", "TKTopAlgo", "TKGeomAlgo", "TKBRep", "TKGeomBase", "TKG3d", "TKG2d", "TKMath", "TKService", "TKernel",
+        ] {
+            libs.push(name.to_string());
+        }
+    }
+    for name in libs {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
 }

@@ -2,6 +2,15 @@
 
 ## Windows (RTX 3070 target)
 
+**Easiest:** download `peregrine-windows-x64.zip` from the latest `windows` run under the repository's
+Actions tab (artifact `peregrine-windows-x64`), unzip, and run `peregrine-app.exe`.
+
+**Build it yourself in one step:** from PowerShell with Rust (MSVC toolchain) and Git installed,
+```
+.\scripts\build-windows.ps1
+```
+installs OpenCASCADE via vcpkg, builds, and writes `dist\peregrine-windows-x64.zip`. The manual steps:
+
 1. Install Rust (rustup, stable) and the "Desktop development with C++" build tools (MSVC).
 2. Install OpenCASCADE with vcpkg (needed for STEP import):
    ```
