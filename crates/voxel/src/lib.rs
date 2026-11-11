@@ -760,7 +760,7 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                     continue;
                 }
                 'axes: for (dx_, dy_, dz_) in step_dirs {
-                    let find = |sign: i32| -> Option<u16> {
+                    let find = |sign: i32| -> Option<(u16, usize)> {
                         for k in 1..=reach as i32 {
                             let (xx, yy, zz) = (x as i32 + sign * k * dx_, y as i32 + sign * k * dy_, z as i32 + sign * k * dz_);
                             if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 {
@@ -768,7 +768,7 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                             }
                             let j = grid.idx(xx as usize, yy as usize, zz as usize);
                             if cells[j] == SOLID {
-                                return Some(label[j]);
+                                return Some((label[j], k as usize));
                             }
                             if cells[j] != FLUID {
                                 return None;
@@ -776,7 +776,11 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                         }
                         None
                     };
-                    if let (Some(a), Some(b)) = (find(-1), find(1)) {
+                    if let (Some((a, da)), Some((b, db))) = (find(-1), find(1)) {
+                        // the whole gap between the two surfaces must be thin, not just this cell's distance to each side
+                        if da + db - 1 > reach {
+                            continue;
+                        }
                         if any_pair || (a != b && a != u16::MAX && b != u16::MAX && group_of[a as usize] != usize::MAX && group_of[a as usize] == group_of[b as usize]) {
                             fill.push(i);
                             break 'axes;
@@ -869,5 +873,26 @@ mod diag_tests {
         }
         // and it only added a few cells
         assert!(cells.iter().filter(|&&c| c == SOLID).count() < 8 + 8);
+    }
+
+    /// A gap is closed only when the WHOLE gap is thin: a channel a few cells wide must stay open, not get a plug
+    /// down its middle.
+    #[test]
+    fn only_thin_gaps_are_closed() {
+        for (gap, closed) in [(1usize, true), (2, true), (3, true), (4, false), (5, false)] {
+            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [gap + 2, 3, 3] };
+            let mut cells = vec![FLUID; grid.len()];
+            for y in 0..3 {
+                for z in 0..3 {
+                    cells[grid.idx(0, y, z)] = SOLID;
+                    cells[grid.idx(gap + 1, y, z)] = SOLID;
+                }
+            }
+            let label = vec![0u16; grid.len()];
+            seal_seams(&grid, &mut cells, &label, &[], 3, true);
+            let filled = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == SOLID);
+            let untouched = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == FLUID);
+            assert!(if closed { filled } else { untouched }, "gap of {gap} cells: closed = {closed}");
+        }
     }
 }

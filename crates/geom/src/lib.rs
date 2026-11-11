@@ -54,6 +54,9 @@ pub fn load_bodies(path: &Path, project: &Project) -> Result<Vec<Body>> {
             _ => bail!("unsupported geometry file: {}", f.display()),
         }
     }
+    for b in &mut bodies {
+        b.mesh.orient_outward();
+    }
     apply_roles(project, &mut bodies, true);
     Ok(bodies)
 }
@@ -122,7 +125,7 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                     && (c.area - area).abs() <= 0.06 * c.area.max(area));
                 if dup { continue; }
                 let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
-                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, cap: o.cap };
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, inline: false, cap: o.cap };
                 if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
                 planar_kept.push(cand);
             }
@@ -138,7 +141,7 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                 });
                 if dup { continue; }
                 let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
-                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, cap: o.cap };
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, inline: false, cap: o.cap };
                 if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
                 planar_kept.push(cand);
             }
@@ -184,11 +187,66 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                 c.clearance = if v.is_finite() { (v / vmax).min(1.0) } else { 1.0 };
             }
         }
+        // An opening whose outward direction runs on, through air, to another opening is only a cross-section of the
+        // tube: the opening farther down the tube is the port.
+        let n_c = duct_cands.len();
+        let mut inline = vec![false; n_c];
+        for i in 0..n_c {
+            let a_cap = &duct_cands[i].cap;
+            let dir = a_cap.normal;
+            let samples = peregrine_core::rim::cap_samples(a_cap);
+            if samples.is_empty() { continue; }
+            let step = (samples.len() / 24).max(1);
+            let (mut tried, mut reached) = (0usize, 0usize);
+            for p in samples.iter().step_by(step) {
+                tried += 1;
+                let o = [p[0] + dir[0] * 0.05, p[1] + dir[1] * 0.05, p[2] + dir[2] * 0.05];
+                let hit = (0..n_c).filter(|&j| j != i && dot(dir, duct_cands[j].cap.normal) >= 0.8).any(|j| {
+                    ray_hits_cap(o, dir, &duct_cands[j].cap).map_or(false, |t| t > 0.5 && t < 80.0 && !grid.any_hit(o, dir, t - 0.2))
+                });
+                if hit { reached += 1; }
+            }
+            // most of the air leaving this opening runs on to another one
+            if tried > 0 && reached * 2 >= tried { inline[i] = true; }
+        }
+        for (c, f) in duct_cands.iter_mut().zip(inline) { c.inline = f; }
         for c in duct_cands {
             out.push((d.name.clone(), c));
         }
     }
     out
+}
+
+/// Distance along the ray `o + t d` to where it crosses an opening (planar or curved), if it does.
+fn ray_hits_cap(o: [f64; 3], d: [f64; 3], cap: &peregrine_core::PortCap) -> Option<f64> {
+    use peregrine_core::vec3::{cross, dot, sub};
+    if cap.is_surface() {
+        let mut best: Option<f64> = None;
+        for t in &cap.triangles {
+            let (e1, e2) = (sub(t[1], t[0]), sub(t[2], t[0]));
+            let p = cross(d, e2);
+            let det = dot(e1, p);
+            if det.abs() < 1e-12 { continue; }
+            let inv = 1.0 / det;
+            let s = sub(o, t[0]);
+            let u = dot(s, p) * inv;
+            if !(0.0..=1.0).contains(&u) { continue; }
+            let q = cross(s, e1);
+            let v = dot(d, q) * inv;
+            if v < 0.0 || u + v > 1.0 { continue; }
+            let tt = dot(e2, q) * inv;
+            if tt > 1e-6 && best.map_or(true, |b| tt < b) { best = Some(tt); }
+        }
+        return best;
+    }
+    let denom = dot(d, cap.normal);
+    if denom.abs() < 1e-9 { return None; }
+    let t = dot(sub(cap.origin, o), cap.normal) / denom;
+    if t <= 0.0 { return None; }
+    let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+    let poly = cap.polygon_2d();
+    let holes = cap.holes_2d();
+    cap.contains_in_opening(&poly, &holes, hit).then_some(t)
 }
 
 pub fn domain_bounds(bodies: &[Body], padding: f64) -> Aabb {
@@ -271,6 +329,31 @@ mod tests {
         let names: Vec<String> = bodies.iter().map(|b| b.name.clone()).collect();
         let ducts = Project::new("t").effective_ducts(&names);
         assert_eq!(duct_port_candidates(&bodies, &ducts, 1.0, None, false).len(), 2);
+    }
+
+    #[test]
+    fn an_opening_with_another_down_the_same_tube_is_inline() {
+        use peregrine_core::shapes;
+        // two tubes end to end with a 3 mm gap: the gap faces are cross-sections of one longer tube
+        let a = shapes::hollow_tube(8.0, 4.0, 15.0);
+        let mut b = shapes::hollow_tube(8.0, 4.0, 15.0);
+        b.translate([18.0, 0.0, 0.0]);
+        let bodies = vec![
+            Body { name: "part A".into(), role: BodyRole::Solid, mesh: a },
+            Body { name: "part B".into(), role: BodyRole::Solid, mesh: b },
+        ];
+        let duct = vec![DuctDef { name: "duct".into(), parts: vec!["part A".into(), "part B".into()] }];
+        let c = duct_port_candidates(&bodies, &duct, 1.0, None, false);
+        assert_eq!(c.len(), 4, "{:?}", c.iter().map(|x| (x.1.cap.centroid()[0], x.1.cap.normal[0])).collect::<Vec<_>>());
+        for (_, cand) in &c {
+            let x = cand.cap.centroid()[0];
+            let facing_out = cand.cap.normal[0] > 0.0;
+            // A's far end (x=15, facing +x) leads on through part B to its far end; B's near end (x=18, facing -x)
+            // leads back through A to its start. The two true ends are not inline.
+            let expect_inline = (facing_out && (x - 15.0).abs() < 1e-3) || (!facing_out && (x - 18.0).abs() < 1e-3);
+            assert_eq!(cand.inline, expect_inline, "opening at x = {x}, normal {:?}", cand.cap.normal);
+        }
+        assert_eq!(c.iter().filter(|x| is_real_opening(&x.1)).count(), 2);
     }
 
     #[test]
@@ -376,7 +459,7 @@ pub fn sealed_regions(domain: &Domain) -> Vec<[f64; 5]> {
 
 /// True unless the opening is a pocket: hard to see from outside AND with no confirmed air behind it.
 pub fn is_real_opening(c: &PortCandidate) -> bool {
-    c.clearance >= 0.5 || c.visibility >= 0.5
+    !c.inline && (c.clearance >= 0.5 || c.visibility >= 0.5)
 }
 
 /// Make every planar opening that lies wholly inside another coplanar, same-facing opening an island of it.

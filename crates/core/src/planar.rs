@@ -29,6 +29,9 @@ pub struct PortCandidate {
     pub visibility: f64,
     /// Fraction (0..1) of the opening with open air continuing behind it (a channel, not a pocket).
     pub clearance: f64,
+    /// True when air leaving this opening runs on down the same tube to another opening (so this one is just a
+    /// cross-section of the tube, and the opening farther along is the port).
+    pub inline: bool,
 }
 
 impl PortCandidate {
@@ -168,7 +171,7 @@ pub fn find_port_candidates(mesh: &TriMesh, min_area: f64) -> Vec<PortCandidate>
                 }
                 let circularity = if perim > 0.0 { 4.0 * std::f64::consts::PI * area / (perim * perim) } else { 0.0 };
                 let equiv_diameter = 2.0 * (area / std::f64::consts::PI).sqrt();
-                out.push(PortCandidate { cap, area, parent_area: r.area, circularity, equiv_diameter, visibility: 1.0, clearance: 1.0 });
+                out.push(PortCandidate { cap, area, parent_area: r.area, circularity, equiv_diameter, visibility: 1.0, clearance: 1.0, inline: false });
             }
         }
     }

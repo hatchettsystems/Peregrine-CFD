@@ -127,3 +127,21 @@ fn manual_loop_follows_the_rim_between_clicked_points() {
     let cap = cap_from_loop(&loop_pts, &m).expect("cap from a hand-drawn loop");
     assert!(cap.normal[0] > 0.9);
 }
+
+
+#[test]
+fn flipped_faces_are_turned_outward() {
+    use peregrine_core::shapes;
+    let mut m = shapes::solid_box([0.0; 3], [4.0, 3.0, 2.0]);
+    let good_volume = m.signed_volume();
+    assert!(good_volume > 0.0);
+    // flip a few triangles and the whole piece for a second mesh
+    for t in [0usize, 5, 7] { m.triangles[t].swap(1, 2); }
+    let flipped = m.orient_outward();
+    assert!(flipped >= 3, "flipped {flipped}");
+    assert!((m.signed_volume() - good_volume).abs() < 1e-9);
+    let mut inside_out = shapes::solid_box([0.0; 3], [4.0, 3.0, 2.0]);
+    for t in inside_out.triangles.iter_mut() { t.swap(1, 2); }
+    inside_out.orient_outward();
+    assert!(inside_out.signed_volume() > 0.0);
+}

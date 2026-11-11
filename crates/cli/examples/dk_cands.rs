@@ -10,6 +10,6 @@ fn main() {
     println!("{} candidates in {:.1}s", c.len(), t.elapsed().as_secs_f64());
     for (i, (_, c)) in c.iter().enumerate() {
         let o = c.cap.centroid();
-        println!("#{i:<3} area {:>7.1} surf {} vis {:.2} clr {:.2} ctr ({:>6.1},{:>6.1},{:>6.1}) n ({:>5.2},{:>5.2},{:>5.2})", c.area, c.cap.is_surface() as u8, c.visibility, c.clearance, o[0], o[1], o[2], c.cap.normal[0], c.cap.normal[1], c.cap.normal[2]);
+        println!("#{i:<3} inline {} area {:>7.1} surf {} vis {:.2} clr {:.2} ctr ({:>6.1},{:>6.1},{:>6.1}) n ({:>5.2},{:>5.2},{:>5.2})", c.inline as u8, c.area, c.cap.is_surface() as u8, c.visibility, c.clearance, o[0], o[1], o[2], c.cap.normal[0], c.cap.normal[1], c.cap.normal[2]);
     }
 }

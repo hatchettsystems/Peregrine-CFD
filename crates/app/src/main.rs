@@ -210,6 +210,7 @@ struct App {
     detect_curved: bool,
     show_hidden: bool,
     tut: Option<usize>,
+    hidden_caps: std::collections::HashSet<[i64; 3]>,
     leak_notes: Vec<String>,
     sealed_check: Vec<[f64; 5]>,
     show_sealed: bool,
@@ -345,6 +346,7 @@ impl App {
             detect_curved: true,
             show_hidden: false,
             tut: None,
+            hidden_caps: Default::default(),
             leak_notes: vec![],
             sealed_check: vec![],
             show_sealed: false,
@@ -414,7 +416,7 @@ impl App {
         // an opening that admits air is visible from outside and leads into a channel, not a pocket
         // only openings that fail BOTH tests (hard to see from outside and no air behind) are hidden as pockets; the
         // air-behind test depends on thin necks that a grid can close, so it must not hide an opening on its own
-        if !self.show_hidden { self.candidates.retain(|c| c.1.clearance >= 0.5 || c.1.visibility >= 0.5); }
+        if !self.show_hidden { self.candidates.retain(|c| !c.1.inline && (c.1.clearance >= 0.5 || c.1.visibility >= 0.5)); }
         self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
         self.block_stale = true;
@@ -479,7 +481,7 @@ impl App {
             Some(cap) => {
                 let area = cap.area();
                 let perim = l.perimeter;
-                let cand = PortCandidate { area, parent_area: 0.0, circularity: (4.0 * std::f64::consts::PI * area / (perim * perim)).min(1.0), equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: info.vis, clearance: info.clear, cap };
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: (4.0 * std::f64::consts::PI * area / (perim * perim)).min(1.0), equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: info.vis, clearance: info.clear, inline: false, cap };
                 self.manual_openings.push((duct, cand));
                 self.refresh_candidates();
                 self.sel_cand = Some(self.candidates.len() - 1);
@@ -1361,24 +1363,67 @@ impl App {
         if ui.button("Show in Bodies list").clicked() { self.select_body(bi, false); ui.close_menu(); }
     }
 
+    /// Identity of an opening for view state (hidden or not): its centre to 0.05 mm.
+    fn cap_key(cap: &PortCap) -> [i64; 3] {
+        let c = cap.centroid();
+        [(c[0] * 20.0).round() as i64, (c[1] * 20.0).round() as i64, (c[2] * 20.0).round() as i64]
+    }
+
+    /// In the opaque (Shaded) view an opening on the far side of the part is behind the surface: do not draw or pick it.
+    fn cap_visible_from_eye(&self, cap: &PortCap) -> bool {
+        if self.mesh_mode != MeshMode::Shaded { return true; }
+        let e = self.cam.eye();
+        dot(cap.normal, sub(e, cap.centroid())) > 0.0
+    }
+
+    fn cap_hidden(&self, cap: &PortCap) -> bool {
+        self.hidden_caps.contains(&Self::cap_key(cap))
+    }
+
+    fn toggle_cap_hidden(&mut self, cap: &PortCap) {
+        let k = Self::cap_key(cap);
+        if !self.hidden_caps.remove(&k) { self.hidden_caps.insert(k); }
+    }
+
+    /// The opening whose BOUNDARY is nearest the cursor (within a few pixels). Selecting by outline, not by area,
+    /// keeps a small opening inside a big one selectable. Hidden openings are skipped.
     fn hit_test(&self, rect: Rect, pos: Pos2) -> Option<Target> {
         let mut items: Vec<(Target, &PortCap)> = vec![];
         for (i, (_, c)) in self.candidates.iter().enumerate() { items.push((Target::Cand(i), &c.cap)); }
         for (i, p) in self.project.ports.iter().enumerate() { items.push((Target::Port(i), &p.cap)); }
-        let mut inside: Option<(f64, Target)> = None;
-        let mut near: Option<(f32, Target)> = None;
+        let seg_dist = |a: Pos2, b: Pos2| -> f32 {
+            let ab = b - a;
+            let l2 = ab.length_sq();
+            let t = if l2 > 0.0 { (((pos - a).x * ab.x + (pos - a).y * ab.y) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            (a + ab * t).distance(pos)
+        };
+        let mut best: Option<(f32, f32, Target)> = None; // distance to outline, screen area, target
         for (t, cap) in items {
-            let pts: Vec<Option<(Pos2, f64)>> = cap.polygon.iter().map(|p| self.cam.project(rect, *p)).collect();
-            if pts.iter().any(|p| p.is_none()) || pts.len() < 3 { continue; }
-            let poly: Vec<[f64; 2]> = pts.iter().map(|p| { let q = p.unwrap().0; [q.x as f64, q.y as f64] }).collect();
-            let depth = self.cam.project(rect, cap.centroid()).map_or(f64::MAX, |p| p.1);
-            if point_in_polygon(&poly, [pos.x as f64, pos.y as f64]) && inside.map_or(true, |b| depth < b.0) { inside = Some((depth, t)); }
-            if let Some((c, _)) = self.cam.project(rect, cap.centroid()) {
-                let d = c.distance(pos);
-                if d < 18.0 && near.map_or(true, |b| d < b.0) { near = Some((d, t)); }
+            if self.cap_hidden(cap) || !self.cap_visible_from_eye(cap) { continue; }
+            let mut loops: Vec<&[[f64; 3]]> = vec![&cap.polygon];
+            for h in &cap.holes { loops.push(h); }
+            let mut dmin = f32::MAX;
+            let mut screen_area = 0.0f32;
+            for (li, lp) in loops.iter().enumerate() {
+                let pts: Vec<Option<Pos2>> = lp.iter().map(|p| self.cam.project(rect, *p).map(|x| x.0)).collect();
+                if pts.len() < 3 || pts.iter().any(|p| p.is_none()) { continue; }
+                let pts: Vec<Pos2> = pts.into_iter().flatten().collect();
+                for k in 0..pts.len() { dmin = dmin.min(seg_dist(pts[k], pts[(k + 1) % pts.len()])); }
+                if li == 0 {
+                    let mut a = 0.0f32;
+                    for k in 0..pts.len() { let (p, q) = (pts[k], pts[(k + 1) % pts.len()]); a += p.x * q.y - q.x * p.y; }
+                    screen_area = a.abs() * 0.5;
+                }
+            }
+            if dmin <= 8.0 {
+                let better = match best {
+                    None => true,
+                    Some((bd, ba, _)) => dmin < bd - 1.5 || (dmin <= bd + 1.5 && screen_area < ba),
+                };
+                if better { best = Some((dmin, screen_area, t)); }
             }
         }
-        inside.map(|b| b.1).or(near.map(|b| b.1)).map(|t| self.resolve(t))
+        best.map(|b| self.resolve(b.2))
     }
 
     fn context_menu_ui(&mut self, ui: &mut egui::Ui) {
@@ -1638,6 +1683,7 @@ impl App {
             if changed { self.refresh_candidates(); }
         });
         let mut act: Option<(usize, u8, String)> = None;
+        let mut eye_toggle: Option<PortCap> = None;
         for i in 0..self.candidates.len() {
             let status = match self.port_for_cand(i).map(|k| &self.project.ports[k].kind) {
                 Some(PortKind::PressureOutlet { .. }) => "outlet".to_string(),
@@ -1645,10 +1691,17 @@ impl App {
                 None => "unassigned".to_string(),
             };
             let (body, c) = &self.candidates[i];
-            let hidden = if c.clearance < 0.5 && c.visibility < 0.5 { "  pocket" } else if c.visibility < 0.5 { "  not visible from outside" } else if c.clearance < 0.5 { "  air behind not confirmed" } else { "" };
+            let hidden = if c.inline { "  inline: another opening lies down this tube" } else if c.clearance < 0.5 && c.visibility < 0.5 { "  pocket" } else if c.visibility < 0.5 { "  not visible from outside" } else if c.clearance < 0.5 { "  air behind not confirmed" } else { "" };
             let text = format!("#{i}  {body}  {:.1} mm²{}{}  [{status}]", c.area, if c.cap.is_surface() { "  curved" } else { "" }, hidden);
-            if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
+            let vis = !self.cap_hidden(&self.candidates[i].1.cap);
+            let cap = self.candidates[i].1.cap.clone();
+            ui.horizontal(|ui| {
+                if eye_button(ui, vis) { eye_toggle = Some(cap.clone()); }
+                if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
+            });
         }
+        if let Some(cap) = eye_toggle { self.toggle_cap_hidden(&cap); }
+        if !self.hidden_caps.is_empty() && ui.small_button("Show all hidden openings").clicked() { self.hidden_caps.clear(); }
         if let Some(i) = self.sel_cand {
             ui.horizontal_wrapped(|ui| {
                 ui.menu_button("Assign to source", |ui| {
@@ -1671,12 +1724,16 @@ impl App {
     fn outlets_ui(&mut self, ui: &mut egui::Ui) {
         let mut remove = None;
         let mut any = false;
+        let mut eye_key: Option<[i64; 3]> = None;
         for i in 0..self.project.ports.len() {
             let sel = self.sel_port == Some(i);
             let p = &mut self.project.ports[i];
             if let PortKind::PressureOutlet { pressure } = &mut p.kind {
                 any = true;
+                let vis = !self.hidden_caps.contains(&Self::cap_key(&p.cap));
+                let key = Self::cap_key(&p.cap);
                 ui.horizontal(|ui| {
+                    if eye_button(ui, vis) { eye_key = Some(key); }
                     ui.label(egui::RichText::new("■").color(theme::OUTLET));
                     if ui.selectable_label(sel, &p.name).clicked() { self.sel_port = Some(i); }
                     ui.add(egui::DragValue::new(pressure).speed(1.0).suffix(" Pa"));
@@ -1685,6 +1742,7 @@ impl App {
             }
         }
         if !any { ui.label(egui::RichText::new("No outlets yet. Right-click an opening > Pressure outlet.").color(theme::TEXT_DIM)); }
+        if let Some(k) = eye_key { if !self.hidden_caps.remove(&k) { self.hidden_caps.insert(k); } }
         if let Some(i) = remove { self.project.ports.remove(i); self.sel_port = None; }
     }
 
@@ -1909,7 +1967,7 @@ impl App {
                 match (b.role, ghost) {
                     (BodyRole::Duct, true) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
                     (_, true) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
-                    (BodyRole::Duct, false) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 150),
+                    (BodyRole::Duct, false) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 255),
                     _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
                 }
             };
@@ -1927,12 +1985,14 @@ impl App {
         let show_ports = self.show_ports;
         for (i, (_, c)) in self.candidates.iter().enumerate() {
             if !show_ports { break; }
+            if self.cap_hidden(&c.cap) || !self.cap_visible_from_eye(&c.cap) { continue; }
             if self.port_for_cand(i).is_some() { continue; }
             let sel = self.sel_cand == Some(i);
             viewport::draw_polygon(&painter, rect, &self.cam, &c.cap.polygon, Stroke::new(if sel { 2.5 } else { 1.0 }, if sel { theme::ACCENT } else { Color32::from_gray(200) }));
         }
         for (i, p) in self.project.ports.iter().enumerate() {
             if !show_ports { break; }
+            if self.cap_hidden(&p.cap) || !self.cap_visible_from_eye(&p.cap) { continue; }
             let col = if p.kind.is_inlet() { theme::INLET } else { theme::OUTLET };
             viewport::draw_polygon(&painter, rect, &self.cam, &p.cap.polygon, Stroke::new(if self.sel_port == Some(i) { 3.5 } else { 2.5 }, col));
             if let Some((pos, _)) = self.cam.project(rect, p.cap.centroid()) {
@@ -2022,6 +2082,12 @@ impl App {
         }
         // hover highlight, left-click select, right-click menu
         let hover = if resp.hovered() && self.show_ports && self.tool != Tool::Block { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
+        if hover.is_some() && ui.input(|i| i.key_pressed(egui::Key::V) && !i.modifiers.command) {
+            if let Some(cap) = hover.and_then(|t| self.target_cap(t).cloned()) {
+                self.toggle_cap_hidden(&cap);
+                self.status = "Opening hidden. Use the eye in the Ports tab (or 'Show all hidden openings') to bring it back.".into();
+            }
+        }
         if let (Some(t), Some(pos)) = (hover, resp.hover_pos()) {
             if let Some(cap) = self.target_cap(t) {
                 viewport::draw_polygon(&painter, rect, &self.cam, &cap.polygon, Stroke::new(3.0, theme::ACCENT));
@@ -2146,6 +2212,22 @@ impl App {
             });
         });
     }
+}
+
+/// An eye icon button: open eye = shown, struck-through = hidden. Returns true when clicked.
+fn eye_button(ui: &mut egui::Ui, visible: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(20.0, 16.0), Sense::click());
+    let col = if visible { Color32::from_rgb(0xD8, 0xD8, 0xD8) } else { Color32::from_rgb(0x70, 0x70, 0x70) };
+    let c = rect.center();
+    let p = ui.painter();
+    if resp.hovered() { p.rect_filled(rect, 2.0, theme::WIDGET_HOVER); }
+    let pts: Vec<Pos2> = (0..=16).map(|k| { let t = k as f32 / 16.0; let x = -7.5 + 15.0 * t; let y = -4.5 * (1.0 - (2.0 * t - 1.0).powi(2)); c + Vec2::new(x, y) }).collect();
+    let low: Vec<Pos2> = pts.iter().map(|q| Pos2::new(q.x, c.y + (c.y - q.y))).collect();
+    p.add(Shape::line(pts, Stroke::new(1.4, col)));
+    p.add(Shape::line(low, Stroke::new(1.4, col)));
+    p.circle_filled(c, 2.4, col);
+    if !visible { p.line_segment([c + Vec2::new(-8.0, 6.0), c + Vec2::new(8.0, -6.0)], Stroke::new(1.8, Color32::from_rgb(0xE0, 0x5A, 0x4F))); }
+    resp.on_hover_text(if visible { "Hide this opening (or hover it and press V)" } else { "Show this opening" }).clicked()
 }
 
 fn source_color(i: usize) -> Color32 {
