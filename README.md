@@ -4,9 +4,13 @@
 
 Airflow simulation for 3D-printer part-cooling ducts, written in Rust.
 
-- Import a STEP assembly (a duct or a whole toolhead) or STL files. Bodies are found by name
-  (`duct`, `duct_1`, `duct_L`, `duct_R`, ...; editable regex rules).
-- Ducts are hollow solids. Their openings are detected automatically. Define one or more **sources** (a fan from
+- Import a STEP assembly (a duct or a whole toolhead) or STL files. A STEP product holding several solids
+  is split into one part per solid. **You** define the duct(s): select one or more parts (click them in the 3D
+  view or in the Bodies list; Ctrl-click for several) and press *Define as duct*, so a duct made of several
+  pieces is one duct. Part names only *highlight* likely ducts ("duct", "shroud", "scoop"...), they decide nothing.
+- Ducts are hollow solids. Their openings are detected automatically, flat ones exactly and curved
+  (non-planar) ones heuristically; for any it misses, use the **Curved Opening** tool (`R`) and click the rim
+  or wall at the opening to pick its edge loop. Define one or more **sources** (a fan from
   the built-in library or your own curve, a total flow, or a mean speed), then **right-click an opening** in the
   3D view to assign it to a source (as an inlet) or make it a pressure outlet.
 - A source can feed several openings (one fan over a hole that splits four ways). Choose how it is shared:

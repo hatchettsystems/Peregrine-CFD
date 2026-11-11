@@ -85,6 +85,7 @@ struct App {
     ctx_target: Option<Target>,
     hide_screws: bool,
     screw_max_d: f64,
+    detect_curved: bool,
     rim_loops: Vec<peregrine_core::RimLoop>,
     rim_sel: Option<usize>,
     rim_body: Option<usize>,
@@ -131,6 +132,13 @@ fn main() -> eframe::Result {
                 }
             }
         }
+        // debugging aids: --hide <body>, --frame <body>, --yaw <deg>, --pitch <deg>
+        for (i, a) in args.iter().enumerate() {
+            if a == "--hide" { if let Some(n) = args.get(i + 1) { if let Some(k) = app.bodies.iter().position(|b| &b.name == n) { app.visible[k] = false; } } }
+            if a == "--frame" { if let Some(n) = args.get(i + 1) { if let Some(b) = app.bodies.iter().find(|b| &b.name == n) { let bb = b.mesh.bounds(); app.cam.frame(bb.min, bb.max); } } }
+            if a == "--yaw" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.yaw = v.to_radians(); } }
+            if a == "--pitch" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.pitch = v.to_radians(); } }
+        }
         if std::env::args().any(|a| a == "--demo") {
             app.load_demo();
             if std::env::args().any(|a| a == "--run") {
@@ -166,6 +174,7 @@ impl App {
             ctx_target: None,
             hide_screws: true,
             screw_max_d: 6.0,
+            detect_curved: true,
             rim_loops: vec![],
             rim_sel: None,
             rim_body: None,
@@ -208,7 +217,7 @@ impl App {
     }
 
     fn refresh_candidates(&mut self) {
-        self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None });
+        self.candidates = duct_port_candidates(&self.bodies, &self.project.ducts, 0.5, if self.hide_screws { Some(self.screw_max_d) } else { None }, self.detect_curved);
         self.candidates.extend(self.manual_openings.iter().cloned());
         self.sel_cand = None;
     }
@@ -1139,6 +1148,7 @@ impl App {
             if self.hide_screws {
                 changed |= ui.add(egui::DragValue::new(&mut self.screw_max_d).speed(0.1).range(0.5..=30.0).prefix("up to ").suffix(" mm")).changed();
             }
+            changed |= ui.checkbox(&mut self.detect_curved, "Detect curved openings").on_hover_text("Also look for openings that are not flat (scoops, curved lips). Use the Curved Opening tool for any it misses.").changed();
             if changed { self.refresh_candidates(); }
         });
         let mut act: Option<(usize, u8, String)> = None;
@@ -1234,6 +1244,13 @@ impl App {
                 }
             });
         });
+        {
+            let q_in: f64 = s.report.iter().filter(|r| r.inlet).map(|r| r.flow_l_min).sum();
+            let net: f64 = s.report.iter().map(|r| r.flow_l_min).sum();
+            if q_in > 1e-6 && net.abs() > 0.08 * q_in && s.step > 2000 {
+                ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), format!("{:.1} L/min of the {:.1} L/min going in is not accounted for by your outlets. Air is probably leaving through duct openings you did not define as ports (or the run has not settled yet).", net.abs(), q_in));
+            }
+        }
         theme::section(ui, "Display", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Mesh");

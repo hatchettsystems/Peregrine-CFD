@@ -79,7 +79,7 @@ pub fn apply_roles(project: &Project, bodies: &mut [Body], legacy_hints: bool) {
 /// parts: openings are found on all parts together, and the openings where two parts join (equal and
 /// opposite, coincident) are removed because they are internal.
 /// `hide_round_below`: skip small round holes (screw holes) with an equivalent diameter up to this (mm).
-pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, hide_round_below: Option<f64>) -> Vec<(String, PortCandidate)> {
+pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, hide_round_below: Option<f64>, curved: bool) -> Vec<(String, PortCandidate)> {
     use peregrine_core::vec3::{dot, len, sub};
     let mut out = vec![];
     for d in ducts {
@@ -104,10 +104,24 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                 }
             }
         }
+        let mut planar_kept: Vec<PortCandidate> = vec![];
         for (c, k) in cands.into_iter().zip(keep) {
             if k && !hide_round_below.map_or(false, |dm| c.is_screw_hole(dm)) {
-                out.push((d.name.clone(), c));
+                planar_kept.push(c);
             }
+        }
+        if curved {
+            for o in peregrine_core::find_curved_openings(&mesh, 12.0, 300.0, 25.0) {
+                let area = o.cap.area();
+                if area < min_area.max(8.0) { continue; }
+                let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), cap: o.cap };
+                if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
+                planar_kept.push(cand);
+            }
+        }
+        for c in planar_kept {
+            out.push((d.name.clone(), c));
         }
     }
     out
@@ -177,7 +191,7 @@ mod tests {
         assert_eq!(duct.role, BodyRole::Duct);
         let names: Vec<String> = bodies.iter().map(|b| b.name.clone()).collect();
         let ducts = Project::new("t").effective_ducts(&names);
-        assert_eq!(duct_port_candidates(&bodies, &ducts, 1.0, None).len(), 2);
+        assert_eq!(duct_port_candidates(&bodies, &ducts, 1.0, None, false).len(), 2);
     }
 
     #[test]
@@ -196,10 +210,10 @@ mod tests {
             DuctDef { name: "A".into(), parts: vec!["part A".into()] },
             DuctDef { name: "B".into(), parts: vec!["part B".into()] },
         ];
-        assert_eq!(duct_port_candidates(&bodies, &separate, 1.0, None).len(), 4);
+        assert_eq!(duct_port_candidates(&bodies, &separate, 1.0, None, false).len(), 4);
         // as one two-part duct the joint disappears and only the two real ends remain
         let joined = vec![DuctDef { name: "duct".into(), parts: vec!["part A".into(), "part B".into()] }];
-        let c = duct_port_candidates(&bodies, &joined, 1.0, None);
+        let c = duct_port_candidates(&bodies, &joined, 1.0, None, false);
         assert_eq!(c.len(), 2, "{:?}", c.iter().map(|x| x.1.cap.centroid()).collect::<Vec<_>>());
         let xs: Vec<f64> = c.iter().map(|x| x.1.cap.centroid()[0]).collect();
         assert!(xs.iter().any(|x| x.abs() < 1e-3) && xs.iter().any(|x| (x - 30.0).abs() < 1e-3), "{xs:?}");

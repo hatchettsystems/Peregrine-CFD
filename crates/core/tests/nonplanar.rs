@@ -48,3 +48,15 @@ fn rim_click_finds_the_curved_loop_and_a_cap() {
     assert!(cap.triangles.iter().all(|t| dot(cross(sub(t[1], t[0]), sub(t[2], t[0])), cap.normal) > 0.0), "all cap triangles face outward");
     assert!(cap.is_surface());
 }
+
+#[test]
+fn automatic_detection_finds_only_the_curved_inner_opening() {
+    let m = tube();
+    let found = peregrine_core::find_curved_openings(&m, 10.0, 300.0, 25.0);
+    assert_eq!(found.len(), 1, "{:?}", found.iter().map(|o| (o.cap.area(), o.perimeter)).collect::<Vec<_>>());
+    let o = &found[0];
+    let disc = std::f64::consts::PI * 16.0;
+    assert!(o.cap.area() >= 0.98 * disc && o.cap.area() <= 1.3 * disc, "area {}", o.cap.area());
+    assert!(o.cap.normal[0] > 0.95, "outward normal {:?}", o.cap.normal);
+    assert!(o.planarity_dev > 0.8);
+}

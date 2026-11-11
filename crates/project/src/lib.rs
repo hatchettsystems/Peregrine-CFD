@@ -151,6 +151,7 @@ pub struct Port {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Fluid {
     pub density: f64,
     pub kinematic_viscosity: f64,
@@ -163,6 +164,7 @@ impl Default for Fluid {
 pub enum FaceBc { Open, Wall }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DomainSettings {
     /// Padding (mm) around the bounding box of all active bodies.
     pub padding_mm: f64,
@@ -178,6 +180,7 @@ impl Default for DomainSettings {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SolverSettings {
     /// Cell size in mm.
     pub cell_size_mm: f64,

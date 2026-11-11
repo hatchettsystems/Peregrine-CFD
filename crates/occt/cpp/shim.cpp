@@ -24,6 +24,12 @@
 #include <TopLoc_Location.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Compound.hxx>
+#include <BRep_Builder.hxx>
+#include <StepRepr_RepresentationItem.hxx>
+#include <TCollection_HAsciiString.hxx>
+#include <XSControl_TransferReader.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
@@ -84,7 +90,19 @@ static void mesh_into(const TopoDS_Shape& s, double deflection, Body& b) {
     }
 }
 
-static void walk(const Handle(XCAFDoc_ShapeTool)& st, const TDF_Label& label, const TopLoc_Location& parent, double defl, PgStep* out, int depth) {
+// Name stored on the STEP entity (e.g. MANIFOLD_SOLID_BREP('Body3', ...)) that produced `s`.
+static std::string step_item_name(const Handle(XSControl_TransferReader)& tr, const TopoDS_Shape& s) {
+    if (tr.IsNull() || s.IsNull()) return std::string();
+    try {
+        Handle(Standard_Transient) ent = tr->EntityFromShapeResult(s, 1);
+        Handle(StepRepr_RepresentationItem) item = Handle(StepRepr_RepresentationItem)::DownCast(ent);
+        if (!item.IsNull() && !item->Name().IsNull()) return std::string(item->Name()->ToCString());
+    } catch (...) {
+    }
+    return std::string();
+}
+
+static void walk(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XSControl_TransferReader)& tr, const TDF_Label& label, const TopLoc_Location& parent, double defl, PgStep* out, int depth) {
     if (depth > 64) return;
     TDF_Label ref = label;
     if (st->IsReference(label)) st->GetReferredShape(label, ref);
@@ -92,17 +110,53 @@ static void walk(const Handle(XCAFDoc_ShapeTool)& st, const TDF_Label& label, co
     if (st->IsAssembly(ref)) {
         TDF_LabelSequence comps;
         st->GetComponents(ref, comps);
-        for (int i = 1; i <= comps.Length(); ++i) walk(st, comps.Value(i), loc, defl, out, depth + 1);
+        for (int i = 1; i <= comps.Length(); ++i) walk(st, tr, comps.Value(i), loc, defl, out, depth + 1);
         return;
     }
     TopoDS_Shape shape = st->GetShape(ref);
     if (shape.IsNull()) return;
-    Body b;
-    b.name = label_name(ref);
-    if (b.name.empty()) b.name = label_name(label);
-    if (b.name.empty()) b.name = "body";
-    mesh_into(shape.Moved(loc), defl, b);
-    if (!b.tris.empty()) out->bodies.push_back(std::move(b));
+    const std::string product = [&] {
+        std::string n = label_name(ref);
+        if (n.empty()) n = label_name(label);
+        return n.empty() ? std::string("body") : n;
+    }();
+    // A product may hold several solids (e.g. a toolhead exported as one part with Body1, Body2, ...).
+    // Return each solid as its own body so the user can decide which ones form the duct.
+    std::vector<std::pair<std::string, TopoDS_Shape>> parts;
+    TDF_LabelSequence subs;
+    st->GetSubShapes(ref, subs);
+    for (int i = 1; i <= subs.Length(); ++i) {
+        TopoDS_Shape sub = st->GetShape(subs.Value(i));
+        if (sub.IsNull() || sub.ShapeType() != TopAbs_SOLID) continue;
+        std::string n = label_name(subs.Value(i));
+        parts.emplace_back(n, sub);
+    }
+    if (parts.size() < 2) {
+        parts.clear();
+        int k = 0;
+        for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+            parts.emplace_back(std::string(), ex.Current());
+            ++k;
+        }
+        if (k < 2) parts.clear();
+    }
+    if (parts.size() < 2) {
+        Body b;
+        b.name = product;
+        mesh_into(shape.Moved(loc), defl, b);
+        if (!b.tris.empty()) out->bodies.push_back(std::move(b));
+        return;
+    }
+    int idx = 0;
+    for (auto& pr : parts) {
+        ++idx;
+        Body b;
+        std::string nm = pr.first;
+        if (nm.empty()) nm = step_item_name(tr, pr.second);
+        b.name = nm.empty() ? product + " " + std::to_string(idx) : nm;
+        mesh_into(pr.second.Moved(loc), defl, b);
+        if (!b.tris.empty()) out->bodies.push_back(std::move(b));
+    }
 }
 
 extern "C" {
@@ -127,10 +181,11 @@ PgStep* pg_step_read(const char* path, double deflection, char* err, int err_len
             return nullptr;
         }
         Handle(XCAFDoc_ShapeTool) st = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+        Handle(XSControl_TransferReader) tr = reader.ChangeReader().WS()->TransferReader();
         TDF_LabelSequence free;
         st->GetFreeShapes(free);
         auto* out = new PgStep();
-        for (int i = 1; i <= free.Length(); ++i) walk(st, free.Value(i), TopLoc_Location(), deflection, out, 0);
+        for (int i = 1; i <= free.Length(); ++i) walk(st, tr, free.Value(i), TopLoc_Location(), deflection, out, 0);
         // make names unique
         std::map<std::string, int> seen;
         for (auto& b : out->bodies) {
@@ -172,6 +227,22 @@ int pg_step_write_demo(const char* path, char* err, int err_len) {
         TDF_Label ln = st->AddShape(nozzle, Standard_False);
         TDataStd_Name::Set(ld, "duct");
         TDataStd_Name::Set(ln, "nozzle");
+        {
+            TopoDS_Shape left = BRepPrimAPI_MakeBox(gp_Pnt(100, 0, 0), gp_Pnt(105, 5, 5)).Shape();
+            TopoDS_Shape right = BRepPrimAPI_MakeBox(gp_Pnt(110, 0, 0), gp_Pnt(115, 5, 5)).Shape();
+            BRep_Builder bb;
+            TopoDS_Compound comp;
+            bb.MakeCompound(comp);
+            bb.Add(comp, left);
+            bb.Add(comp, right);
+            TDF_Label lt = st->AddShape(comp, Standard_False);
+            TDataStd_Name::Set(lt, "twin");
+            TDF_Label sl, sr;
+            st->AddSubShape(lt, left, sl);
+            st->AddSubShape(lt, right, sr);
+            if (!sl.IsNull()) TDataStd_Name::Set(sl, "Body_left");
+            if (!sr.IsNull()) TDataStd_Name::Set(sr, "Body_right");
+        }
         TDF_Label as = st->NewShape();
         TDataStd_Name::Set(as, "toolhead");
         gp_Trsf t;

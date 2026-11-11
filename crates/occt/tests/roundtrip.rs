@@ -18,4 +18,10 @@ fn assembly_names_transforms_and_ports() {
     let caps = find_port_candidates(&duct.mesh, 1.0);
     assert_eq!(caps.len(), 2, "{caps:?}");
     assert!(caps.iter().all(|c| (c.area - 36.0).abs() < 1e-3));
+
+    // a single product holding two solids comes back as two bodies, named after the solids
+    // (named after the solids when the file stores their names, otherwise "twin 1", "twin 2")
+    let twins = names.iter().filter(|n| n.starts_with("twin ") || n.starts_with("Body_")).count();
+    assert_eq!(twins, 2, "{names:?}");
+    assert!(!names.contains(&"twin"), "{names:?}");
 }
