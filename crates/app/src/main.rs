@@ -118,6 +118,32 @@ fn sev_color(s: Sev) -> Color32 {
     match s { Sev::Error => Color32::from_rgb(0xE0, 0x5A, 0x4F), Sev::Warning => Color32::from_rgb(0xF2, 0xD0, 0x3A), Sev::Info => Color32::from_rgb(0x6C, 0xB4, 0xF0) }
 }
 
+/// First "(x, y, z)" triple of numbers in a message, as a point in mm.
+fn parse_coords(msg: &str) -> Option<[f64; 3]> {
+    let mut rest = msg;
+    while let Some(i) = rest.find('(') {
+        let after = &rest[i + 1..];
+        let end = after.find(')')?;
+        let parts: Vec<&str> = after[..end].split(',').collect();
+        if parts.len() == 3 {
+            let v: Vec<f64> = parts.iter().filter_map(|p| p.trim().parse().ok()).collect();
+            if v.len() == 3 { return Some([v[0], v[1], v[2]]); }
+        }
+        rest = &after[end..];
+    }
+    None
+}
+
+/// Where in the model an issue is about, when it says so (shown as a clickable marker in the viewport).
+fn issue_point(i: &Issue, all: &[Issue], project: &Project) -> Option<[f64; 3]> {
+    if let Some(p) = parse_coords(&i.detail) { return Some(p); }
+    if let Some(name) = i.title.strip_prefix("Outlet '").and_then(|t| t.split('\'').next()) {
+        return project.ports.iter().find(|p| p.name == name).map(|p| p.cap.centroid());
+    }
+    if i.title.starts_with("Major leak") { return all.iter().find_map(|o| parse_coords(&o.detail)); }
+    None
+}
+
 #[derive(Clone)]
 struct TabInfo { title: String, running: bool }
 
@@ -181,6 +207,8 @@ struct App {
     detect_curved: bool,
     show_hidden: bool,
     tut: Option<usize>,
+    show_markers: bool,
+    focus_issue: Option<String>,
     show_ports: bool,
     line_cutoff: f32,
     undo: Vec<Project>,
@@ -303,6 +331,8 @@ impl App {
             detect_curved: true,
             show_hidden: false,
             tut: None,
+            show_markers: true,
+            focus_issue: None,
             show_ports: true,
             line_cutoff: 0.0,
             undo: vec![],
@@ -1641,15 +1671,27 @@ impl App {
         }
         ui.label(egui::RichText::new("Click an item to read the details.").color(theme::TEXT_DIM));
         ui.add_space(2.0);
+        let mut locate: Option<[f64; 3]> = None;
+        let focus = self.focus_issue.take();
         for (k, it) in issues.iter().enumerate() {
             let id = ui.make_persistent_id(("issue", &it.title, k));
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+            if focus.as_deref() == Some(it.title.as_str()) { state.set_open(true); }
+            let at = issue_point(it, &issues, &self.project);
+            state
                 .show_header(ui, |ui| {
                     chip(ui, match it.sev { Sev::Error => "ERROR", Sev::Warning => "WARNING", Sev::Info => "INFO" }, sev_color(it.sev));
                     ui.label(egui::RichText::new(&it.title).strong());
+                    if at.is_some() { ui.label(egui::RichText::new("(located)").color(theme::TEXT_DIM)); }
                 })
-                .body(|ui| { ui.label(egui::RichText::new(&it.detail).color(theme::TEXT)); });
+                .body(|ui| {
+                    ui.label(egui::RichText::new(&it.detail).color(theme::TEXT));
+                    if let Some(p) = at {
+                        if ui.button("Show in 3D view").on_hover_text("Centre the view on the marker for this item").clicked() { locate = Some(p); }
+                    }
+                });
         }
+        if let Some(p) = locate { self.cam.target = p; self.status = format!("Centred on ({:.1}, {:.1}, {:.1}) mm.", p[0], p[1], p[2]); }
     }
 
     fn results_panel(&mut self, ui: &mut egui::Ui) {
@@ -1708,6 +1750,7 @@ impl App {
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Ghost, "Ghost");
                 ui.selectable_value(&mut self.mesh_mode, MeshMode::Hidden, "Hidden");
             });
+            ui.checkbox(&mut self.show_markers, "Show warning markers").on_hover_text("A clickable marker in the 3D view wherever a warning or error points at a place.");
             ui.checkbox(&mut self.show_ports, "Show ports, openings and blockers").on_hover_text("Turn off to see only the geometry and the flow.");
             ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
             if self.show_lines {
@@ -1840,6 +1883,27 @@ impl App {
             let sel = self.rim_sel == Some(li);
             viewport::draw_polygon(&painter, rect, &self.cam, &l.l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
         }
+        // markers for warnings and errors that point at a place
+        let markers: Vec<(Pos2, Issue)> = if self.show_markers {
+            let all = self.current_issues();
+            all.iter().filter_map(|it| issue_point(it, &all, &self.project).and_then(|p| self.cam.project(rect, p)).map(|(q, _)| (q, it.clone()))).collect()
+        } else { vec![] };
+        let hover_pos = resp.hover_pos();
+        for (q, it) in &markers {
+            let col = sev_color(it.sev);
+            let hot = hover_pos.map_or(false, |h| h.distance(*q) < 12.0);
+            painter.circle_filled(*q, if hot { 11.0 } else { 9.0 }, col);
+            painter.circle_stroke(*q, if hot { 11.0 } else { 9.0 }, Stroke::new(1.5, Color32::BLACK));
+            painter.text(*q, Align2::CENTER_CENTER, "!", FontId::proportional(13.0), Color32::BLACK);
+            if hot {
+                let galley = painter.layout_no_wrap(it.title.clone(), FontId::proportional(11.0), Color32::WHITE);
+                let r = Rect::from_min_size(*q + Vec2::new(14.0, -8.0), galley.size() + Vec2::new(10.0, 6.0));
+                painter.rect_filled(r, 2.0, Color32::from_black_alpha(220));
+                painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
+            }
+        }
+        let clicked_marker = if resp.clicked() { resp.interact_pointer_pos().and_then(|pp| markers.iter().find(|(q, _)| q.distance(pp) < 12.0).map(|(_, it)| it.title.clone())) } else { None };
+        if let Some(t) = &clicked_marker { self.tab = Tab::Exceptions; self.focus_issue = Some(t.clone()); }
         // hand-drawn loop preview
         if let Some(bi) = self.draw_body {
             let mesh = &self.bodies[bi].mesh;
@@ -1879,7 +1943,8 @@ impl App {
                 }
             }
         }
-        if resp.clicked() && self.tool == Tool::Block {
+        if clicked_marker.is_some() {
+        } else if resp.clicked() && self.tool == Tool::Block {
             if let Some(pp) = resp.interact_pointer_pos() {
                 // an existing blocker is removed, a small hole is closed
                 let hit = |cap: &PortCap, cam: &Camera| -> Option<f32> {
@@ -2317,5 +2382,28 @@ impl eframe::App for Shell {
                 ShellCmd::Tutorial => { let mut d = self.new_doc(); d.start_tutorial(); self.docs.push(d); self.active = self.docs.len() - 1; }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinates_are_found_in_messages() {
+        let m = "Air can leave the duct through something that is not a port, near (3.1, 13.8, 79.8) mm: a gap";
+        assert_eq!(parse_coords(m), Some([3.1, 13.8, 79.8]));
+        assert_eq!(parse_coords("no place here (just words)"), None);
+        assert_eq!(parse_coords("near (-6.1, 23.0, -62.3) mm"), Some([-6.1, 23.0, -62.3]));
+    }
+
+    #[test]
+    fn leak_issue_is_located_and_major_leak_reuses_it() {
+        let leak = classify_issue("Air can leave the duct through something that is not a port, near (3.1, 13.8, 79.8) mm: x");
+        let major = Issue { sev: Sev::Error, title: "Major leak: most of the air is not leaving through the outlets".into(), detail: "93 L/min".into() };
+        let p = Project::new("t");
+        let all = vec![leak.clone(), major.clone()];
+        assert_eq!(issue_point(&leak, &all, &p), Some([3.1, 13.8, 79.8]));
+        assert_eq!(issue_point(&major, &all, &p), Some([3.1, 13.8, 79.8]));
     }
 }
