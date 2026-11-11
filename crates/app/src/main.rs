@@ -61,7 +61,7 @@ fn classify_issue(msg: &str) -> Issue {
 }
 
 /// Everything worth flagging about a run, ordered errors first.
-fn issues_of(s: &Snapshot) -> Vec<Issue> {
+fn issues_of(s: &Snapshot, project: &Project) -> Vec<Issue> {
     let mut v: Vec<Issue> = vec![];
     if let Some(e) = &s.error { v.push(Issue { sev: Sev::Error, title: "Simulation failed".into(), detail: e.clone() }); }
     for w in &s.warnings { v.push(classify_issue(w)); }
@@ -69,7 +69,38 @@ fn issues_of(s: &Snapshot) -> Vec<Issue> {
     let q_in: f64 = s.report.iter().filter(|r| r.inlet).map(|r| r.flow_l_min).sum();
     let net: f64 = s.report.iter().map(|r| r.flow_l_min).sum();
     if q_in > 1e-6 && net.abs() > 0.08 * q_in && s.step > 2000 {
-        v.push(classify_issue(&format!("{:.1} L/min of the {:.1} L/min going in is not accounted for by your outlets. Air is probably leaving through duct openings you did not define as ports (or the run has not settled yet).", net.abs(), q_in)));
+        let msg = format!("{:.1} L/min of the {:.1} L/min going in ({:.0}%) is not accounted for by your outlets. Air is leaving through something that is not a defined port (a gap, or an opening that is not a port), or the run has not settled yet. Check the leak warning, define the missing openings as ports, or block them.", net.abs(), q_in, 100.0 * net.abs() / q_in);
+        let severe = net.abs() > 0.25 * q_in;
+        v.push(Issue { sev: if severe { Sev::Error } else { Sev::Warning }, title: if severe { "Major leak: most of the air is not leaving through the outlets".into() } else { "Flow does not balance".into() }, detail: msg });
+    }
+    if s.step > 1500 {
+        // outlets that carry far less than their share of the opening area
+        let outs: Vec<(&peregrine_solver::PortReport, f64)> = s.report.iter().filter(|r| !r.inlet).map(|r| (r, project.ports.iter().find(|p| p.name == r.name).map_or(0.0, |p| p.cap.area()))).collect();
+        let total_out: f64 = outs.iter().map(|(r, _)| (-r.flow_l_min).max(0.0)).sum();
+        let total_area: f64 = outs.iter().map(|(_, a)| *a).sum();
+        if outs.len() >= 2 && total_area > 0.0 && q_in > 1e-6 {
+            for (r, a) in &outs {
+                let (ash, fsh) = (a / total_area, (-r.flow_l_min).max(0.0) / total_out.max(1e-9));
+                if ash > 0.2 && fsh < 0.25 * ash {
+                    v.push(Issue { sev: Sev::Warning, title: format!("Outlet '{}' is starved", r.name), detail: format!("'{}' is {:.0}% of the outlet area ({:.0} mm²) but carries only {:.1}% of the outflow ({:.2} L/min). A large opening that passes almost no air is usually cut off from the duct (a pocket, a closed-off passage or a part in the way), or air is escaping elsewhere before it gets there. Check the flow path in the streamlines and the leak warning.", r.name, 100.0 * ash, a, 100.0 * fsh, -r.flow_l_min) });
+                }
+            }
+        }
+        // how hard the fan is working
+        for g in &s.sources {
+            if let Some(Source { kind: SourceKind::Fan { curve }, .. }) = project.sources.iter().find(|x| x.name == g.name) {
+                let qmax = curve.iter().map(|c| c.0).fold(0.0, f64::max);
+                let pmax = curve.iter().map(|c| c.1).fold(0.0, f64::max);
+                if qmax > 0.0 && pmax > 0.0 {
+                    let (fq, fp) = (g.total_flow_l_min / qmax, g.pressure_pa / pmax);
+                    if fq < 0.35 {
+                        v.push(Issue { sev: if fq < 0.1 { Sev::Error } else { Sev::Warning }, title: format!("Major flow restriction at '{}'", g.name), detail: format!("The duct lets '{}' deliver only {:.0}% of its free-air flow ({:.1} of {:.0} L/min) while working at {:.0}% of its maximum pressure ({:.0} of {:.0} Pa). The duct is a severe restriction for this fan.", g.name, 100.0 * fq, g.total_flow_l_min, qmax, 100.0 * fp, g.pressure_pa, pmax) });
+                    } else if fq > 0.85 && fp < 0.15 {
+                        v.push(Issue { sev: Sev::Warning, title: format!("'{}' is barely loaded", g.name), detail: format!("'{}' delivers {:.0}% of its free-air flow at only {:.0}% of its maximum pressure. A real duct usually pressurises noticeably; this suggests air is escaping (a leak) or the run has not settled.", g.name, 100.0 * fq, 100.0 * fp) });
+                    }
+                }
+            }
+        }
     }
     let mut seen = std::collections::HashSet::new();
     v.retain(|i| seen.insert(i.title.clone()));
@@ -1594,7 +1625,7 @@ impl App {
     }
 
     fn current_issues(&self) -> Vec<Issue> {
-        match &self.last { Some(s) => issues_of(&s.lock().unwrap()), None => vec![] }
+        match &self.last { Some(s) => issues_of(&s.lock().unwrap(), &self.project), None => vec![] }
     }
 
     fn issue_counts(&self) -> (usize, usize) {
@@ -1630,7 +1661,7 @@ impl App {
         theme::section(ui, "Run", |ui| {
             ui.add(egui::ProgressBar::new(if s.total > 0 { s.step as f32 / s.total as f32 } else { 0.0 }).text(format!("{} / {}", s.step, s.total)).fill(theme::ACCENT));
             ui.label(format!("Engine: {}", s.engine));
-            let iss = issues_of(&s);
+            let iss = issues_of(&s, &self.project);
             if !iss.is_empty() {
                 let (e, w) = (iss.iter().filter(|i| i.sev == Sev::Error).count(), iss.iter().filter(|i| i.sev == Sev::Warning).count());
                 ui.horizontal(|ui| {

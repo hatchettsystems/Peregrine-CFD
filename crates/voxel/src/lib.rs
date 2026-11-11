@@ -1,5 +1,5 @@
 //! Cartesian voxelisation: solids by ray parity, port caps, fluid-region flood fill.
-use peregrine_core::port_cap::PortCap;
+use peregrine_core::port_cap::{point_in_polygon, PortCap};
 use peregrine_core::vec3::*;
 use peregrine_core::{Aabb, TriMesh};
 use rayon::prelude::*;
@@ -244,7 +244,59 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool) 
             }
         }
     }
+    seal_rim(grid, cells, cap, &poly, plug || code == SOLID);
     count
+}
+
+/// Close the sliver of fluid cells just outside the rim of a planar cap. The cap polygon is the rim of the
+/// opening and a voxel grid never matches it exactly: without this, air slips between the port and the wall
+/// (around a fan inlet, or beside an outlet) and leaves through a path that is not a port.
+fn seal_rim(grid: &Grid, cells: &mut [u8], cap: &PortCap, poly: &[[f64; 2]], both_sides: bool) {
+    if std::env::var_os("PG_NO_RIM_SEAL").is_some() {
+        return;
+    }
+    let dx = grid.dx;
+    let ring = 1.2 * dx;
+    let mut bb = Aabb::empty();
+    for v in &cap.polygon {
+        bb.grow(*v);
+    }
+    let bb = bb.expanded(ring + 2.0 * dx);
+    let lo = [0, 1, 2].map(|i| (((bb.min[i] - grid.origin[i]) / dx).floor().max(0.0)) as usize);
+    let hi = [0, 1, 2].map(|i| ((((bb.max[i] - grid.origin[i]) / dx).ceil()).max(0.0) as usize).min(grid.dims[i]));
+    let front = if both_sides { 2.0 * dx } else { 0.0 };
+    for z in lo[2]..hi[2] {
+        for y in lo[1]..hi[1] {
+            for x in lo[0]..hi[0] {
+                let i = grid.idx(x, y, z);
+                if cells[i] != FLUID {
+                    continue;
+                }
+                let c = grid.center(x, y, z);
+                let d = cap.height(c);
+                if d < -dx || d >= front {
+                    continue;
+                }
+                let q = cap.project2d(c);
+                if point_in_polygon(poly, q) {
+                    continue;
+                }
+                // distance to the rim
+                let mut best = f64::MAX;
+                for k in 0..poly.len() {
+                    let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+                    let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+                    let l2 = ex * ex + ey * ey;
+                    let t = if l2 > 0.0 { (((q[0] - a[0]) * ex + (q[1] - a[1]) * ey) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    let (px, py) = (a[0] + t * ex - q[0], a[1] + t * ey - q[1]);
+                    best = best.min((px * px + py * py).sqrt());
+                }
+                if best <= ring {
+                    cells[i] = SOLID;
+                }
+            }
+        }
+    }
 }
 
 /// Mark the cells just inside a non-planar cap: fluid cells within one cell behind each cap triangle

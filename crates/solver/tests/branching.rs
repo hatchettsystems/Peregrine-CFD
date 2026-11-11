@@ -82,6 +82,7 @@ fn run_kind(baffle: bool, dx: f64, steps: usize, kind: SourceKind) -> Out {
 }
 
 #[test]
+#[ignore = "slow exploration (minutes); run with --ignored"]
 fn explore_small_inline_vs_large_side() {
     for (label, baffle) in [("direct jet", false), ("baffled", true)] {
         for dx in [0.5] {
@@ -92,6 +93,7 @@ fn explore_small_inline_vs_large_side() {
 }
 
 #[test]
+#[ignore = "slow exploration (minutes); run with --ignored"]
 fn explore_fan_source() {
     for (label, baffle) in [("direct jet", false), ("baffled", true)] {
         let o = run_kind(baffle, 0.5, 6000, SourceKind::Fan { curve: vec![(0.0, 300.0), (10.0, 220.0), (20.0, 120.0), (30.0, 0.0)] });
