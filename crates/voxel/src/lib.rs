@@ -171,6 +171,7 @@ pub fn build_domain_full(solids: &[&TriMesh], groups: &[Vec<usize>], seam_tol_mm
         }
         seal_seams(&grid, &mut cells, &label, &group_of, reach);
     }
+    close_diagonal_gaps(&grid, &mut cells);
     let [nx, ny, nz] = grid.dims;
     // sphere plugs (a leak the user sealed at its narrowest point)
     for (c, r) in plugs {
@@ -267,6 +268,67 @@ fn mark_cap(grid: &Grid, cells: &mut [u8], cap: &PortCap, code: u8, plug: bool, 
         seal_rim(grid, cells, cap, &poly, true, collar_mm, collar_mm);
     }
     count
+}
+
+/// Make every thin wall face-connected. A wall one cell thick at a slant becomes a staircase of cells that touch
+/// only at their corners: the air on either side then sees each other along a diagonal lattice link and flows
+/// straight through. Wherever two solid cells touch diagonally across a pair of fluid cells, one of the fluid
+/// cells is closed (the one that already touches more solid), which turns the corner contact into a face contact.
+fn close_diagonal_gaps(grid: &Grid, cells: &mut [u8]) {
+    if std::env::var_os("PG_NO_DIAG_CLOSE").is_some() {
+        return;
+    }
+    let [nx, ny, nz] = grid.dims;
+    let solid_neighbors = |cells: &[u8], q: [usize; 3]| -> usize {
+        let mut n = 0;
+        for (dx, dy, dz) in [(-1i32, 0i32, 0i32), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+            let (xx, yy, zz) = (q[0] as i32 + dx, q[1] as i32 + dy, q[2] as i32 + dz);
+            if xx >= 0 && yy >= 0 && zz >= 0 && (xx as usize) < nx && (yy as usize) < ny && (zz as usize) < nz && cells[grid.idx(xx as usize, yy as usize, zz as usize)] == SOLID {
+                n += 1;
+            }
+        }
+        n
+    };
+    for _pass in 0..2 {
+        let mut fill: Vec<usize> = vec![];
+        for (u, v) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let c = [x, y, z];
+                        if c[u] + 1 >= grid.dims[u] || c[v] + 1 >= grid.dims[v] {
+                            continue;
+                        }
+                        let at = |du: usize, dv: usize| -> ([usize; 3], usize) {
+                            let mut q = c;
+                            q[u] += du;
+                            q[v] += dv;
+                            (q, grid.idx(q[0], q[1], q[2]))
+                        };
+                        let (q00, i00) = at(0, 0);
+                        let (q11, i11) = at(1, 1);
+                        let (q10, i10) = at(1, 0);
+                        let (q01, i01) = at(0, 1);
+                        // solid on one diagonal and fluid on the other, either way round
+                        let pairs = [((i00, i11), (i10, q10, i01, q01)), ((i10, i01), (i00, q00, i11, q11))];
+                        for ((s1, s2), (f1, qf1, f2, qf2)) in pairs {
+                            if cells[s1] == SOLID && cells[s2] == SOLID && cells[f1] == FLUID && cells[f2] == FLUID {
+                                fill.push(if solid_neighbors(cells, qf1) >= solid_neighbors(cells, qf2) { f1 } else { f2 });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if fill.is_empty() {
+            break;
+        }
+        for i in fill {
+            if cells[i] == FLUID {
+                cells[i] = SOLID;
+            }
+        }
+    }
 }
 
 /// Close the sliver of fluid cells just outside the rim of a planar cap. The cap polygon is the rim of the
@@ -593,4 +655,31 @@ pub fn behind_volumes(solids: &[&TriMesh], caps: &[PortCap], bounds: &Aabb, dx: 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// A slanted wall one cell thick (corner contacts only) must become face-connected.
+    #[test]
+    fn diagonal_wall_is_closed() {
+        let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [8, 8, 1] };
+        let mut cells = vec![FLUID; grid.len()];
+        for i in 0..8 {
+            cells[grid.idx(i, i, 0)] = SOLID; // the diagonal
+        }
+        // before: cells (3,4) and (4,3) are fluid, diagonal neighbours on opposite sides of the wall
+        close_diagonal_gaps(&grid, &mut cells);
+        // after: no pair of solid cells is left touching only at corners across two fluid cells
+        for y in 0..7 {
+            for x in 0..7 {
+                let (a, b, c, d) = (cells[grid.idx(x, y, 0)], cells[grid.idx(x + 1, y, 0)], cells[grid.idx(x, y + 1, 0)], cells[grid.idx(x + 1, y + 1, 0)]);
+                assert!(!(a == SOLID && d == SOLID && b == FLUID && c == FLUID), "open corner at {x},{y}");
+                assert!(!(b == SOLID && c == SOLID && a == FLUID && d == FLUID), "open corner at {x},{y}");
+            }
+        }
+        // and it only added a few cells
+        assert!(cells.iter().filter(|&&c| c == SOLID).count() < 8 + 8);
+    }
 }
