@@ -295,6 +295,7 @@ fn main() -> eframe::Result {
                 app.mesh_mode = MeshMode::Ghost;
                 app.focus_issue = Some("Air leaks out of the duct".into());
             }
+            if a == "--show-sealed" { app.show_sealed = true; }
             if a == "--tab" { match args.get(i + 1).map(|v| v.as_str()) { Some("ports") => app.tab = Tab::Ports, Some("results") => app.tab = Tab::Results, Some("exceptions") => app.tab = Tab::Exceptions, _ => {} } }
             if a == "--tutorial" { app.start_tutorial(); }
             if a == "--tutorial-selftest" {
