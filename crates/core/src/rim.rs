@@ -272,18 +272,19 @@ fn external_visibility_at(cap: &PortCap, grid: &RayGrid, pts: &[V3]) -> f64 {
     }
     let n = cap.normal;
     let (a, b) = basis(n);
-    // a viewer may look from any direction within 60 degrees of the opening's normal
+    // a viewer may look from any direction in the hemisphere in front of the opening: sample it evenly
+    // (Fibonacci spiral), because a notch or recess may only be visible through a narrow window of angles
     let dirs: Vec<V3> = {
-        let mut d = vec![n];
-        for tilt_deg in [25.0f64, 45.0, 60.0] {
-            let tilt = tilt_deg.to_radians();
-            for k in 0..8 {
-                let ang = std::f64::consts::TAU * k as f64 / 8.0;
-                let side = add(scale(a, ang.cos()), scale(b, ang.sin()));
-                d.push(normalize(add(scale(n, tilt.cos()), scale(side, tilt.sin()))));
-            }
-        }
-        d
+        let count = 96;
+        let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+        (0..count)
+            .map(|k| {
+                let cz = 0.26 + 0.74 * (1.0 - (k as f64 + 0.5) / count as f64); // cos of the angle from the normal
+                let r = (1.0 - cz * cz).max(0.0).sqrt();
+                let phi = golden * k as f64;
+                add(add(scale(a, r * phi.cos()), scale(b, r * phi.sin())), scale(n, cz))
+            })
+            .collect()
     };
     let visible = pts
         .iter()
@@ -510,11 +511,13 @@ pub struct CurvedParams {
     pub min_off_plane_rel: f64,
     pub min_confidence: f64,
     pub min_area: f64,
+    /// Also return loops that are flat (the caller removes those the flat-hole detector already found).
+    pub include_flat: bool,
 }
 
 impl Default for CurvedParams {
     fn default() -> Self {
-        CurvedParams { min_perimeter: 12.0, max_perimeter: 300.0, feature_angle_deg: 25.0, min_off_plane: 0.3, min_off_plane_rel: 0.02, min_confidence: 0.2, min_area: 4.0 }
+        CurvedParams { min_perimeter: 12.0, max_perimeter: 300.0, feature_angle_deg: 25.0, min_off_plane: 0.3, min_off_plane_rel: 0.02, min_confidence: 0.2, min_area: 4.0, include_flat: false }
     }
 }
 
@@ -597,7 +600,7 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
                 c_perim += 1;
                 let (c, n) = loop_frame(&points);
                 let dev = points.iter().map(|p| dot(sub(*p, c), n).abs()).fold(0.0, f64::max);
-                if dev < (prm.min_off_plane_rel * perimeter).max(prm.min_off_plane) { c_flat += 1; continue; } // flat loops are the planar detector's job
+                if !prm.include_flat && dev < (prm.min_off_plane_rel * perimeter).max(prm.min_off_plane) { c_flat += 1; if dbg && perimeter < 100.0 { eprintln!("  too flat: perim {:.0} off-plane {:.2} at ({:.1},{:.1},{:.1})", perimeter, dev, c[0], c[1], c[2]); } continue; } // flat loops are the planar detector's job
                 // the same physical loop borders two patches; keep one copy
                 let mut ids: Vec<u32> = lp.clone();
                 ids.sort_unstable();
@@ -624,7 +627,7 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
         c_cap += 1;
         if in_material * 10 > interior.len() * 3 {
             c_mat += 1;
-            if dbg { eprintln!("  rejected (cap inside material): perim {:.0} samples {} in material {}", l.perimeter, interior.len(), in_material); }
+            if dbg { { let (cc, _) = loop_frame(&l.points); eprintln!("  rejected (cap inside material): perim {:.0} off-plane {:.2} at ({:.1},{:.1},{:.1}) samples {} in material {}", l.perimeter, l.planarity_dev, cc[0], cc[1], cc[2], interior.len(), in_material); } }
             continue;
         }
         let probe_base = cents[(0..cents.len()).max_by(|&a, &b| depth[a].partial_cmp(&depth[b]).unwrap()).unwrap()];
@@ -656,14 +659,21 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
                 }
             }
         }
-        if !near_air[0] || !near_air[1] || side[0].1 == 0 || side[1].1 == 0 { c_air += 1; if dbg { eprintln!("  rejected (probe in material): perim {:.0} near_air {:?} valid probes {} / {}", l.perimeter, near_air, side[0].1, side[1].1); } continue; } // against material: not an opening
+        if side[0].1 == 0 || side[1].1 == 0 { c_air += 1; if dbg { { let (cc, _) = loop_frame(&l.points); eprintln!("  rejected (probe in material): perim {:.0} off-plane {:.2} at ({:.1},{:.1},{:.1}) near_air {:?} valid probes {} / {}", l.perimeter, l.planarity_dev, cc[0], cc[1], cc[2], near_air, side[0].1, side[1].1); } } continue; } // against material: not an opening
         let (plus, minus) = (side[0].0 / side[0].1 as f64, side[1].0 / side[1].1 as f64);
         let (lumen_enc, open_enc, n_out) = if minus >= plus { (minus, plus, n0) } else { (plus, minus, scale(n0, -1.0)) };
         let confidence = (lumen_enc - open_enc) / 26.0;
-        if confidence < prm.min_confidence { c_conf += 1; if dbg { eprintln!("  rejected: perim {:.0} area {:.0} enc lumen {:.1} open {:.1} (conf {:.2})", l.perimeter, a_tot, lumen_enc, open_enc, confidence); } continue; }
+        if confidence < prm.min_confidence { c_conf += 1; if dbg { { let (cc, _) = loop_frame(&l.points); eprintln!("  rejected (confidence): perim {:.0} area {:.0} at ({:.1},{:.1},{:.1}) enc lumen {:.1} open {:.1} (conf {:.2})", l.perimeter, a_tot, cc[0], cc[1], cc[2], lumen_enc, open_enc, confidence); } } continue; }
         let flip = dot(n0, n_out) < 0.0;
         let triangles: Vec<[V3; 3]> = tris.into_iter().map(|t| if flip { [t[0], t[2], t[1]] } else { t }).collect();
-        out.push(CurvedOpening { cap: PortCap { origin: ctr, normal: n_out, polygon: l.points.clone(), triangles, holes: vec![] }, perimeter: l.perimeter, planarity_dev: l.planarity_dev, confidence });
+        let flat = l.planarity_dev < 0.05;
+        let cap = if flat {
+            // a flat loop is an ordinary planar opening; use the loop's own plane
+            PortCap { origin: ctr, normal: n_out, polygon: l.points.clone(), triangles: vec![], holes: vec![] }
+        } else {
+            PortCap { origin: ctr, normal: n_out, polygon: l.points.clone(), triangles, holes: vec![] }
+        };
+        out.push(CurvedOpening { cap, perimeter: l.perimeter, planarity_dev: l.planarity_dev, confidence });
     }
     if dbg { eprintln!("cap tested {c_cap}, in material {c_mat}, solid on a side {c_air}, low confidence {c_conf}, accepted {}", out.len()); }
     // A rim has an outer and an inner edge loop around the same opening; keep the inner (smaller) one.

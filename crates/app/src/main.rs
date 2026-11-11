@@ -141,6 +141,7 @@ fn main() -> eframe::Result {
         for (i, a) in args.iter().enumerate() {
             if a == "--hide" { if let Some(n) = args.get(i + 1) { if let Some(k) = app.bodies.iter().position(|b| &b.name == n) { app.visible[k] = false; } } }
             if a == "--frame" { if let Some(n) = args.get(i + 1) { if let Some(b) = app.bodies.iter().find(|b| &b.name == n) { let bb = b.mesh.bounds(); app.cam.frame(bb.min, bb.max); } } }
+            if a == "--show-hidden" { app.show_hidden = true; app.refresh_candidates(); }
             if a == "--yaw" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.yaw = v.to_radians(); } }
             if a == "--pitch" { if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) { app.cam.pitch = v.to_radians(); } }
         }

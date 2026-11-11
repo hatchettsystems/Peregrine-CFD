@@ -2,7 +2,7 @@
 use anyhow::{bail, Context, Result};
 use peregrine_core::{find_port_candidates, stl, Aabb, PortCandidate, TriMesh};
 use peregrine_project::{BodyRole, DuctDef, Project};
-use peregrine_voxel::{build_domain_ext, leak_check, Domain, PortSpec, PORT_BASE};
+use peregrine_voxel::{behind_volumes, build_domain_ext, leak_check, Domain, PortSpec, PORT_BASE};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -111,9 +111,16 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
             }
         }
         if curved {
-            for o in peregrine_core::find_curved_openings(&mesh, 12.0, 300.0, 25.0) {
+            let prm = peregrine_core::CurvedParams { include_flat: true, ..Default::default() };
+            for o in peregrine_core::find_curved_openings_with(&mesh, &prm) {
                 let area = o.cap.area();
                 if area < min_area.max(8.0) { continue; }
+                // flat loops the flat-hole detector already reported are not new
+                let dup = planar_kept.iter().any(|c| !c.cap.is_surface() && !o.cap.is_surface()
+                    && dot(c.cap.normal, o.cap.normal).abs() > 0.99
+                    && len(sub(c.cap.centroid(), o.cap.centroid())) < 0.5
+                    && (c.area - area).abs() <= 0.06 * c.area.max(area));
+                if dup { continue; }
                 let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
                 let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, cap: o.cap };
                 if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
@@ -125,9 +132,28 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
         nest_islands(&mut planar_kept);
         // an opening that admits air must be visible from outside the duct
         let grid = peregrine_core::RayGrid::new(&mesh);
+        let mut duct_cands: Vec<PortCandidate> = vec![];
         for mut c in planar_kept {
             c.visibility = peregrine_core::external_visibility(&c.cap, &grid);
-            c.clearance = peregrine_core::inward_clearance(&c.cap, &grid, 5.0);
+            duct_cands.push(c);
+        }
+        // Air behind a real opening is the whole duct interior; behind a pocket it is a small closed cavity.
+        // Score each opening by the connected volume behind it relative to the largest.
+        let part_meshes: Vec<&TriMesh> = d.parts.iter().filter_map(|p| bodies.iter().find(|b| &b.name == p).map(|b| &b.mesh)).collect();
+        if !duct_cands.is_empty() && !part_meshes.is_empty() {
+            let mut bb = mesh.bounds().expanded(2.0);
+            if !bb.is_valid() { bb = mesh.bounds(); }
+            let size = [bb.max[0] - bb.min[0], bb.max[1] - bb.min[1], bb.max[2] - bb.min[2]];
+            let dx = (size[0] * size[1] * size[2] / 6.0e6).cbrt().clamp(0.4, 1.2);
+            // plug islands too: air must not escape through a hub or boss region
+            let caps: Vec<peregrine_core::PortCap> = duct_cands.iter().map(|c| { let mut k = c.cap.clone(); k.holes.clear(); k }).collect();
+            let vols = behind_volumes(&part_meshes, &caps, &bb, dx);
+            let vmax = vols.iter().cloned().filter(|v| v.is_finite()).fold(0.0, f64::max).max(1e-9);
+            for (c, v) in duct_cands.iter_mut().zip(vols) {
+                c.clearance = if v.is_finite() { v / vmax } else { 1.0 };
+            }
+        }
+        for c in duct_cands {
             out.push((d.name.clone(), c));
         }
     }

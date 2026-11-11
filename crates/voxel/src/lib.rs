@@ -416,3 +416,54 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
         cells[i] = SOLID;
     }
 }
+
+/// For each cap, the volume (mm^3) of the connected air just behind it, with every cap plugged. Air behind a
+/// real opening is the whole duct interior (shared by all its openings); air behind a pocket or recess is a small
+/// closed cavity. Compare the values: a pocket scores a tiny fraction of the largest.
+pub fn behind_volumes(solids: &[&TriMesh], caps: &[PortCap], bounds: &Aabb, dx: f64) -> Vec<f64> {
+    let n = caps.len().min(250);
+    let ports: Vec<PortSpec> = caps.iter().take(n).map(|c| PortSpec { cap: c.clone(), plug: true }).collect();
+    let d = build_domain(solids, &ports, bounds, dx);
+    let g = &d.grid;
+    let [nx, ny, nz] = g.dims;
+    // label connected components of all non-solid cells (port cells belong to the air behind their cap)
+    let mut comp = vec![u32::MAX; g.len()];
+    let mut sizes: Vec<u64> = vec![];
+    for s in 0..g.len() {
+        if d.cells[s] == SOLID || comp[s] != u32::MAX {
+            continue;
+        }
+        let id = sizes.len() as u32;
+        let mut count = 0u64;
+        let mut stack = vec![s];
+        comp[s] = id;
+        while let Some(i) = stack.pop() {
+            count += 1;
+            let [x, y, z] = g.xyz(i);
+            let mut visit = |xx: usize, yy: usize, zz: usize| {
+                let j = g.idx(xx, yy, zz);
+                if comp[j] == u32::MAX && d.cells[j] != SOLID {
+                    comp[j] = id;
+                    stack.push(j);
+                }
+            };
+            if x > 0 { visit(x - 1, y, z); }
+            if x + 1 < nx { visit(x + 1, y, z); }
+            if y > 0 { visit(x, y - 1, z); }
+            if y + 1 < ny { visit(x, y + 1, z); }
+            if z > 0 { visit(x, y, z - 1); }
+            if z + 1 < nz { visit(x, y, z + 1); }
+        }
+        sizes.push(count);
+    }
+    let cell_vol = dx * dx * dx;
+    // NaN = the cap could not be resolved on this grid (no cells behind it): unknown, not zero
+    let mut out = vec![f64::NAN; caps.len()];
+    for k in 0..n {
+        let code = PORT_BASE + k as u8;
+        if let Some(i) = (0..g.len()).find(|&i| d.cells[i] == code) {
+            out[k] = sizes[comp[i] as usize] as f64 * cell_vol;
+        }
+    }
+    out
+}
