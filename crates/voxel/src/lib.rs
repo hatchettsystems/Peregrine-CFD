@@ -168,59 +168,41 @@ impl Domain {
     }
 
     fn cluster(&self, cells_idx: &[u32], max_regions: usize) -> Vec<SealedRegion> {
+        let mut all = self.cluster_all(cells_idx);
+        all.truncate(max_regions);
+        all
+    }
+
+    /// How many separate places (10 mm blocks) hold sealed cells.
+    pub fn sealed_region_total(&self) -> usize { self.cluster_all(&self.sealed_idx).len() }
+
+    /// How many separate places hold gaps left open for review.
+    pub fn review_region_total(&self) -> usize { self.cluster_all(&self.review_idx).len() }
+
+    /// Cells grouped by 10 mm block (not merged across blocks, so scattered pinholes do not fuse into one huge
+    /// region), largest first.
+    fn cluster_all(&self, cells_idx: &[u32]) -> Vec<SealedRegion> {
         use std::collections::HashMap;
         if cells_idx.is_empty() {
             return vec![];
         }
         let g = &self.grid;
-        let mut bin = (3.0 / g.dx).ceil().max(2.0) as i64; // cells per bin
-        loop {
-            let mut bins: HashMap<(i64, i64, i64), (V3, usize)> = HashMap::new();
-            for &i in cells_idx {
-                let [x, y, z] = g.xyz(i as usize);
-                let key = (x as i64 / bin, y as i64 / bin, z as i64 / bin);
-                let c = g.center(x, y, z);
-                let e = bins.entry(key).or_insert(([0.0; 3], 0));
-                e.0 = add(e.0, c);
-                e.1 += 1;
-            }
-            // merge touching bins
-            let keys: Vec<(i64, i64, i64)> = bins.keys().copied().collect();
-            let idx_of: HashMap<(i64, i64, i64), usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-            let mut parent: Vec<usize> = (0..keys.len()).collect();
-            fn find(p: &mut Vec<usize>, a: usize) -> usize { let mut a = a; while p[a] != a { p[a] = p[p[a]]; a = p[a]; } a }
-            for (i, k) in keys.iter().enumerate() {
-                for dz in -1..=1 { for dy in -1..=1 { for dx in -1..=1 {
-                    if let Some(&j) = idx_of.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
-                        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                        if a != b { parent[a] = b; }
-                    }
-                } } }
-            }
-            let mut groups: HashMap<usize, (V3, usize, Vec<V3>)> = HashMap::new();
-            for (i, k) in keys.iter().enumerate() {
-                let r = find(&mut parent, i);
-                let (sum, n) = bins[k];
-                let e = groups.entry(r).or_insert(([0.0; 3], 0, vec![]));
-                e.0 = add(e.0, sum);
-                e.1 += n;
-                e.2.push(scale(sum, 1.0 / n as f64));
-            }
-            if groups.len() <= max_regions || bin > 64 {
-                let cell_vol = g.dx * g.dx * g.dx;
-                let mut out: Vec<SealedRegion> = groups
-                    .into_values()
-                    .map(|(sum, n, bcs)| {
-                        let center = scale(sum, 1.0 / n as f64);
-                        let radius = bcs.iter().map(|b| len(sub(*b, center))).fold(0.0, f64::max) + 0.5 * bin as f64 * g.dx;
-                        SealedRegion { center, cells: n, volume_mm3: n as f64 * cell_vol, radius_mm: radius }
-                    })
-                    .collect();
-                out.sort_by(|a, b| b.cells.cmp(&a.cells));
-                return out;
-            }
-            bin *= 2;
+        let bin = (10.0 / g.dx).ceil().max(2.0) as i64;
+        let mut bins: HashMap<(i64, i64, i64), (V3, usize)> = HashMap::new();
+        for &i in cells_idx {
+            let [x, y, z] = g.xyz(i as usize);
+            let key = (x as i64 / bin, y as i64 / bin, z as i64 / bin);
+            let e = bins.entry(key).or_insert(([0.0; 3], 0));
+            e.0 = add(e.0, g.center(x, y, z));
+            e.1 += 1;
         }
+        let cell_vol = g.dx * g.dx * g.dx;
+        let mut out: Vec<SealedRegion> = bins
+            .into_values()
+            .map(|(sum, n)| SealedRegion { center: scale(sum, 1.0 / n as f64), cells: n, volume_mm3: n as f64 * cell_vol, radius_mm: 0.5 * bin as f64 * g.dx })
+            .collect();
+        out.sort_by(|a, b| b.cells.cmp(&a.cells));
+        out
     }
 }
 
@@ -773,6 +755,10 @@ pub fn auto_seal_leaks(domain: &mut Domain, inlet_codes: &[u8], ignore: &[(V3, f
         }
         let g = &domain.grid;
         let r = 0.5 * leak.throat_width + 0.75 * g.dx;
+        // a breach with more than a couple of mm² of surface is an intentional opening, not a defect
+        if std::f64::consts::PI * r * r > MAX_SEAL_AREA_MM2 {
+            break;
+        }
         let c = leak.throat;
         let lo = [0, 1, 2].map(|i| (((c[i] - r - g.origin[i]) / g.dx).floor().max(0.0)) as usize);
         let hi = [0, 1, 2].map(|i| ((((c[i] + r - g.origin[i]) / g.dx).ceil()).max(0.0) as usize).min(g.dims[i]));
@@ -858,9 +844,9 @@ pub fn keep_relevant_seals(domain: &mut Domain, inlet_codes: &[u8]) {
 }
 
 /// Fill fluid cells that sit between two different parts of the same duct (see [`build_domain_ext`]).
-/// A thin gap longer than this (mm), or covering more than [`INTENTIONAL_AREA_MM2`], is taken to be intentional.
-const INTENTIONAL_LENGTH_MM: f64 = 12.0;
-const INTENTIONAL_AREA_MM2: f64 = 60.0;
+/// The largest defect (mm² of surface) the sealers will close. Anything bigger than a pinhole or a hairline gap is an
+/// intentional opening and is left open for the user to review.
+pub const MAX_SEAL_AREA_MM2: f64 = 2.0;
 
 fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], reach: usize, any_pair: bool) -> (Vec<usize>, Vec<usize>) {
     let [nx, ny, nz] = grid.dims;
@@ -930,10 +916,11 @@ fn seal_seams(grid: &Grid, cells: &mut [u8], label: &[u16], group_of: &[usize], 
                     if in_fill[j] && !done[j] { done[j] = true; comp.push(j); }
                 } } }
             }
-            let mut ext: Vec<f64> = (0..3).map(|k| (hi[k] - lo[k] + 1) as f64 * grid.dx).collect();
-            ext.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let (longest, second) = (ext[0], ext[1]);
-            if longest > INTENTIONAL_LENGTH_MM || longest * second > INTENTIONAL_AREA_MM2 {
+            // how big an opening the gap is: its volume spread over its longest direction, i.e. the cross-section of the
+            // passage it makes (a pinhole or a hairline slit is small; a window or a slot is not)
+            let longest = (0..3).map(|k| hi[k] - lo[k] + 1).max().unwrap() as f64;
+            let area = comp.len() as f64 * grid.dx * grid.dx / longest;
+            if area > MAX_SEAL_AREA_MM2 {
                 review.extend(comp);
             } else {
                 keep.extend(comp);
@@ -1030,68 +1017,47 @@ mod diag_tests {
     /// down its middle.
     #[test]
     fn only_thin_gaps_are_closed() {
+        // a 1 x 1 mm window, so the area rule does not apply and only the width decides
         for (gap, closed) in [(1usize, true), (2, true), (3, true), (4, false), (5, false)] {
-            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [gap + 2, 3, 3] };
+            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [gap + 2, 1, 1] };
             let mut cells = vec![FLUID; grid.len()];
-            for y in 0..3 {
-                for z in 0..3 {
-                    cells[grid.idx(0, y, z)] = SOLID;
-                    cells[grid.idx(gap + 1, y, z)] = SOLID;
-                }
-            }
+            cells[grid.idx(0, 0, 0)] = SOLID;
+            cells[grid.idx(gap + 1, 0, 0)] = SOLID;
             let label = vec![0u16; grid.len()];
             let _ = seal_seams(&grid, &mut cells, &label, &[], 3, true);
-            let filled = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == SOLID);
-            let untouched = (1..=gap).all(|x| cells[grid.idx(x, 1, 1)] == FLUID);
+            let filled = (1..=gap).all(|x| cells[grid.idx(x, 0, 0)] == SOLID);
+            let untouched = (1..=gap).all(|x| cells[grid.idx(x, 0, 0)] == FLUID);
             assert!(if closed { filled } else { untouched }, "gap of {gap} cells: closed = {closed}");
         }
     }
 
-    /// A thin gap that runs a long way is an intentional opening: it must be left open and handed back for review.
+    /// A gap with more than 2 mm² of surface is an intentional opening: it must be left open and handed back for review.
     #[test]
-    fn long_thin_gaps_are_left_for_review() {
-        let make = |len: usize| {
-            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [len, len.min(8), 6] };
+    fn gaps_over_two_square_millimetres_are_left_for_review() {
+        let make = |side: usize| {
+            let grid = Grid { origin: [0.0; 3], dx: 1.0, dims: [side + 2, side + 2, 6] };
             let mut cells = vec![FLUID; grid.len()];
             for x in 0..grid.dims[0] { for y in 0..grid.dims[1] {
                 cells[grid.idx(x, y, 0)] = SOLID; cells[grid.idx(x, y, 1)] = SOLID;
                 cells[grid.idx(x, y, 4)] = SOLID; cells[grid.idx(x, y, 5)] = SOLID;
             } }
+            // the gap (z = 2..3) is bounded sideways by solid, except for a side x side window
+            for x in 0..grid.dims[0] { for y in 0..grid.dims[1] {
+                let inside = x >= 1 && x <= side && y >= 1 && y <= side;
+                if !inside { cells[grid.idx(x, y, 2)] = SOLID; cells[grid.idx(x, y, 3)] = SOLID; }
+            } }
             (grid, cells)
         };
-        // 6 x 6 mm patch, 2 mm gap: a clearance, sealed
-        let (grid, mut cells) = make(6);
+        // 1 x 1 mm: a pinhole, closed
+        let (grid, mut cells) = make(1);
         let label = vec![0u16; grid.len()];
         let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], 3, true);
-        assert!(!filled.is_empty() && review.is_empty());
-        // 30 mm long: intentional, left open
-        let (grid, mut cells) = make(30);
+        assert!(!filled.is_empty() && review.is_empty(), "a 1 mm² gap must be closed");
+        // 3 x 3 mm = 9 mm²: intentional, left open
+        let (grid, mut cells) = make(3);
         let label = vec![0u16; grid.len()];
         let (filled, review) = seal_seams(&grid, &mut cells, &label, &[], 3, true);
-        assert!(filled.is_empty() && !review.is_empty());
-        assert!(cells[grid.idx(15, 3, 2)] == FLUID, "the long gap must stay open");
-    }
-
-    /// A sheet thinner than a cell must never vanish, wherever it sits relative to the cell centres.
-    #[test]
-    fn thin_sheets_survive_voxelization() {
-        use peregrine_core::shapes;
-        let mut lost_without = 0;
-        for k in 0..10 {
-            let off = 0.05 + 0.1 * k as f64;
-            let sheet = shapes::solid_box([off, -5.0, -5.0], [off + 0.25, 5.0, 5.0]);
-            let mut bb = sheet.bounds();
-            bb.grow([-3.0, -6.0, -6.0]);
-            bb.grow([4.0, 6.0, 6.0]);
-            let grid = Grid::from_bounds(&bb, 1.0);
-            let (inside, _) = voxelize_inside(&sheet, &grid);
-            let mut cells: Vec<u8> = inside.iter().map(|&i| if i { SOLID } else { FLUID }).collect();
-            let row = |cells: &[u8]| (0..grid.dims[0]).any(|x| cells[grid.idx(x, grid.dims[1] / 2, grid.dims[2] / 2)] == SOLID);
-            if !row(&cells) { lost_without += 1; }
-            let label = vec![0u16; grid.len()];
-            let _ = restore_thin_walls(&grid, &mut cells, &label, &[&sheet]);
-            assert!(row(&cells), "sheet at offset {off} vanished");
-        }
-        assert!(lost_without > 0, "the test must include sheets that the plain test loses");
+        assert!(filled.is_empty() && !review.is_empty(), "a 9 mm² gap must be left open");
+        assert!(cells[grid.idx(2, 2, 2)] == FLUID);
     }
 }

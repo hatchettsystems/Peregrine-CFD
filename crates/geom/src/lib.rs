@@ -448,6 +448,7 @@ pub fn leak_warning(project: &Project, domain: &Domain) -> Option<String> {
 /// What the automatic sealer did, if anything (shown as an informational note with a marker).
 pub fn repair_note(domain: &Domain) -> Option<String> {
     let regions = domain.sealed_regions(25);
+    let total_places = domain.sealed_region_total();
     let first = regions.first()?;
     let cells: usize = regions.iter().map(|r| r.cells).sum();
     let vol: f64 = regions.iter().map(|r| r.volume_mm3).sum();
@@ -455,11 +456,11 @@ pub fn repair_note(domain: &Domain) -> Option<String> {
     for (k, r) in regions.iter().take(8).enumerate() {
         lines.push_str(&format!("\n  {}. near ({:.1}, {:.1}, {:.1}) mm, about {:.1} mm across, {:.1} mm³", k + 1, r.center[0], r.center[1], r.center[2], 2.0 * r.radius_mm, r.volume_mm3));
     }
-    if regions.len() > 8 { lines.push_str(&format!("\n  ... and {} more regions", regions.len() - 8)); }
+    if total_places > 8 { lines.push_str(&format!("\n  ... and {} more places", total_places - 8)); }
     let _ = first;
     Some(format!(
-        "Auto-sealed small gaps (thin air gaps between solid surfaces, under about 1 mm) in {} region(s), {} cells, {:.0} mm³ in total. No gap that thin should exist in a real part, so they were closed.{}\nReal openings are never closed automatically: define them as ports or blockers. Tick 'Show auto-sealed regions' in the Results display options to see them, or turn the sealer off with gap_seal_mm = 0 / auto_seal_leaks = false in the project's [domain] section.",
-        regions.len(), cells, vol, lines
+        "Auto-sealed small gaps (thin air gaps between solid surfaces, under about 1 mm wide and 2 mm² each) in {} place(s) (the {} biggest are listed), {} cells, {:.0} mm³ in total. No gap that thin should exist in a real part, so they were closed.{}\nReal openings are never closed automatically: define them as ports or blockers. Tick 'Show auto-sealed regions' in the Results display options to see them, or turn the sealer off with gap_seal_mm = 0 / auto_seal_leaks = false in the project's [domain] section.",
+        total_places, regions.len(), cells, vol, lines
     ))
 }
 
@@ -478,7 +479,7 @@ pub fn review_note(domain: &Domain) -> Option<String> {
         lines.push_str(&format!("\n  {}. near ({:.1}, {:.1}, {:.1}) mm, about {:.1} mm across", k + 1, r.center[0], r.center[1], r.center[2], 2.0 * r.radius_mm));
     }
     if regions.len() > 8 { lines.push_str(&format!("\n  ... and {} more regions", regions.len() - 8)); }
-    Some(format!("Possible intentional openings were NOT sealed ({} region(s)): thin gaps that run longer than 12 mm or cover more than 60 mm² are almost certainly meant to be there (a slot or vent), so they were left open for you to review. If one is an outlet, define it as a port; if it should be closed, block it.{lines}", regions.len()))
+    Some(format!("Possible intentional openings were NOT sealed ({} region(s)): thin gaps with more than 2 mm² of surface are almost certainly meant to be there (a slot or vent), so they were left open for you to review. If one is an outlet, define it as a port; if it should be closed, block it.{lines}", regions.len()))
 }
 
 /// The regions the automatic sealers closed (centre x/y/z in mm, cell count, radius mm), for display.
