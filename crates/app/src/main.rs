@@ -24,7 +24,7 @@ enum Tool { Orbit, Pan, PickPort, Slice, Rim, Draw, Block }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results, Exceptions }
 /// What the active tab asks the tab shell to do after the frame.
-enum ShellCmd { New, Duplicate, Close(usize), Switch(usize), Tutorial }
+enum ShellCmd { New, Duplicate, Close(usize), Switch(usize), Tutorial, Zoom(Box<Project>) }
 
 /// An edge loop found by the Rim tool with its quality scores.
 #[derive(Clone)]
@@ -215,6 +215,10 @@ struct App {
     show_hidden: bool,
     tut: Option<usize>,
     hidden_caps: std::collections::HashSet<[i64; 3]>,
+    zoom_plane: f64,
+    zoom_zmin: f64,
+    zoom_box: [f64; 4],
+    zoom_dx: f64,
     leak_notes: Vec<String>,
     sealed_check: Vec<[f64; 5]>,
     show_sealed: bool,
@@ -354,6 +358,10 @@ impl App {
             show_hidden: false,
             tut: None,
             hidden_caps: Default::default(),
+            zoom_plane: -38.0,
+            zoom_zmin: -66.0,
+            zoom_box: [-36.0, -36.0, 36.0, 18.0],
+            zoom_dx: 0.3,
             leak_notes: vec![],
             sealed_check: vec![],
             show_sealed: false,
@@ -1943,6 +1951,38 @@ impl App {
             }
             ui.checkbox(&mut self.show_slice, "Slice plane");
         });
+        theme::section(ui, "Zoom run", |ui| {
+            ui.label(egui::RichText::new("Re-simulate a box of the duct at much finer cells. The channels are cut at the top of the box and fed with the flow this run measured there. Use it for the bottom plate and its slots.").color(theme::TEXT_DIM));
+            ui.horizontal(|ui| {
+                ui.label("Top of box z");
+                ui.add(egui::DragValue::new(&mut self.zoom_plane).speed(0.5).suffix(" mm"));
+                ui.label("Bottom z");
+                ui.add(egui::DragValue::new(&mut self.zoom_zmin).speed(0.5).suffix(" mm"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("x");
+                ui.add(egui::DragValue::new(&mut self.zoom_box[0]).speed(0.5));
+                ui.add(egui::DragValue::new(&mut self.zoom_box[2]).speed(0.5));
+                ui.label("y");
+                ui.add(egui::DragValue::new(&mut self.zoom_box[1]).speed(0.5));
+                ui.add(egui::DragValue::new(&mut self.zoom_box[3]).speed(0.5));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Cell size");
+                ui.add(egui::DragValue::new(&mut self.zoom_dx).speed(0.01).range(0.05..=1.0).suffix(" mm"));
+            });
+            let n: f64 = [self.zoom_box[2] - self.zoom_box[0] + 6.0, self.zoom_box[3] - self.zoom_box[1] + 6.0, self.zoom_plane - self.zoom_zmin + 6.0].iter().map(|l| l.max(1.0) / self.zoom_dx).product();
+            ui.label(egui::RichText::new(format!("about {:.1} M cells, {:.1} GB of graphics memory", n / 1e6, n * 77.0 / 1e9)).color(theme::TEXT_DIM));
+            let ready = !s.vel.is_empty() && !s.cells.is_empty();
+            if ui.add_enabled(ready, egui::Button::new("Create zoom simulation (new tab)")).on_hover_text("Needs a finished or running coarse simulation in this tab").clicked() {
+                let coarse = peregrine_geom::zoom::CoarseField { dims: s.dims, origin: s.origin, dx: s.dx, cells: s.cells.to_vec(), vel: s.vel.to_vec() };
+                let spec = peregrine_geom::zoom::ZoomSpec { plane_z: self.zoom_plane, z_min: self.zoom_zmin, x_range: [self.zoom_box[0], self.zoom_box[2]], y_range: [self.zoom_box[1], self.zoom_box[3]], fine_dx: self.zoom_dx };
+                match peregrine_geom::zoom::zoom_project(&self.project, &coarse, &spec) {
+                    Ok((p, notes)) => { self.status = format!("Zoom project built: {}", notes.join("; ")); self.cmds.push(ShellCmd::Zoom(Box::new(p))); }
+                    Err(e) => self.status = format!("Zoom failed: {e:#}"),
+                }
+            }
+        });
         if self.show_slice { theme::section(ui, "Slice", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Field");
@@ -2589,6 +2629,17 @@ impl eframe::App for Shell {
                 ShellCmd::Duplicate => { let d = self.docs[self.active].duplicate(); self.docs.push(d); self.active = self.docs.len() - 1; }
                 ShellCmd::Close(i) => self.close(i),
                 ShellCmd::Switch(i) => { if i < self.docs.len() { self.active = i; } }
+                ShellCmd::Zoom(p) => {
+                    let mut d = self.docs[self.active].duplicate();
+                    d.project = *p;
+                    d.project_path = None;
+                    d.last = None;
+                    d.reclassify();
+                    d.tab = Tab::Ports;
+                    d.status = "Zoom simulation ready: check the fine cell size, then press Run.".into();
+                    self.docs.push(d);
+                    self.active = self.docs.len() - 1;
+                }
                 ShellCmd::Tutorial => { let mut d = self.new_doc(); d.start_tutorial(); self.docs.push(d); self.active = self.docs.len() - 1; }
             }
         }

@@ -1,4 +1,5 @@
 //! Loading bodies from geometry files and assembling the voxel domain for a project.
+pub mod zoom;
 use anyhow::{bail, Context, Result};
 use peregrine_core::{find_port_candidates, stl, Aabb, PortCandidate, TriMesh};
 use peregrine_project::{BodyRole, DuctDef, Project};
@@ -260,7 +261,15 @@ pub fn domain_bounds(bodies: &[Body], padding: f64) -> Aabb {
 /// Domain box: all active bodies plus padding, extended beyond every outlet along its outward normal
 /// by `outlet_clearance_mm` so free jets have room to develop.
 pub fn project_bounds(project: &Project, bodies: &[Body]) -> Aabb {
-    let mut b = domain_bounds(bodies, project.domain.padding_mm);
+    let mut b = match project.domain.crop {
+        Some(c) => {
+            let mut b = Aabb::empty();
+            b.grow([c[0], c[1], c[2]]);
+            b.grow([c[3], c[4], c[5]]);
+            b.expanded(project.domain.padding_mm)
+        }
+        None => domain_bounds(bodies, project.domain.padding_mm),
+    };
     for p in project.ports.iter().filter(|p| !p.kind.is_inlet()) {
         let c = project.domain.outlet_clearance_mm;
         for v in &p.cap.polygon {

@@ -19,6 +19,8 @@ const USAGE: &str = "peregrine <command>
   fans                             list the built-in fan library
   set-source <project.toml> <name> <spec> [area|weights|plenum]
                                    define a source; spec = flow=<L/min> | velocity=<m/s> | fan=<library name or part> | fan=q:dp,q:dp,...
+  zoom <project.toml> <result.vtk> --plane Z --zmin Z --box x0,y0,x1,y1 --dx D --out zoom.toml
+                                   make a zoom project: re-simulate a box of the duct at a finer cell size, fed by the flow of a coarse run
   run <project.toml> [--steps N] [--out DIR] [--cpu|--gpu]
                                    voxelize, solve, print the port report, write VTK";
 
@@ -57,6 +59,37 @@ fn real_main() -> Result<()> {
         Some("set-source") => {
             if args.len() < 4 { bail!("{USAGE}"); }
             set_source(Path::new(&args[1]), &args[2], &args[3], args.get(4).map(String::as_str))
+        }
+        Some("zoom") => {
+            let proj = PathBuf::from(args.get(1).context("zoom <project> <result.vtk> ...")?);
+            let vtk = PathBuf::from(args.get(2).context("zoom <project> <result.vtk> ...")?);
+            let (mut plane, mut zmin, mut dx, mut bx) = (None, None, 0.3f64, None);
+            let mut out = PathBuf::from("zoom.toml");
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--plane" => { plane = Some(args.get(i + 1).context("--plane Z")?.parse::<f64>()?); i += 2; }
+                    "--zmin" => { zmin = Some(args.get(i + 1).context("--zmin Z")?.parse::<f64>()?); i += 2; }
+                    "--dx" => { dx = args.get(i + 1).context("--dx D")?.parse()?; i += 2; }
+                    "--box" => { let v: Vec<f64> = args.get(i + 1).context("--box x0,y0,x1,y1")?.split(',').filter_map(|t| t.parse().ok()).collect(); if v.len() != 4 { bail!("--box needs x0,y0,x1,y1"); } bx = Some(v); i += 2; }
+                    "--out" => { out = PathBuf::from(args.get(i + 1).context("--out FILE")?); i += 2; }
+                    other => bail!("unknown option {other}"),
+                }
+            }
+            let (plane, zmin, bx) = (plane.context("--plane Z")?, zmin.context("--zmin Z")?, bx.context("--box x0,y0,x1,y1")?);
+            let mut project = Project::load(&proj)?;
+            if let Some(g) = project.geometry_file.clone() {
+                if g.is_relative() { project.geometry_file = Some(proj.parent().unwrap_or(Path::new(".")).join(g)); }
+            }
+            let coarse = peregrine_geom::zoom::read_vtk_field(&vtk)?;
+            let spec = peregrine_geom::zoom::ZoomSpec { plane_z: plane, z_min: zmin, x_range: [bx[0], bx[2]], y_range: [bx[1], bx[3]], fine_dx: dx };
+            let (zp, notes) = peregrine_geom::zoom::zoom_project(&project, &coarse, &spec)?;
+            for n in &notes { println!("{n}"); }
+            let n_cells: f64 = [bx[2] - bx[0] + 6.0, bx[3] - bx[1] + 6.0, plane - zmin + 6.0].iter().map(|l| l / dx).product();
+            println!("box {:.0} x {:.0} x {:.0} mm at {dx} mm = about {:.1} M cells, about {:.1} GB of graphics memory", bx[2] - bx[0], bx[3] - bx[1], plane - zmin, n_cells / 1e6, n_cells * 77.0 / 1e9);
+            zp.save(&out)?;
+            println!("wrote {}", out.display());
+            Ok(())
         }
         Some("run") => {
             let proj = PathBuf::from(args.get(1).context("run <project>")?);

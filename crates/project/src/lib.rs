@@ -185,6 +185,9 @@ pub struct DomainSettings {
     /// of a mounted fan. Use when a fan mount leaks around the inlet because the fan body is not in the model. 0 = off.
     #[serde(default)]
     pub inlet_collar_mm: f64,
+    /// Simulate only this box (xmin, ymin, zmin, xmax, ymax, zmax in mm) instead of the whole model: a zoom run.
+    #[serde(default)]
+    pub crop: Option<[f64; 6]>,
     /// Gap sealer (mm): any air gap this thin between two solid surfaces (between parts, or inside one part) is closed.
     /// Real assemblies are tight where the CAD has small clearances. 0 = off.
     #[serde(default = "default_gap_seal")]
@@ -197,7 +200,7 @@ pub struct DomainSettings {
     pub faces: [FaceBc; 6],
 }
 impl Default for DomainSettings {
-    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, gap_seal_mm: 0.9, auto_seal_leaks: true, faces: [FaceBc::Open; 6] } }
+    fn default() -> Self { DomainSettings { padding_mm: 10.0, outlet_clearance_mm: 30.0, seam_tolerance_mm: 0.5, inlet_collar_mm: 0.0, crop: None, gap_seal_mm: 0.9, auto_seal_leaks: true, faces: [FaceBc::Open; 6] } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
