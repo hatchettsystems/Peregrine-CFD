@@ -1,6 +1,6 @@
 use crate::lbm::{port_cell_list, Engine, Lbm, LbmConfig, PortBc, PortInfo};
 use crate::units::Units;
-use peregrine_project::{FaceBc, PortKind, Project};
+use peregrine_project::{FaceBc, SourceKind, SplitMode, PortKind, Project};
 use peregrine_voxel::Domain;
 
 #[derive(Clone, Debug)]
@@ -12,6 +12,43 @@ pub struct PortReport {
     /// Mean static gauge pressure near the port (Pa).
     pub pressure_pa: f64,
     pub cells: usize,
+    /// Name of the port source this opening belongs to, if any.
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceReport {
+    pub name: String,
+    /// Total flow into the duct through all members (L/min).
+    pub total_flow_l_min: f64,
+    /// Mean static gauge pressure at the members (Pa).
+    pub pressure_pa: f64,
+    pub split: SplitMode,
+    /// Flow the controller is currently commanding (L/min) for forced splits, or plenum pressure (Pa).
+    pub commanded: f64,
+}
+
+/// Share a source's total flow (L/min) between members. `ByArea` gives each member flow proportional
+/// to its cross-section (equal velocity); `Weights` uses the manual weights. `Plenum` returns the
+/// by-area split as an initial estimate (the real split then follows the duct resistances).
+pub fn split_flows(areas: &[f64], weights: &[f64], split: SplitMode, q_total: f64) -> Vec<f64> {
+    let basis: Vec<f64> = match split {
+        SplitMode::Weights => weights.to_vec(),
+        _ => areas.to_vec(),
+    };
+    let sum: f64 = basis.iter().sum();
+    basis.iter().map(|b| if sum > 0.0 { q_total * b / sum } else { 0.0 }).collect()
+}
+
+struct SourceRt {
+    name: String,
+    source: SourceKind,
+    split: SplitMode,
+    members: Vec<usize>,
+    weights: Vec<f64>,
+    areas: Vec<f64>, // m^2, discrete cross-section of each member
+    q_cmd: f64,      // L/min (forced splits)
+    p_cmd: f64,      // Pa (plenum)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +73,7 @@ pub struct Simulation {
     port_dir: Vec<[f64; 3]>,
     /// Fixed inlet velocity vectors (lattice) ramped in over `RAMP_STEPS`.
     ramp_base: Vec<Option<[f32; 3]>>,
+    sources: Vec<SourceRt>,
 }
 
 fn snap(v: [f64; 3]) -> [i32; 3] {
@@ -72,7 +110,8 @@ impl Simulation {
         let mut dirs = vec![];
         for p in &project.ports {
             let inward_f = [-p.cap.normal[0], -p.cap.normal[1], -p.cap.normal[2]];
-            let area = p.cap.area() * 1e-6;
+            let dx_m = g.dx * 1e-3;
+            let area = (domain.port_cell_counts[meta.len()].max(1) as f64) * dx_m * dx_m;
             let bc = match &p.kind {
                 PortKind::VelocityInlet { speed } => PortBc::Velocity(dir_vel(inward_f, units.vel_to_lat(*speed))),
                 PortKind::FlowInlet { l_per_min } => {
@@ -85,6 +124,7 @@ impl Simulation {
                     PortBc::Velocity(dir_vel(inward_f, units.vel_to_lat(u)))
                 }
                 PortKind::PressureOutlet { pressure } => PortBc::Pressure(units.rho_lat(*pressure) as f32),
+                PortKind::SourceInlet { .. } => PortBc::Velocity([0.0; 3]),
             };
             infos.push(PortInfo { bc, inward: snap(inward_f) });
             meta.push((p.name.clone(), p.kind.clone(), area));
@@ -118,8 +158,28 @@ impl Simulation {
             #[cfg(not(feature = "gpu"))]
             Backend::Auto => Box::new(Lbm::new(cfg)),
         };
-        let mut sim = Simulation { engine, units, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base };
+        let mut sources = vec![];
+        for grp in &project.sources {
+            let members = project.members(&grp.name);
+            let areas: Vec<f64> = members.iter().map(|&k| meta[k].2).collect();
+            let weights: Vec<f64> = members.iter().map(|&k| match &project.ports[k].kind { PortKind::SourceInlet { weight, .. } => *weight, _ => 1.0 }).collect();
+            let sum_a: f64 = areas.iter().sum();
+            let q_target = match &grp.kind {
+                SourceKind::Flow { l_per_min } => Some(*l_per_min),
+                SourceKind::Velocity { speed } => Some(speed * sum_a * 60000.0),
+                SourceKind::Fan { .. } => None,
+            };
+            let q_cmd = q_target.unwrap_or_else(|| match &grp.kind { SourceKind::Fan { curve } => curve.last().map_or(1.0, |c| c.0) * 0.5, _ => 1.0 });
+            let p_cmd = match (&grp.kind, q_target) {
+                (SourceKind::Fan { curve }, _) => curve.first().map_or(0.0, |c| c.1) * 0.3,
+                (_, Some(q)) => 1.5 * 0.5 * project.fluid.density * (q / 60000.0 / sum_a.max(1e-12)).powi(2),
+                _ => 0.0,
+            };
+            sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, members, weights, areas, q_cmd, p_cmd });
+        }
+        let mut sim = Simulation { engine, units, dims: g.dims, cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
+        sim.apply_sources();
         Ok(sim)
     }
 
@@ -148,7 +208,11 @@ impl Simulation {
             }
             if self.engine.steps() % 100 == 0 && self.engine.steps() > 0 {
                 self.update_fans();
+                if self.engine.steps() >= RAMP_STEPS {
+                    self.update_sources();
+                }
             }
+            self.apply_sources();
             self.engine.step_n(c);
             left -= c;
         }
@@ -186,6 +250,97 @@ impl Simulation {
         }
     }
 
+    fn ramp_factor(&self) -> f32 {
+        let t = (self.engine.steps() as f32 / RAMP_STEPS as f32).min(1.0);
+        0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+    }
+
+    /// Push the source controllers' current commands to the member boundary conditions.
+    fn apply_sources(&mut self) {
+        let f = self.ramp_factor();
+        let mut updates: Vec<(usize, PortBc)> = vec![];
+        for g in &self.sources {
+            match g.split {
+                SplitMode::ByArea | SplitMode::Weights => {
+                    let flows = split_flows(&g.areas, &g.weights, g.split, g.q_cmd);
+                    for (i, &k) in g.members.iter().enumerate() {
+                        let u = flows[i] / 60000.0 / g.areas[i].max(1e-12);
+                        updates.push((k, PortBc::Velocity(dir_vel(self.port_dir[k], self.units.vel_to_lat(u) * f as f64))));
+                    }
+                }
+                SplitMode::Plenum => {
+                    let rho = self.units.rho_lat(g.p_cmd * f as f64) as f32;
+                    for &k in &g.members {
+                        updates.push((k, PortBc::Pressure(rho)));
+                    }
+                }
+            }
+        }
+        for (k, bc) in updates {
+            self.engine.set_port_bc(k, bc);
+        }
+    }
+
+    /// Measured total flow (L/min) and mean pressure (Pa) over a source's members.
+    fn source_measure(&mut self, gi: usize) -> (f64, f64) {
+        let members = self.sources[gi].members.clone();
+        let (mut q, mut p, mut n_tot) = (0.0, 0.0, 0.0);
+        for &k in &members {
+            let (rho, u_in, n) = self.port_stats(k);
+            q += self.units.vel_to_phys(u_in as f64) * n as f64 * self.units.dx * self.units.dx * 60000.0;
+            p += self.units.pressure(rho as f64) * n as f64;
+            n_tot += n as f64;
+        }
+        (q, p / n_tot.max(1.0))
+    }
+
+    fn update_sources(&mut self) {
+        for gi in 0..self.sources.len() {
+            let (q, p_in) = self.source_measure(gi);
+            let rho = self.units.rho;
+            let g = &mut self.sources[gi];
+            let sum_a: f64 = g.areas.iter().sum();
+            match (&g.source, g.split) {
+                (SourceKind::Flow { .. } | SourceKind::Velocity { .. }, SplitMode::ByArea | SplitMode::Weights) => {}
+                (SourceKind::Fan { curve }, SplitMode::ByArea | SplitMode::Weights) => {
+                    let target = curve_at(curve, q.max(0.0));
+                    let scale = target.abs().max(p_in.abs()).max(1.0);
+                    g.q_cmd = (g.q_cmd * (1.0 + 0.1 * ((target - p_in) / scale).clamp(-1.0, 1.0))).max(0.01);
+                }
+                (SourceKind::Fan { curve }, SplitMode::Plenum) => {
+                    let target = curve_at(curve, q.max(0.0));
+                    g.p_cmd += 0.2 * (target - g.p_cmd);
+                }
+                (src, SplitMode::Plenum) => {
+                    let q_t = match src {
+                        SourceKind::Flow { l_per_min } => *l_per_min,
+                        SourceKind::Velocity { speed } => speed * sum_a * 60000.0,
+                        _ => q,
+                    };
+                    let err = (q_t - q) / q_t.abs().max(1e-6);
+                    let p_dyn = 0.5 * rho * (q_t / 60000.0 / sum_a.max(1e-12)).powi(2);
+                    g.p_cmd += 0.15 * err.clamp(-1.0, 1.0) * g.p_cmd.abs().max(p_dyn);
+                }
+            }
+        }
+    }
+
+    pub fn source_reports(&mut self) -> Vec<SourceReport> {
+        (0..self.sources.len())
+            .map(|gi| {
+                let (q, p) = self.source_measure(gi);
+                let g = &self.sources[gi];
+                SourceReport {
+                    name: g.name.clone(),
+                    total_flow_l_min: q,
+                    pressure_pa: p,
+                    split: g.split,
+                    commanded: if g.split == SplitMode::Plenum { g.p_cmd } else { g.q_cmd },
+                }
+            })
+            .collect()
+    }
+
     pub fn max_speed(&mut self) -> f32 {
         let cells = &self.cells;
         let mac = self.engine.mac();
@@ -208,6 +363,7 @@ impl Simulation {
                     flow_l_min: flow,
                     pressure_pa: self.units.pressure(rho as f64),
                     cells: n,
+                    source: self.project_ports[k].1.source().map(|s| s.to_string()),
                 }
             })
             .collect()

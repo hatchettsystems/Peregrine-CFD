@@ -1,4 +1,6 @@
 //! Project file (TOML): body role rules, ports, fluid, domain and solver settings.
+pub mod presets;
+
 use peregrine_core::PortCap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -64,12 +66,52 @@ pub enum PortKind {
     FanInlet { curve: Vec<(f64, f64)> },
     /// Static (gauge) pressure in Pa.
     PressureOutlet { pressure: f64 },
+    /// Inlet fed by a [`Source`]; `weight` is used by the `Weights` split.
+    SourceInlet { source: String, weight: f64 },
 }
 
 impl PortKind {
     pub fn is_inlet(&self) -> bool {
         !matches!(self, PortKind::PressureOutlet { .. })
     }
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            PortKind::SourceInlet { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// What drives a port source as a whole.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SourceKind {
+    /// Total volumetric flow (L/min) shared by all members.
+    Flow { l_per_min: f64 },
+    /// Mean speed (m/s) over the combined cross-section of all members.
+    Velocity { speed: f64 },
+    /// One fan feeding all members: pressure rise (Pa) versus total flow (L/min).
+    Fan { curve: Vec<(f64, f64)> },
+}
+
+/// How the source's total is shared between its member openings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitMode {
+    /// Each member takes flow in proportion to its cross-section (equal velocity at every member).
+    ByArea,
+    /// Each member takes flow in proportion to its manual weight.
+    Weights,
+    /// Members share one plenum pressure; the flow divides by the resistance of each duct.
+    Plenum,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Source {
+    pub name: String,
+    pub kind: SourceKind,
+    pub split: SplitMode,
+    /// Name of the library fan the curve was taken from, if any (for estimate warnings).
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,9 +175,45 @@ pub struct Project {
     pub solver: SolverSettings,
     #[serde(default)]
     pub ports: Vec<Port>,
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 impl Project {
+    /// Indices of the ports that belong to `source`.
+    pub fn members(&self, source: &str) -> Vec<usize> {
+        (0..self.ports.len()).filter(|&i| self.ports[i].kind.source() == Some(source)).collect()
+    }
+
+    /// Human-readable problems that would stop a run (empty = ok).
+    pub fn validate(&self) -> Vec<String> {
+        let mut p = vec![];
+        for (i, a) in self.ports.iter().enumerate() {
+            if self.ports[..i].iter().any(|b| b.name == a.name) {
+                p.push(format!("two ports are named '{}'", a.name));
+            }
+            if let PortKind::SourceInlet { source, weight } = &a.kind {
+                match self.sources.iter().find(|g| &g.name == source) {
+                    None => p.push(format!("port '{}' belongs to unknown source '{source}'", a.name)),
+                    Some(g) if g.split == SplitMode::Weights && *weight <= 0.0 => p.push(format!("port '{}' has a non-positive weight", a.name)),
+                    _ => {}
+                }
+            }
+        }
+        for g in &self.sources {
+            if self.members(&g.name).is_empty() {
+                p.push(format!("source '{}' has no inlet ports assigned", g.name));
+            }
+        }
+        if !self.ports.iter().any(|p| p.kind.is_inlet()) {
+            p.push("define at least one inlet".into());
+        }
+        if !self.ports.iter().any(|p| !p.kind.is_inlet()) {
+            p.push("define at least one outlet".into());
+        }
+        p
+    }
+
     pub fn new(name: &str) -> Self {
         Project {
             name: name.into(),
@@ -145,6 +223,7 @@ impl Project {
             domain: Default::default(),
             solver: Default::default(),
             ports: vec![],
+            sources: vec![],
         }
     }
     pub fn load(path: &Path) -> anyhow::Result<Project> {
@@ -168,6 +247,22 @@ mod tests {
         assert_eq!(g.classify("nozzle"), BodyRole::Solid);
         assert_eq!(g.classify("ductwork_cover"), BodyRole::Solid);
     }
+    #[test]
+    fn source_validation() {
+        let cap = PortCap { origin: [0.0; 3], normal: [1.0, 0.0, 0.0], polygon: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]] };
+        let mut p = Project::new("g");
+        p.sources.push(Source { name: "fan".into(), kind: SourceKind::Flow { l_per_min: 10.0 }, split: SplitMode::ByArea, preset: None });
+        p.ports.push(Port { name: "a".into(), body: "d".into(), kind: PortKind::SourceInlet { source: "fan".into(), weight: 1.0 }, cap: cap.clone() });
+        p.ports.push(Port { name: "o".into(), body: "d".into(), kind: PortKind::PressureOutlet { pressure: 0.0 }, cap: cap.clone() });
+        assert!(p.validate().is_empty(), "{:?}", p.validate());
+        assert_eq!(p.members("fan"), vec![0]);
+        p.sources.push(Source { name: "empty".into(), kind: SourceKind::Flow { l_per_min: 1.0 }, split: SplitMode::ByArea, preset: None });
+        assert!(p.validate().iter().any(|m| m.contains("no inlet ports")));
+        let s = toml::to_string_pretty(&p).unwrap();
+        let q: Project = toml::from_str(&s).unwrap();
+        assert_eq!(q.sources.len(), 2);
+    }
+
     #[test]
     fn roundtrip() {
         let mut p = Project::new("t");

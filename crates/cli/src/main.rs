@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use peregrine_core::{shapes, stl};
 use peregrine_geom::{build_project_domain, duct_port_candidates, load_bodies};
-use peregrine_project::{Port, PortKind, Project};
+use peregrine_project::presets;
+use peregrine_project::{Port, PortKind, Project, Source, SourceKind, SplitMode};
 use peregrine_solver::{Backend, Simulation};
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,10 @@ const USAGE: &str = "peregrine <command>
   demo <dir>                       write a demo duct + nozzle block (STL) and a project file
   ports <project.toml>             list port candidates (planar openings) of the duct bodies
   set-port <project.toml> <#> <name> <kind>
-                                   define a port from candidate #; kind = velocity=<m/s> | flow=<L/min> | outlet=<Pa>
+                                   define a port from candidate #; kind = velocity=<m/s> | flow=<L/min> | outlet=<Pa> | source=<name>
+  fans                             list the built-in fan library
+  set-source <project.toml> <name> <spec> [area|weights|plenum]
+                                   define a source; spec = flow=<L/min> | velocity=<m/s> | fan=<library name or part> | fan=q:dp,q:dp,...
   run <project.toml> [--steps N] [--out DIR] [--cpu|--gpu]
                                    voxelize, solve, print the port report, write VTK";
 
@@ -28,6 +32,16 @@ fn real_main() -> Result<()> {
         Some("set-port") => {
             if args.len() < 5 { bail!("{USAGE}"); }
             set_port(Path::new(&args[1]), args[2].parse()?, &args[3], &args[4])
+        }
+        Some("fans") => {
+            for p in presets::fan_presets() {
+                println!("{:<52} {:>7.1} L/min  {:>7.1} Pa  {}", p.name, p.qmax_lpm, p.pmax_pa, if p.verified { "" } else { "(ESTIMATE)" });
+            }
+            Ok(())
+        }
+        Some("set-source") => {
+            if args.len() < 4 { bail!("{USAGE}"); }
+            set_source(Path::new(&args[1]), &args[2], &args[3], args.get(4).map(String::as_str))
         }
         Some("run") => {
             let proj = PathBuf::from(args.get(1).context("run <project>")?);
@@ -101,11 +115,11 @@ fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result
     let c = duct_port_candidates(&bodies, 0.5);
     let (body, cand) = c.get(index).with_context(|| format!("no candidate #{index}"))?;
     let (k, v) = kind.split_once('=').context("kind must look like velocity=5")?;
-    let v: f64 = v.parse()?;
     let kind = match k {
-        "velocity" => PortKind::VelocityInlet { speed: v },
-        "flow" => PortKind::FlowInlet { l_per_min: v },
-        "outlet" => PortKind::PressureOutlet { pressure: v },
+        "source" => PortKind::SourceInlet { source: v.to_string(), weight: 1.0 },
+        "velocity" => PortKind::VelocityInlet { speed: v.parse()? },
+        "flow" => PortKind::FlowInlet { l_per_min: v.parse()? },
+        "outlet" => PortKind::PressureOutlet { pressure: v.parse()? },
         _ => bail!("unknown port kind {k}"),
     };
     project.ports.retain(|p| p.name != name);
@@ -115,8 +129,45 @@ fn set_port(project_path: &Path, index: usize, name: &str, kind: &str) -> Result
     Ok(())
 }
 
+fn set_source(project_path: &Path, name: &str, spec: &str, split: Option<&str>) -> Result<()> {
+    let mut project = Project::load(project_path)?;
+    let (k, v) = spec.split_once('=').context("spec must look like flow=10")?;
+    let mut preset = None;
+    let kind = match k {
+        "flow" => SourceKind::Flow { l_per_min: v.parse()? },
+        "velocity" => SourceKind::Velocity { speed: v.parse()? },
+        "fan" => {
+            if let Some(p) = presets::fan_presets().into_iter().find(|p| p.name.to_lowercase().contains(&v.to_lowercase())) {
+                preset = Some(p.name.to_string());
+                SourceKind::Fan { curve: p.curve() }
+            } else {
+                let curve: Result<Vec<(f64, f64)>> = v.split(',').map(|pt| {
+                    let (q, dp) = pt.split_once(':').context("fan curve points look like q:dp")?;
+                    Ok((q.parse()?, dp.parse()?))
+                }).collect();
+                SourceKind::Fan { curve: curve? }
+            }
+        }
+        _ => bail!("unknown source kind {k}"),
+    };
+    let split = match split {
+        None | Some("area") => SplitMode::ByArea,
+        Some("weights") => SplitMode::Weights,
+        Some("plenum") => SplitMode::Plenum,
+        Some(o) => bail!("unknown split {o} (area|weights|plenum)"),
+    };
+    project.sources.retain(|s| s.name != name);
+    project.sources.push(Source { name: name.to_string(), kind, split, preset });
+    project.save(project_path)?;
+    println!("source '{name}' set; assign inlets with: set-port <project> <#> <port> source={name}");
+    Ok(())
+}
+
 fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) -> Result<()> {
     let (project, bodies) = load(project_path)?;
+    let problems = project.validate();
+    if !problems.is_empty() { bail!("project is not ready: {}", problems.join("; ")); }
+    for w in presets::preset_warnings(&project) { println!("warning: {w}"); }
     let domain = build_project_domain(&project, &bodies)?;
     let g = &domain.grid;
     let (gpu, cpu) = g.memory_estimate();
@@ -143,6 +194,9 @@ fn run(project_path: &Path, steps: Option<usize>, out: &Path, backend: Backend) 
         println!("step {done:>6}/{total}  net flow imbalance {net:+.3} L/min  max speed {:.2} m/s", { let ms = sim.max_speed() as f64; sim.units.vel_to_phys(ms) });
     }
     print!("{}", peregrine_post::format_report(&sim.report()));
+    for g in sim.source_reports() {
+        println!("source {:<12} total {:>8.2} L/min  pressure {:>8.1} Pa", g.name, g.total_flow_l_min, g.pressure_pa);
+    }
     let infl = sim.units.viscosity_inflation();
     if infl > 3.0 {
         println!("CAUTION: effective viscosity is {infl:.0}x physical at this cell size. Flow patterns are qualitative; pressure drops are overestimated. Refine the grid before trusting numbers.");

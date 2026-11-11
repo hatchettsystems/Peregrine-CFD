@@ -226,8 +226,11 @@ impl Lbm {
                 PortBc::Velocity(u) => (m[0], u),
                 PortBc::Pressure(r) => (r, [m[1], m[2], m[3]]),
             };
+            // Non-equilibrium extrapolation: equilibrium at the imposed state plus the neighbour's
+            // deviation from equilibrium. Much more stable (and accurate) than pure equilibrium.
             for i in 0..Q {
-                self.fnew[idx * Q + i] = feq(i, rho, u);
+                let neq = if nb != idx { self.fnew[nb * Q + i] - feq(i, m[0], [m[1], m[2], m[3]]) } else { 0.0 };
+                self.fnew[idx * Q + i] = feq(i, rho, u) + neq;
             }
             self.mac_new[idx] = [rho, u[0], u[1], u[2]];
         }

@@ -6,5 +6,5 @@ pub mod sim;
 pub mod units;
 
 pub use lbm::{Engine, Lbm, LbmConfig, PortBc, PortInfo};
-pub use sim::{Backend, PortReport, Simulation};
+pub use sim::{split_flows, Backend, SourceReport, PortReport, Simulation};
 pub use units::Units;

@@ -49,9 +49,10 @@ STEP -> bodies (name, mesh) -> role by name rules -> planar-face hole detection 
 2. [x] STEP import through an OpenCASCADE C++ shim (`crates/occt`): assembly tree, names, transforms, per-body meshes.
 3. [x] wgpu D3Q19 backend, parity-tested against the CPU solver (also runs on software Vulkan).
 4. [x] egui app with Photoshop-style theme: viewport, bodies/ports/results panels, live run, slice view.
-5. [ ] Streamlines, probes, screenshot export, per-port flow history plot.
-6. [ ] Accuracy: non-equilibrium-extrapolation inlets, Bouzidi walls, cumulant/regularized collision, local refinement; validate against OpenFOAM or measurement.
-7. [ ] Performance: AA-pattern single-buffer streaming, f16 storage, multi-buffer grids beyond the per-buffer limit.
+5. [x] Sources (fan/flow/velocity) feeding several openings, split by area / weights / shared plenum; right-click port assignment; fan library.
+6. [ ] Streamlines, probes, screenshot export, per-port flow history plot.
+7. [ ] Accuracy: non-equilibrium-extrapolation inlets, Bouzidi walls, cumulant/regularized collision, local refinement; validate against OpenFOAM or measurement.
+8. [ ] Performance: AA-pattern single-buffer streaming, f16 storage, multi-buffer grids beyond the per-buffer limit.
 
 ## Status
 

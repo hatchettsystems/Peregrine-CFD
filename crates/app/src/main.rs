@@ -5,10 +5,13 @@ mod theme;
 mod viewport;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
-use peregrine_core::{shapes, PortCandidate};
+use peregrine_core::port_cap::point_in_polygon;
+use peregrine_core::vec3::{dot, len, sub};
+use peregrine_core::{shapes, PortCandidate, PortCap};
 use peregrine_geom::{build_project_domain, domain_bounds, duct_port_candidates, load_bodies, Body};
-use peregrine_project::{BodyRole, Port, PortKind, Project};
-use peregrine_solver::{Backend, PortReport, Simulation};
+use peregrine_project::presets::{self, FanPreset};
+use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
+use peregrine_solver::{Backend, PortReport, Simulation, SourceReport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +23,8 @@ enum Tool { Orbit, Pan, PickPort, Slice }
 enum Tab { Bodies, Ports, Results }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field { Speed, Pressure }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target { Cand(usize), Port(usize) }
 
 #[derive(Default)]
 struct Snapshot {
@@ -33,6 +38,7 @@ struct Snapshot {
     speed: Vec<f32>,
     pressure: Vec<f32>,
     report: Vec<PortReport>,
+    sources: Vec<SourceReport>,
     inflation: f64,
     warnings: Vec<String>,
     finished: bool,
@@ -63,7 +69,7 @@ struct App {
     slice_axis: usize,
     slice_pos: f32,
     status: String,
-    new_name: String,
+    ctx_target: Option<Target>,
 }
 
 fn main() -> eframe::Result {
@@ -106,7 +112,7 @@ impl App {
             slice_axis: 1,
             slice_pos: 0.5,
             status: "Open a geometry file (STL) or load the demo to begin.".into(),
-            new_name: String::new(),
+            ctx_target: None,
         }
     }
 
@@ -148,8 +154,9 @@ impl App {
             Body { name: "nozzle".into(), role: BodyRole::Solid, mesh: nozzle },
         ];
         self.set_bodies(bodies);
-        self.add_port_from(0, "inlet", PortKind::VelocityInlet { speed: 8.0 });
-        self.add_port_from(1, "outlet", PortKind::PressureOutlet { pressure: 0.0 });
+        self.project.sources.push(Source { name: "fan".into(), kind: SourceKind::Velocity { speed: 8.0 }, split: SplitMode::ByArea, preset: None });
+        self.add_port_from(0, "inlet_1", PortKind::SourceInlet { source: "fan".into(), weight: 1.0 });
+        self.add_port_from(1, "outlet_1", PortKind::PressureOutlet { pressure: 0.0 });
         self.status = "Demo loaded: straight duct with a nozzle block. Press Simulation > Run.".into();
     }
 
@@ -204,9 +211,8 @@ impl App {
 
     fn can_run(&self) -> Result<(), String> {
         if self.bodies.is_empty() { return Err("no geometry loaded".into()); }
-        if !self.project.ports.iter().any(|p| p.kind.is_inlet()) { return Err("define at least one inlet".into()); }
-        if !self.project.ports.iter().any(|p| !p.kind.is_inlet()) { return Err("define at least one outlet".into()); }
-        Ok(())
+        let problems = self.project.validate();
+        if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) }
     }
 
     fn start_run(&mut self) {
@@ -230,6 +236,7 @@ impl App {
                     s.engine = sim.engine_name();
                     s.inflation = sim.units.viscosity_inflation();
                     s.warnings = sim.units.warnings();
+                    s.warnings.extend(presets::preset_warnings(&project));
                     if domain.odd_columns > 0 {
                         s.warnings.push(format!("{} ray columns crossed a surface an odd number of times; a body may not be watertight.", domain.odd_columns));
                     }
@@ -249,7 +256,9 @@ impl App {
                     let speed = mac.iter().zip(&cells).map(|(m, &c)| if c == 1 { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
                     let pressure = mac.iter().zip(&cells).map(|(m, &c)| if c == 1 { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
                     let report = sim.report();
+                    let sources = sim.source_reports();
                     let mut s = snap2.lock().unwrap();
+                    s.sources = sources;
                     s.step = done;
                     s.speed = speed;
                     s.pressure = pressure;
@@ -406,58 +415,318 @@ impl App {
         });
     }
 
-    fn ports_panel(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Detected openings", |ui| {
-            if self.candidates.is_empty() { ui.label(egui::RichText::new("None. Duct bodies need planar faces with openings.").color(theme::TEXT_DIM)); }
-            for i in 0..self.candidates.len() {
-                let (body, c) = &self.candidates[i];
-                let text = format!("#{i}  {body}   {:.1} mm2", c.area);
-                if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.tool = Tool::PickPort; }
+    // ---------- sources and port assignment ----------
+
+    fn port_for_cand(&self, i: usize) -> Option<usize> {
+        let (_, c) = self.candidates.get(i)?;
+        let ctr = c.cap.centroid();
+        self.project.ports.iter().position(|p| len(sub(p.cap.centroid(), ctr)) < 0.05 && dot(p.cap.normal, c.cap.normal) > 0.99)
+    }
+
+    fn resolve(&self, t: Target) -> Target {
+        if let Target::Cand(i) = t {
+            if let Some(p) = self.port_for_cand(i) { return Target::Port(p); }
+        }
+        t
+    }
+
+    fn target_cap(&self, t: Target) -> Option<&PortCap> {
+        match t {
+            Target::Cand(i) => self.candidates.get(i).map(|c| &c.1.cap),
+            Target::Port(i) => self.project.ports.get(i).map(|p| &p.cap),
+        }
+    }
+
+    fn select_target(&mut self, t: Target) {
+        match self.resolve(t) {
+            Target::Cand(i) => { self.sel_cand = Some(i); self.sel_port = None; }
+            Target::Port(i) => { self.sel_port = Some(i); self.sel_cand = (0..self.candidates.len()).find(|&c| self.port_for_cand(c) == Some(i)); }
+        }
+    }
+
+    fn unique_name(taken: impl Fn(&str) -> bool, prefix: &str) -> String {
+        (1..).map(|n| format!("{prefix}_{n}")).find(|n| !taken(n)).unwrap()
+    }
+
+    fn ensure_port(&mut self, t: Target, prefix: &str, kind: PortKind) -> Option<usize> {
+        match self.resolve(t) {
+            Target::Port(i) => { self.project.ports[i].kind = kind; Some(i) }
+            Target::Cand(i) => {
+                let (body, c) = self.candidates.get(i)?.clone();
+                let name = Self::unique_name(|n| self.project.ports.iter().any(|p| p.name == n), prefix);
+                self.project.ports.push(Port { name, body, kind, cap: c.cap });
+                Some(self.project.ports.len() - 1)
             }
-            if let Some(i) = self.sel_cand {
+        }
+    }
+
+    fn assign_to_source(&mut self, t: Target, source: &str) {
+        if let Some(i) = self.ensure_port(t, "inlet", PortKind::SourceInlet { source: source.into(), weight: 1.0 }) {
+            self.sel_port = Some(i);
+        }
+    }
+
+    fn make_outlet(&mut self, t: Target) {
+        if let Some(i) = self.ensure_port(t, "outlet", PortKind::PressureOutlet { pressure: 0.0 }) { self.sel_port = Some(i); }
+    }
+
+    fn add_source(&mut self, kind: SourceKind, prefix: &str, preset: Option<String>) -> String {
+        let name = Self::unique_name(|n| self.project.sources.iter().any(|s| s.name == n), prefix);
+        self.project.sources.push(Source { name: name.clone(), kind, split: SplitMode::ByArea, preset });
+        name
+    }
+
+    fn add_fan_preset(&mut self, p: &FanPreset) -> String {
+        self.add_source(SourceKind::Fan { curve: p.curve() }, "fan", Some(p.name.to_string()))
+    }
+
+    fn add_default_source(&mut self, which: u8) -> String {
+        match which {
+            0 => self.add_source(SourceKind::Fan { curve: vec![(0.0, 300.0), (20.0, 200.0), (40.0, 0.0)] }, "fan", None),
+            1 => self.add_source(SourceKind::Flow { l_per_min: 10.0 }, "flow", None),
+            _ => self.add_source(SourceKind::Velocity { speed: 5.0 }, "velocity", None),
+        }
+    }
+
+    fn rename_source(&mut self, old: &str, new: &str) {
+        for s in &mut self.project.sources { if s.name == old { s.name = new.to_string(); } }
+        for p in &mut self.project.ports {
+            if let PortKind::SourceInlet { source, .. } = &mut p.kind { if source == old { *source = new.to_string(); } }
+        }
+    }
+
+    fn remove_source(&mut self, name: &str) {
+        self.project.ports.retain(|p| p.kind.source() != Some(name));
+        self.project.sources.retain(|s| s.name != name);
+        self.sel_port = None;
+    }
+
+    fn hit_test(&self, rect: Rect, pos: Pos2) -> Option<Target> {
+        let mut items: Vec<(Target, &PortCap)> = vec![];
+        for (i, (_, c)) in self.candidates.iter().enumerate() { items.push((Target::Cand(i), &c.cap)); }
+        for (i, p) in self.project.ports.iter().enumerate() { items.push((Target::Port(i), &p.cap)); }
+        let mut inside: Option<(f64, Target)> = None;
+        let mut near: Option<(f32, Target)> = None;
+        for (t, cap) in items {
+            let pts: Vec<Option<(Pos2, f64)>> = cap.polygon.iter().map(|p| self.cam.project(rect, *p)).collect();
+            if pts.iter().any(|p| p.is_none()) || pts.len() < 3 { continue; }
+            let poly: Vec<[f64; 2]> = pts.iter().map(|p| { let q = p.unwrap().0; [q.x as f64, q.y as f64] }).collect();
+            let depth = self.cam.project(rect, cap.centroid()).map_or(f64::MAX, |p| p.1);
+            if point_in_polygon(&poly, [pos.x as f64, pos.y as f64]) && inside.map_or(true, |b| depth < b.0) { inside = Some((depth, t)); }
+            if let Some((c, _)) = self.cam.project(rect, cap.centroid()) {
+                let d = c.distance(pos);
+                if d < 18.0 && near.map_or(true, |b| d < b.0) { near = Some((d, t)); }
+            }
+        }
+        inside.map(|b| b.1).or(near.map(|b| b.1)).map(|t| self.resolve(t))
+    }
+
+    fn context_menu_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(t0) = self.ctx_target else {
+            ui.label("Right-click an opening to assign it.");
+            return;
+        };
+        let t = self.resolve(t0);
+        let title = match t {
+            Target::Port(i) => format!("Port '{}'", self.project.ports[i].name),
+            Target::Cand(i) => format!("Opening #{i}  ({:.1} mm²)", self.candidates[i].1.area),
+        };
+        ui.label(egui::RichText::new(title).strong());
+        ui.separator();
+        ui.menu_button("Assign to source", |ui| {
+            let names: Vec<String> = self.project.sources.iter().map(|s| s.name.clone()).collect();
+            for n in &names {
+                if ui.button(n).clicked() { self.assign_to_source(t, n); ui.close_menu(); }
+            }
+            if !names.is_empty() { ui.separator(); }
+            ui.menu_button("New fan source", |ui| {
+                if let Some(p) = fan_library_menu(ui) { let n = self.add_fan_preset(&p); self.assign_to_source(t, &n); ui.close_menu(); }
                 ui.separator();
-                ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut self.new_name); });
-                let name = if self.new_name.trim().is_empty() { format!("port_{i}") } else { self.new_name.trim().to_string() };
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Velocity inlet").clicked() { self.add_port_from(i, &name, PortKind::VelocityInlet { speed: 5.0 }); self.sel_cand = None; }
-                    if ui.button("Flow inlet").clicked() { self.add_port_from(i, &name, PortKind::FlowInlet { l_per_min: 5.0 }); self.sel_cand = None; }
-                    if ui.button("Fan inlet").clicked() { self.add_port_from(i, &name, PortKind::FanInlet { curve: vec![(0.0, 300.0), (20.0, 200.0), (40.0, 0.0)] }); self.sel_cand = None; }
-                    if ui.button("Pressure outlet").clicked() { self.add_port_from(i, &name, PortKind::PressureOutlet { pressure: 0.0 }); self.sel_cand = None; }
-                });
-            }
+                if ui.button("Custom fan curve").clicked() { let n = self.add_default_source(0); self.assign_to_source(t, &n); ui.close_menu(); }
+            });
+            if ui.button("New flow source").clicked() { let n = self.add_default_source(1); self.assign_to_source(t, &n); ui.close_menu(); }
+            if ui.button("New velocity source").clicked() { let n = self.add_default_source(2); self.assign_to_source(t, &n); ui.close_menu(); }
         });
-        theme::section(ui, "Boundary conditions", |ui| {
-            let mut remove = None;
-            for (i, p) in self.project.ports.iter_mut().enumerate() {
-                let col = if p.kind.is_inlet() { theme::INLET } else { theme::OUTLET };
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("■").color(col));
-                    if ui.selectable_label(self.sel_port == Some(i), &p.name).clicked() { self.sel_port = Some(i); }
-                    ui.label(egui::RichText::new(&p.body).color(theme::TEXT_DIM));
-                    if ui.small_button("x").on_hover_text("Remove").clicked() { remove = Some(i); }
+        if ui.button("Pressure outlet").clicked() { self.make_outlet(t); ui.close_menu(); }
+        if let Target::Port(i) = t {
+            ui.separator();
+            if ui.button("Show in Ports panel").clicked() { self.sel_port = Some(i); self.tab = Tab::Ports; ui.close_menu(); }
+            if ui.button("Remove port").clicked() { self.project.ports.remove(i); self.sel_port = None; ui.close_menu(); }
+        }
+    }
+
+    fn ports_panel(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Sources", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.menu_button("+ Fan", |ui| {
+                    if let Some(p) = fan_library_menu(ui) { self.add_fan_preset(&p); ui.close_menu(); }
+                    ui.separator();
+                    if ui.button("Custom fan curve").clicked() { self.add_default_source(0); ui.close_menu(); }
                 });
-                ui.indent(i, |ui| match &mut p.kind {
-                    PortKind::VelocityInlet { speed } => { ui.horizontal(|ui| { ui.label("Velocity"); ui.add(egui::DragValue::new(speed).speed(0.1).suffix(" m/s")); }); }
-                    PortKind::FlowInlet { l_per_min } => { ui.horizontal(|ui| { ui.label("Flow"); ui.add(egui::DragValue::new(l_per_min).speed(0.1).suffix(" L/min")); }); }
-                    PortKind::PressureOutlet { pressure } => { ui.horizontal(|ui| { ui.label("Pressure"); ui.add(egui::DragValue::new(pressure).speed(1.0).suffix(" Pa")); }); }
-                    PortKind::FanInlet { curve } => {
-                        ui.label("Fan curve: flow (L/min) -> pressure (Pa)");
+                if ui.button("+ Flow").clicked() { self.add_default_source(1); }
+                if ui.button("+ Velocity").clicked() { self.add_default_source(2); }
+            });
+            if self.project.sources.is_empty() {
+                ui.label(egui::RichText::new("Define a source first (a fan, a flow rate or a speed), then assign its inlet openings to it.").color(theme::TEXT_DIM));
+            }
+            self.sources_ui(ui);
+        });
+        theme::section(ui, "Openings", |ui| self.openings_ui(ui));
+        theme::section(ui, "Outlets", |ui| self.outlets_ui(ui));
+    }
+
+    fn sources_ui(&mut self, ui: &mut egui::Ui) {
+        let mut remove_src: Option<String> = None;
+        let mut rename: Option<(String, String)> = None;
+        let mut unassign: Option<usize> = None;
+        let mut replace: Option<(usize, FanPreset)> = None;
+        let mut assign_sel: Option<(usize, String)> = None;
+        for si in 0..self.project.sources.len() {
+            let name = self.project.sources[si].name.clone();
+            let members = self.project.members(&name);
+            let areas: Vec<f64> = members.iter().map(|&k| self.project.ports[k].cap.area()).collect();
+            let sum_a: f64 = areas.iter().sum();
+            let weights: Vec<f64> = members.iter().map(|&k| match &self.project.ports[k].kind { PortKind::SourceInlet { weight, .. } => *weight, _ => 1.0 }).collect();
+            let sum_w: f64 = weights.iter().sum();
+            let split = self.project.sources[si].split;
+            let sel_free = self.sel_cand.filter(|&c| self.port_for_cand(c).is_none());
+            egui::Frame::group(ui.style()).fill(theme::DEEP).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let id = ui.make_persistent_id(("srcname", si));
+                    let mut buf: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| name.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(110.0).font(FontId::proportional(12.0)));
+                    if r.lost_focus() {
+                        let nb = buf.trim().to_string();
+                        if !nb.is_empty() && nb != name && !self.project.sources.iter().any(|s| s.name == nb) { rename = Some((name.clone(), nb)); }
+                        buf = name.clone();
+                    } else if !r.has_focus() {
+                        buf = name.clone();
+                    }
+                    ui.data_mut(|d| d.insert_temp(id, buf));
+                    if ui.small_button("x").on_hover_text("Delete source and unassign its inlets").clicked() { remove_src = Some(name.clone()); }
+                });
+                let src = &mut self.project.sources[si];
+                let Source { kind, split, preset, .. } = src;
+                match kind {
+                    SourceKind::Flow { l_per_min } => { ui.horizontal(|ui| { ui.label("Total flow"); ui.add(egui::DragValue::new(l_per_min).speed(0.1).range(0.0..=2000.0).suffix(" L/min")); }); }
+                    SourceKind::Velocity { speed } => { ui.horizontal(|ui| { ui.label("Mean speed"); ui.add(egui::DragValue::new(speed).speed(0.1).range(0.0..=200.0).suffix(" m/s")); }); }
+                    SourceKind::Fan { curve } => {
+                        if let Some(pn) = preset.as_ref() {
+                            ui.label(egui::RichText::new(format!("Library: {pn}")).color(theme::TEXT_DIM));
+                            if let Some(p) = presets::find_preset(pn) {
+                                if !p.verified { ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), "Estimated curve - replace with datasheet values"); }
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            ui.menu_button("Library", |ui| { if let Some(p) = fan_library_menu(ui) { replace = Some((si, p)); ui.close_menu(); } });
+                            ui.label(egui::RichText::new("Fan curve: flow -> pressure").color(theme::TEXT_DIM));
+                        });
                         let mut del = None;
+                        let mut edited = false;
                         for (j, (q, dp)) in curve.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(q).speed(0.5).suffix(" L/min"));
-                                ui.add(egui::DragValue::new(dp).speed(1.0).suffix(" Pa"));
+                                edited |= ui.add(egui::DragValue::new(q).speed(0.5).suffix(" L/min")).changed();
+                                edited |= ui.add(egui::DragValue::new(dp).speed(1.0).suffix(" Pa")).changed();
                                 if ui.small_button("-").clicked() { del = Some(j); }
                             });
                         }
-                        if let Some(j) = del { if curve.len() > 2 { curve.remove(j); } }
-                        if ui.small_button("+ point").clicked() { let l = *curve.last().unwrap(); curve.push((l.0 + 10.0, (l.1 - 20.0).max(0.0))); }
+                        if let Some(j) = del { if curve.len() > 2 { curve.remove(j); edited = true; } }
+                        if ui.small_button("+ point").clicked() { let l = *curve.last().unwrap(); curve.push((l.0 + 10.0, (l.1 - 20.0).max(0.0))); edited = true; }
+                        if edited { *preset = None; }
                     }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Split");
+                    egui::ComboBox::from_id_salt(("split", si)).selected_text(match split { SplitMode::ByArea => "By cross-section", SplitMode::Weights => "Manual weights", SplitMode::Plenum => "Shared plenum pressure" }).show_ui(ui, |ui| {
+                        ui.selectable_value(split, SplitMode::ByArea, "By cross-section").on_hover_text("Each opening takes flow in proportion to its area (equal speed at every opening).");
+                        ui.selectable_value(split, SplitMode::Weights, "Manual weights").on_hover_text("Each opening takes flow in proportion to the weight you set.");
+                        ui.selectable_value(split, SplitMode::Plenum, "Shared plenum pressure").on_hover_text("All openings sit at one pressure and the flow divides by each duct's resistance (one fan over a manifold).");
+                    });
+                });
+                ui.label(egui::RichText::new(format!("Inlet openings ({})", members.len())).color(theme::TEXT_DIM));
+                for (j, &k) in members.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.sel_port == Some(k), &self.project.ports[k].name).clicked() { self.sel_port = Some(k); }
+                        ui.label(format!("{:.1} mm²", areas[j]));
+                        match split {
+                            SplitMode::ByArea => { ui.label(format!("{:.0}%", 100.0 * areas[j] / sum_a.max(1e-9))); }
+                            SplitMode::Weights => {
+                                if let PortKind::SourceInlet { weight, .. } = &mut self.project.ports[k].kind { ui.add(egui::DragValue::new(weight).speed(0.05).range(0.0..=1000.0).prefix("w ")); }
+                                ui.label(format!("{:.0}%", 100.0 * weights[j] / sum_w.max(1e-9)));
+                            }
+                            SplitMode::Plenum => { ui.label(egui::RichText::new("by resistance").color(theme::TEXT_DIM)); }
+                        }
+                        if ui.small_button("x").on_hover_text("Remove this inlet").clicked() { unassign = Some(k); }
+                    });
+                }
+                if let Some(c) = sel_free {
+                    if ui.button(format!("Assign opening #{c} here")).clicked() { assign_sel = Some((c, name.clone())); }
+                }
+            });
+        }
+        if let Some((si, p)) = replace {
+            self.project.sources[si].kind = SourceKind::Fan { curve: p.curve() };
+            self.project.sources[si].preset = Some(p.name.to_string());
+        }
+        if let Some((c, n)) = assign_sel { self.assign_to_source(Target::Cand(c), &n); }
+        if let Some(k) = unassign { self.project.ports.remove(k); self.sel_port = None; }
+        if let Some((o, n)) = rename { self.rename_source(&o, &n); }
+        if let Some(n) = remove_src { self.remove_source(&n); }
+    }
+
+    fn openings_ui(&mut self, ui: &mut egui::Ui) {
+        if self.candidates.is_empty() {
+            ui.label(egui::RichText::new("None. Duct bodies need planar faces with openings.").color(theme::TEXT_DIM));
+        }
+        ui.label(egui::RichText::new("Tip: right-click an opening in the 3D view to assign it.").color(theme::TEXT_DIM));
+        let mut act: Option<(usize, u8, String)> = None;
+        for i in 0..self.candidates.len() {
+            let status = match self.port_for_cand(i).map(|k| &self.project.ports[k].kind) {
+                Some(PortKind::PressureOutlet { .. }) => "outlet".to_string(),
+                Some(k) => format!("inlet <- {}", k.source().unwrap_or("?")),
+                None => "unassigned".to_string(),
+            };
+            let (body, c) = &self.candidates[i];
+            let text = format!("#{i}  {body}  {:.1} mm²  [{status}]", c.area);
+            if ui.selectable_label(self.sel_cand == Some(i), text).clicked() { self.sel_cand = Some(i); self.sel_port = self.port_for_cand(i); }
+        }
+        if let Some(i) = self.sel_cand {
+            ui.horizontal_wrapped(|ui| {
+                ui.menu_button("Assign to source", |ui| {
+                    for s in self.project.sources.iter() { if ui.button(&s.name).clicked() { act = Some((i, 0, s.name.clone())); ui.close_menu(); } }
+                    if self.project.sources.is_empty() { ui.label("Create a source first"); }
+                });
+                if ui.button("Pressure outlet").clicked() { act = Some((i, 1, String::new())); }
+                if self.port_for_cand(i).is_some() && ui.button("Unassign").clicked() { act = Some((i, 2, String::new())); }
+            });
+        }
+        if let Some((i, what, src)) = act {
+            match what {
+                0 => self.assign_to_source(Target::Cand(i), &src),
+                1 => self.make_outlet(Target::Cand(i)),
+                _ => { if let Some(k) = self.port_for_cand(i) { self.project.ports.remove(k); self.sel_port = None; } }
+            }
+        }
+    }
+
+    fn outlets_ui(&mut self, ui: &mut egui::Ui) {
+        let mut remove = None;
+        let mut any = false;
+        for i in 0..self.project.ports.len() {
+            let sel = self.sel_port == Some(i);
+            let p = &mut self.project.ports[i];
+            if let PortKind::PressureOutlet { pressure } = &mut p.kind {
+                any = true;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("■").color(theme::OUTLET));
+                    if ui.selectable_label(sel, &p.name).clicked() { self.sel_port = Some(i); }
+                    ui.add(egui::DragValue::new(pressure).speed(1.0).suffix(" Pa"));
+                    if ui.small_button("x").clicked() { remove = Some(i); }
                 });
             }
-            if let Some(i) = remove { self.project.ports.remove(i); self.sel_port = None; }
-            if self.project.ports.is_empty() { ui.label(egui::RichText::new("No ports yet. Pick an opening above.").color(theme::TEXT_DIM)); }
-        });
+        }
+        if !any { ui.label(egui::RichText::new("No outlets yet. Right-click an opening > Pressure outlet.").color(theme::TEXT_DIM)); }
+        if let Some(i) = remove { self.project.ports.remove(i); self.sel_port = None; }
     }
 
     fn results_panel(&mut self, ui: &mut egui::Ui) {
@@ -473,14 +742,29 @@ impl App {
             for w in &s.warnings { ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), w); }
             if s.inflation > 3.0 { ui.colored_label(Color32::from_rgb(0xF2, 0xD0, 0x3A), format!("Viscosity is {:.0}x physical at this cell size: patterns are qualitative, pressures overestimated.", s.inflation)); }
         });
-        theme::section(ui, "Ports", |ui| {
+        theme::section(ui, "Flow report", |ui| {
             egui::Grid::new("rep").striped(true).show(ui, |ui| {
-                for h in ["Port", "Flow L/min", "Pressure Pa"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
+                for h in ["Port", "Flow L/min", "Pressure Pa", "Share"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
                 ui.end_row();
-                for r in &s.report {
+                for g in &s.sources {
+                    ui.label(egui::RichText::new(&g.name).strong().color(theme::INLET));
+                    ui.label(format!("{:.2}", g.total_flow_l_min));
+                    ui.label(format!("{:.1}", g.pressure_pa));
+                    ui.label(match g.split { SplitMode::Plenum => format!("plenum {:.0} Pa", g.commanded), _ => format!("cmd {:.1}", g.commanded) });
+                    ui.end_row();
+                    for r in s.report.iter().filter(|r| r.source.as_deref() == Some(g.name.as_str())) {
+                        ui.label(format!("   {}", r.name));
+                        ui.label(format!("{:.2}", r.flow_l_min));
+                        ui.label(format!("{:.1}", r.pressure_pa));
+                        ui.label(format!("{:.0}%", 100.0 * r.flow_l_min / g.total_flow_l_min.abs().max(1e-9)));
+                        ui.end_row();
+                    }
+                }
+                for r in s.report.iter().filter(|r| r.source.is_none()) {
                     ui.label(egui::RichText::new(&r.name).color(if r.inlet { theme::INLET } else { theme::OUTLET }));
                     ui.label(format!("{:.2}", r.flow_l_min));
                     ui.label(format!("{:.1}", r.pressure_pa));
+                    ui.label("");
                     ui.end_row();
                 }
             });
@@ -515,7 +799,7 @@ impl App {
         // input
         let d = resp.drag_delta();
         let pan = resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) || (self.tool == Tool::Pan && resp.dragged_by(egui::PointerButton::Primary));
-        if pan { self.cam.pan(rect, d.x, d.y); } else if resp.dragged_by(egui::PointerButton::Primary) && self.tool != Tool::PickPort { self.cam.orbit(d.x, d.y); }
+        if pan { self.cam.pan(rect, d.x, d.y); } else if resp.dragged_by(egui::PointerButton::Primary) { self.cam.orbit(d.x, d.y); }
         if resp.hovered() { self.cam.zoom(ui.input(|i| i.smooth_scroll_delta.y)); }
 
         // geometry
@@ -529,8 +813,9 @@ impl App {
             let s = snap.lock().unwrap();
             if !s.speed.is_empty() { draw_slice(&painter, rect, &self.cam, &s, self.field, self.slice_axis, self.slice_pos); }
         }
-        // port caps
+        // port caps: unassigned openings in grey, assigned ports coloured
         for (i, (_, c)) in self.candidates.iter().enumerate() {
+            if self.port_for_cand(i).is_some() { continue; }
             let sel = self.sel_cand == Some(i);
             viewport::draw_polygon(&painter, rect, &self.cam, &c.cap.polygon, Stroke::new(if sel { 2.5 } else { 1.0 }, if sel { theme::ACCENT } else { Color32::from_gray(200) }));
         }
@@ -538,22 +823,36 @@ impl App {
             let col = if p.kind.is_inlet() { theme::INLET } else { theme::OUTLET };
             viewport::draw_polygon(&painter, rect, &self.cam, &p.cap.polygon, Stroke::new(if self.sel_port == Some(i) { 3.5 } else { 2.5 }, col));
             if let Some((pos, _)) = self.cam.project(rect, p.cap.centroid()) {
-                painter.text(pos + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, &p.name, FontId::proportional(11.0), col);
+                let label = match p.kind.source() { Some(sname) => format!("{} <- {}", p.name, sname), None => p.name.clone() };
+                painter.text(pos + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), col);
             }
         }
-        // pick
-        if self.tool == Tool::PickPort && resp.clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let mut best = (30.0f32, None);
-                for (i, (_, c)) in self.candidates.iter().enumerate() {
-                    if let Some((p, _)) = self.cam.project(rect, c.cap.centroid()) {
-                        let dd = p.distance(pos);
-                        if dd < best.0 { best = (dd, Some(i)); }
-                    }
-                }
-                if best.1.is_some() { self.sel_cand = best.1; self.tab = Tab::Ports; }
+        // hover highlight, left-click select, right-click menu
+        let hover = if resp.hovered() { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
+        if let (Some(t), Some(pos)) = (hover, resp.hover_pos()) {
+            if let Some(cap) = self.target_cap(t) {
+                viewport::draw_polygon(&painter, rect, &self.cam, &cap.polygon, Stroke::new(3.0, theme::ACCENT));
+            }
+            let text = match t {
+                Target::Port(i) => format!("{}  - right-click to edit", self.project.ports[i].name),
+                Target::Cand(i) => format!("Opening #{i}  {:.1} mm²  - right-click to assign", self.candidates[i].1.area),
+            };
+            let galley = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+            let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), galley.size() + Vec2::new(10.0, 6.0));
+            painter.rect_filled(r, 2.0, Color32::from_black_alpha(200));
+            painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
+        }
+        if resp.clicked() {
+            if let Some(t) = resp.interact_pointer_pos().and_then(|pp| self.hit_test(rect, pp)) {
+                self.select_target(t);
+                self.tab = Tab::Ports;
             }
         }
+        if resp.secondary_clicked() {
+            self.ctx_target = resp.interact_pointer_pos().and_then(|pp| self.hit_test(rect, pp));
+            if let Some(t) = self.ctx_target { self.select_target(t); }
+        }
+        resp.context_menu(|ui| self.context_menu_ui(ui));
         // axis gizmo
         let o = Pos2::new(rect.min.x + 40.0, rect.max.y - 40.0);
         for (v, c, n) in [([1.0, 0.0, 0.0], Color32::from_rgb(0xE0, 0x5A, 0x4F), "X"), ([0.0, 1.0, 0.0], Color32::from_rgb(0x4F, 0xC0, 0x5A), "Y"), ([0.0, 0.0, 1.0], Color32::from_rgb(0x4F, 0x8F, 0xE0), "Z")] {
@@ -584,6 +883,15 @@ impl App {
             });
         });
     }
+}
+
+fn fan_library_menu(ui: &mut egui::Ui) -> Option<FanPreset> {
+    let mut chosen = None;
+    for p in presets::fan_presets() {
+        let label = format!("{}{}", p.name, if p.verified { "" } else { "  (estimate)" });
+        if ui.button(label).on_hover_text(p.note).clicked() { chosen = Some(p); }
+    }
+    chosen
 }
 
 fn field_range(s: &Snapshot, f: Field) -> (f32, f32) {

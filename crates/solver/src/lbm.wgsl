@@ -137,6 +137,10 @@ fn port_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         rho = pg.prm.y;
         u = mnb.yzw;
     }
-    for (var i = 0u; i < Q; i = i + 1u) { f_out[i * n + pc.idx] = feq(i, rho, u); }
+    for (var i = 0u; i < Q; i = i + 1u) {
+        var neq = 0.0;
+        if (pc.nb != pc.idx) { neq = f_out[i * n + pc.nb] - feq(i, mnb.x, mnb.yzw); }
+        f_out[i * n + pc.idx] = feq(i, rho, u) + neq;
+    }
     mac[pc.idx] = vec4<f32>(rho, u);
 }
