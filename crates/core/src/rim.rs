@@ -767,3 +767,124 @@ impl EdgeGraph {
         Some(path)
     }
 }
+
+/// Openings found from how exposed each surface is. Every smooth surface patch is labelled "enclosed" (it faces
+/// into a channel: most rays leaving it hit the part again) or "exposed" (it faces open air). The closed edge
+/// loops where an enclosed patch meets an exposed one are the mouths of the channels, whatever their shape:
+/// flat or curved, round, slotted, triangular or notched. Unlike the other detectors it needs no flat face and no
+/// particular edge sharpness.
+pub fn find_exposure_openings(mesh: &TriMesh, feature_angle_deg: f64, min_perimeter: f64, max_perimeter: f64) -> Vec<CurvedOpening> {
+    let mesh = mesh.welded(1e-5);
+    let nt = mesh.triangles.len();
+    if nt == 0 {
+        return vec![];
+    }
+    let cos_tol = feature_angle_deg.to_radians().cos();
+    let normals: Vec<V3> = (0..nt).map(|i| { let [a, b, c] = mesh.tri(i); normalize(cross(sub(b, a), sub(c, a))) }).collect();
+    let areas: Vec<f64> = (0..nt).map(|i| { let [a, b, c] = mesh.tri(i); 0.5 * len(cross(sub(b, a), sub(c, a))) }).collect();
+    let mut edges: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (i, t) in mesh.triangles.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(i);
+        }
+    }
+    // smooth patches
+    let mut region = vec![usize::MAX; nt];
+    let mut members: Vec<Vec<usize>> = vec![];
+    for s in 0..nt {
+        if region[s] != usize::MAX { continue; }
+        let id = members.len();
+        let mut stack = vec![s];
+        region[s] = id;
+        let mut list = vec![];
+        while let Some(t) = stack.pop() {
+            list.push(t);
+            let tv = mesh.triangles[t];
+            for k in 0..3 {
+                let (a, b) = (tv[k], tv[(k + 1) % 3]);
+                let nb = &edges[&(a.min(b), a.max(b))];
+                if nb.len() != 2 { continue; }
+                for &t2 in nb {
+                    if region[t2] == usize::MAX && dot(normals[t], normals[t2]) >= cos_tol {
+                        region[t2] = id;
+                        stack.push(t2);
+                    }
+                }
+            }
+        }
+        members.push(list);
+    }
+    // exposure of each patch: sample its largest triangles
+    let grid = RayGrid::new(&mesh);
+    let hemi: Vec<[f64; 3]> = {
+        let n = 20usize;
+        (0..n).map(|i| {
+            let z = 0.26 + 0.74 * (i as f64 + 0.5) / n as f64; // cos of the polar angle, away from grazing
+            let r = (1.0 - z * z).sqrt();
+            let a = i as f64 * 2.399_963; // golden angle
+            [r * a.cos(), r * a.sin(), z]
+        }).collect()
+    };
+    let enclosed: Vec<bool> = members.iter().map(|list| {
+        let mut idx = list.clone();
+        idx.sort_by(|&a, &b| areas[b].partial_cmp(&areas[a]).unwrap());
+        idx.truncate(6);
+        let mut open = 0usize;
+        let mut total = 0usize;
+        for &t in &idx {
+            let [a, b, c] = mesh.tri(t);
+            let ctr = scale(add(add(a, b), c), 1.0 / 3.0);
+            let n = normals[t];
+            let (u, v) = basis(n);
+            let o = add(ctr, scale(n, 0.05));
+            for h in &hemi {
+                let d = normalize(add(add(scale(u, h[0]), scale(v, h[1])), scale(n, h[2])));
+                total += 1;
+                if !grid.any_hit(o, d, 1e6) { open += 1; }
+            }
+        }
+        total > 0 && (open as f64 / total as f64) < 0.3
+    }).collect();
+    // boundary edges between an enclosed patch and an exposed one, directed along the enclosed triangle
+    let mut next: HashMap<u32, Vec<u32>> = HashMap::new();
+    for t in 0..nt {
+        if !enclosed[region[t]] { continue; }
+        let tv = mesh.triangles[t];
+        for k in 0..3 {
+            let (a, b) = (tv[k], tv[(k + 1) % 3]);
+            let nb = &edges[&(a.min(b), a.max(b))];
+            let has_exposed = nb.iter().any(|&x| x != t && !enclosed[region[x]]);
+            if has_exposed {
+                next.entry(a).or_default().push(b);
+            }
+        }
+    }
+    let mut out: Vec<CurvedOpening> = vec![];
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
+    for s in starts {
+        while next.get(&s).map_or(false, |v| !v.is_empty()) {
+            let mut lp = vec![s];
+            let mut cur = s;
+            let mut closed = false;
+            loop {
+                let Some(nx) = next.get_mut(&cur).and_then(|v| v.pop()) else { break };
+                if nx == s { closed = true; break; }
+                lp.push(nx);
+                cur = nx;
+                if lp.len() > 20000 { break; }
+            }
+            if !closed || lp.len() < 6 { continue; }
+            let points: Vec<V3> = lp.iter().map(|&i| mesh.vertices[i as usize]).collect();
+            let perimeter: f64 = (0..points.len()).map(|i| len(sub(points[(i + 1) % points.len()], points[i]))).sum();
+            if perimeter < min_perimeter || perimeter > max_perimeter { continue; }
+            let (c, n) = loop_frame(&points);
+            let planarity_dev = points.iter().map(|p| dot(sub(*p, c), n).abs()).fold(0.0, f64::max);
+            if let Some(cap) = cap_from_loop_with_grid(&points, &grid) {
+                out.push(CurvedOpening { cap, perimeter, planarity_dev, confidence: 0.5 });
+            }
+        }
+    }
+    out
+}

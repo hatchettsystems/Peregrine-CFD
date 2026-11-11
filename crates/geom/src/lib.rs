@@ -127,6 +127,22 @@ pub fn duct_port_candidates(bodies: &[Body], ducts: &[DuctDef], min_area: f64, h
                 planar_kept.push(cand);
             }
         }
+        if curved {
+            // second opinion: mouths found from surface exposure (any shape; no flat face or sharp edge needed)
+            for o in peregrine_core::find_exposure_openings(&mesh, 25.0, 6.0, 400.0) {
+                let area = o.cap.area();
+                if area < min_area.max(3.0) { continue; }
+                let dup = planar_kept.iter().any(|c| {
+                    let near = len(sub(c.cap.centroid(), o.cap.centroid())) < 1.5 + 0.15 * (c.area.max(area)).sqrt();
+                    near && (c.area - area).abs() <= 0.35 * c.area.max(area)
+                });
+                if dup { continue; }
+                let circ = (4.0 * std::f64::consts::PI * area / (o.perimeter * o.perimeter)).min(1.0);
+                let cand = PortCandidate { area, parent_area: 0.0, circularity: circ, equiv_diameter: 2.0 * (area / std::f64::consts::PI).sqrt(), visibility: 1.0, clearance: 1.0, cap: o.cap };
+                if hide_round_below.map_or(false, |dm| cand.is_screw_hole(dm)) { continue; }
+                planar_kept.push(cand);
+            }
+        }
         // A loop lying inside another coplanar, same-facing loop is an island of the larger opening (a hub or
         // boss): subtract it, so the opening is the area BETWEEN the loops.
         nest_islands(&mut planar_kept);
