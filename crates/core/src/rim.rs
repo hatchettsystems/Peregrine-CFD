@@ -692,3 +692,78 @@ pub fn find_curved_openings_with(mesh: &TriMesh, prm: &CurvedParams) -> Vec<Curv
     out.sort_by(|a, b| b.cap.area().partial_cmp(&a.cap.area()).unwrap());
     out
 }
+
+/// Edge graph of a welded mesh for tracing a loop by hand: vertex-to-vertex paths that prefer sharp (crease) edges.
+pub struct EdgeGraph {
+    adj: Vec<Vec<(u32, f32, bool)>>, // neighbour, length, is a sharp/boundary edge
+}
+
+impl EdgeGraph {
+    pub fn new(mesh: &TriMesh, feature_angle_deg: f64) -> EdgeGraph {
+        let cos_tol = feature_angle_deg.to_radians().cos();
+        let nt = mesh.triangles.len();
+        let normals: Vec<V3> = (0..nt).map(|i| { let [a, b, c] = mesh.tri(i); normalize(cross(sub(b, a), sub(c, a))) }).collect();
+        let mut edges: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (i, t) in mesh.triangles.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                edges.entry((a.min(b), a.max(b))).or_default().push(i);
+            }
+        }
+        let mut adj: Vec<Vec<(u32, f32, bool)>> = vec![vec![]; mesh.vertices.len()];
+        for ((a, b), tris) in edges {
+            let sharp = tris.len() != 2 || dot(normals[tris[0]], normals[tris[1]]) < cos_tol;
+            let l = len(sub(mesh.vertices[a as usize], mesh.vertices[b as usize])) as f32;
+            adj[a as usize].push((b, l, sharp));
+            adj[b as usize].push((a, l, sharp));
+        }
+        EdgeGraph { adj }
+    }
+
+    /// Shortest path of vertex ids from `a` to `b` (inclusive). Smooth (non-crease) edges cost `smooth_penalty` times
+    /// their length, so the path follows a rim where there is one and still bridges soft or filleted stretches.
+    pub fn path(&self, a: u32, b: u32, smooth_penalty: f32) -> Option<Vec<u32>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let n = self.adj.len();
+        if a as usize >= n || b as usize >= n {
+            return None;
+        }
+        let mut dist = vec![f32::INFINITY; n];
+        let mut prev = vec![u32::MAX; n];
+        let mut heap = BinaryHeap::new();
+        dist[a as usize] = 0.0;
+        heap.push((Reverse(0f32.to_bits()), a));
+        while let Some((Reverse(db), u)) = heap.pop() {
+            let d = f32::from_bits(db);
+            if d > dist[u as usize] {
+                continue;
+            }
+            if u == b {
+                break;
+            }
+            for &(v, l, sharp) in &self.adj[u as usize] {
+                let nd = d + l * if sharp { 1.0 } else { smooth_penalty };
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    prev[v as usize] = u;
+                    heap.push((Reverse(nd.to_bits()), v));
+                }
+            }
+        }
+        if !dist[b as usize].is_finite() {
+            return None;
+        }
+        let mut path = vec![b];
+        let mut cur = b;
+        while cur != a {
+            cur = prev[cur as usize];
+            if cur == u32::MAX {
+                return None;
+            }
+            path.push(cur);
+        }
+        path.reverse();
+        Some(path)
+    }
+}

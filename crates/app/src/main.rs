@@ -7,7 +7,7 @@ mod viewport;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use peregrine_core::port_cap::point_in_polygon;
 use peregrine_core::vec3::{dot, len, sub};
-use peregrine_core::{cap_from_loop_with_grid, external_visibility, inward_clearance, shapes, smooth_region_loops, PortCandidate, PortCap, RayGrid, TriMesh};
+use peregrine_core::{cap_from_loop_with_grid, external_visibility, inward_clearance, shapes, smooth_region_loops, EdgeGraph, PortCandidate, PortCap, RayGrid, TriMesh};
 use peregrine_geom::{apply_roles, build_project_domain, domain_bounds, duct_port_candidates, load_bodies, project_bounds, Body};
 use peregrine_project::presets::{self, FanPreset};
 use peregrine_project::{BodyRole, Port, PortKind, Project, Source, SourceKind, SplitMode};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use viewport::Camera;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool { Orbit, Pan, PickPort, Slice, Rim }
+enum Tool { Orbit, Pan, PickPort, Slice, Rim, Draw }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Bodies, Ports, Results }
 /// What the active tab asks the tab shell to do after the frame.
@@ -91,6 +91,15 @@ struct App {
     screw_max_d: f64,
     detect_curved: bool,
     show_hidden: bool,
+    draw_close_requested: bool,
+    draw_undo_requested: bool,
+    draw_clear_requested: bool,
+    // hand-drawn edge loop
+    draw_pts: Vec<u32>,
+    draw_body: Option<usize>,
+    draw_path: Vec<u32>,
+    draw_marks: Vec<usize>,
+    draw_graph: Option<(usize, EdgeGraph)>,
     rim_loops: Vec<RimInfo>,
     rim_sel: Option<usize>,
     rim_body: Option<usize>,
@@ -182,6 +191,14 @@ impl App {
             screw_max_d: 6.0,
             detect_curved: true,
             show_hidden: false,
+            draw_close_requested: false,
+            draw_undo_requested: false,
+            draw_clear_requested: false,
+            draw_pts: vec![],
+            draw_body: None,
+            draw_path: vec![],
+            draw_marks: vec![],
+            draw_graph: None,
             rim_loops: vec![],
             rim_sel: None,
             rim_body: None,
@@ -300,6 +317,81 @@ impl App {
             }
             None => self.status = "Could not build a cap for that loop.".into(),
         }
+    }
+
+    // ---------- hand-drawn edge loop ----------
+
+    fn draw_clear(&mut self) {
+        self.draw_pts.clear();
+        self.draw_path.clear();
+        self.draw_marks.clear();
+        self.draw_body = None;
+    }
+
+    fn draw_undo(&mut self) {
+        if self.draw_pts.pop().is_some() {
+            self.draw_marks.pop();
+            let keep = self.draw_marks.last().copied().unwrap_or(0);
+            self.draw_path.truncate(keep.max(if self.draw_pts.is_empty() { 0 } else { 1 }));
+            if self.draw_pts.is_empty() { self.draw_clear(); }
+        }
+    }
+
+    /// Add a clicked mesh vertex to the hand-drawn loop, joined to the previous point along the mesh edges.
+    fn draw_add_vertex(&mut self, body: usize, v: u32) {
+        if self.draw_body != Some(body) {
+            self.draw_clear();
+            self.draw_body = Some(body);
+        }
+        if self.draw_graph.as_ref().map_or(true, |g| g.0 != body) {
+            self.draw_graph = Some((body, EdgeGraph::new(&self.bodies[body].mesh, 25.0)));
+        }
+        if let Some(&last) = self.draw_pts.last() {
+            if last == v { return; }
+            if let Some(path) = self.draw_graph.as_ref().and_then(|g| g.1.path(last, v, 4.0)) {
+                self.draw_path.extend(path.into_iter().skip(1));
+            } else {
+                self.status = "Those two points are not connected on the surface.".into();
+                return;
+            }
+        } else {
+            self.draw_path.push(v);
+        }
+        self.draw_pts.push(v);
+        self.draw_marks.push(self.draw_path.len());
+        self.status = format!("{} point(s). Keep clicking along the rim; click the first point again or press Enter to close the loop.", self.draw_pts.len());
+    }
+
+    /// Close the hand-drawn loop (last point back to the first) and turn it into a scored, addable loop.
+    fn draw_close(&mut self) {
+        let (Some(body), Some(&first), Some(&last)) = (self.draw_body, self.draw_pts.first(), self.draw_pts.last()) else { return };
+        if self.draw_pts.len() < 3 {
+            self.status = "Click at least 3 points around the opening first.".into();
+            return;
+        }
+        if let Some(path) = self.draw_graph.as_ref().and_then(|g| g.1.path(last, first, 4.0)) {
+            self.draw_path.extend(path.into_iter().skip(1));
+        }
+        // drop the repeated first vertex at the end
+        if self.draw_path.len() > 1 && self.draw_path.last() == self.draw_path.first() { self.draw_path.pop(); }
+        let mesh = &self.bodies[body].mesh;
+        let points: Vec<[f64; 3]> = self.draw_path.iter().map(|&v| mesh.vertices[v as usize]).collect();
+        let perimeter: f64 = (0..points.len()).map(|i| { let (a, b) = (points[i], points[(i + 1) % points.len()]); ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() }).sum();
+        let (c, n) = peregrine_core::rim::loop_frame(&points);
+        let planarity_dev = points.iter().map(|p| ((p[0] - c[0]) * n[0] + (p[1] - c[1]) * n[1] + (p[2] - c[2]) * n[2]).abs()).fold(0.0, f64::max);
+        let l = peregrine_core::RimLoop { points, perimeter, planarity_dev };
+        let (_, duct_mesh) = self.duct_mesh_and_name(body);
+        let grid = RayGrid::new(&duct_mesh);
+        let (vis, clear) = match cap_from_loop_with_grid(&l.points, &grid) {
+            Some(cap) => (external_visibility(&cap, &grid), inward_clearance(&cap, &grid, 5.0)),
+            None => (0.0, 0.0),
+        };
+        self.rim_body = Some(body);
+        self.rim_loops = vec![RimInfo { l, vis, clear }];
+        self.rim_sel = Some(0);
+        self.draw_clear();
+        self.tab = Tab::Ports;
+        self.status = "Loop closed. Press 'Add as opening' to use it as an opening.".into();
     }
 
     fn suggested_bodies(&self) -> Vec<usize> {
@@ -662,7 +754,7 @@ impl App {
 
     fn options_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice", Tool::Rim => "Curved Opening" }).strong());
+            ui.label(egui::RichText::new(match self.tool { Tool::Orbit => "Orbit", Tool::Pan => "Pan", Tool::PickPort => "Port Pick", Tool::Slice => "Slice", Tool::Rim => "Curved Opening", Tool::Draw => "Draw Loop" }).strong());
             ui.separator();
             ui.label("Cell size");
             ui.add(egui::DragValue::new(&mut self.project.solver.cell_size_mm).speed(0.01).range(0.05..=2.0).suffix(" mm"));
@@ -694,7 +786,7 @@ impl App {
     fn tool_palette(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.vertical_centered(|ui| {
-            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Rim, "Curved opening: click the rim or the wall at a non-flat opening (R)"), (Tool::Slice, "Slice (S)")] {
+            for (t, tip) in [(Tool::Orbit, "Orbit (O)"), (Tool::Pan, "Pan (H)"), (Tool::PickPort, "Port pick (P)"), (Tool::Rim, "Curved opening: click the rim or the wall at a non-flat opening (R)"), (Tool::Draw, "Draw an edge loop by hand: click points along the rim (L)"), (Tool::Slice, "Slice (S)")] {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
                 let selected = self.tool == t;
                 let bg = if selected { theme::ACCENT } else if resp.hovered() { theme::WIDGET_HOVER } else { theme::WIDGET };
@@ -1163,6 +1255,17 @@ impl App {
             ui.label(egui::RichText::new("None. Duct bodies need planar faces with openings.").color(theme::TEXT_DIM));
         }
         ui.label(egui::RichText::new("Tip: right-click an opening in the 3D view to assign it. For a curved (non-flat) opening use the Curved Opening tool (R) and click its rim.").color(theme::TEXT_DIM));
+        if self.tool == Tool::Draw || !self.draw_pts.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Draw an edge loop").strong());
+            ui.label(egui::RichText::new("Click points in order along the edge of the opening. Each click is joined to the previous one along the mesh edges, following sharp edges. Click the first point (green) again, or press Enter, to close the loop. Backspace undoes a point, Esc clears.").color(theme::TEXT_DIM));
+            ui.horizontal(|ui| {
+                ui.label(format!("{} point(s)", self.draw_pts.len()));
+                if ui.add_enabled(self.draw_pts.len() >= 3, egui::Button::new("Close loop")).clicked() { self.draw_close(); }
+                if ui.add_enabled(!self.draw_pts.is_empty(), egui::Button::new("Undo point")).clicked() { self.draw_undo(); }
+                if ui.add_enabled(!self.draw_pts.is_empty(), egui::Button::new("Clear")).clicked() { self.draw_clear(); }
+            });
+        }
         if !self.rim_loops.is_empty() {
             ui.separator();
             ui.label(egui::RichText::new("Edge loops at your click").strong());
@@ -1405,6 +1508,17 @@ impl App {
             let sel = self.rim_sel == Some(li);
             viewport::draw_polygon(&painter, rect, &self.cam, &l.l.points, Stroke::new(if sel { 3.5 } else { 1.5 }, if sel { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::from_rgb(0xB0, 0x90, 0x30) }));
         }
+        // hand-drawn loop preview
+        if let Some(bi) = self.draw_body {
+            let mesh = &self.bodies[bi].mesh;
+            let pts: Vec<Pos2> = self.draw_path.iter().filter_map(|&v| self.cam.project(rect, mesh.vertices[v as usize]).map(|x| x.0)).collect();
+            if pts.len() > 1 { painter.add(Shape::line(pts, Stroke::new(3.0, Color32::from_rgb(0xFF, 0xD0, 0x40)))); }
+            for (k, &v) in self.draw_pts.iter().enumerate() {
+                if let Some((q, _)) = self.cam.project(rect, mesh.vertices[v as usize]) {
+                    painter.circle_filled(q, if k == 0 { 6.0 } else { 4.0 }, if k == 0 { Color32::from_rgb(0x3F, 0xB9, 0x50) } else { Color32::WHITE });
+                }
+            }
+        }
         // hover highlight, left-click select, right-click menu
         let hover = if resp.hovered() { resp.hover_pos().and_then(|pp| self.hit_test(rect, pp)) } else { None };
         if let (Some(t), Some(pos)) = (hover, resp.hover_pos()) {
@@ -1433,7 +1547,24 @@ impl App {
                 }
             }
         }
-        if resp.clicked() && self.tool == Tool::Rim {
+        if resp.clicked() && self.tool == Tool::Draw {
+            if let Some(pp) = resp.interact_pointer_pos() {
+                match self.pick_body_tri(rect, pp) {
+                    Some((bi, ti)) => {
+                        // nearest corner of the clicked triangle
+                        let tri = self.bodies[bi].mesh.triangles[ti];
+                        let proj = self.cam.projector(rect);
+                        let best = tri.iter().filter_map(|&v| proj.project(self.bodies[bi].mesh.vertices[v as usize]).map(|(q, _)| (q.distance(pp), v))).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        if let Some((_, v)) = best {
+                            // clicking the first point again closes the loop
+                            let near_first = self.draw_body == Some(bi) && self.draw_pts.len() >= 3 && self.draw_pts.first().and_then(|&f| proj.project(self.bodies[bi].mesh.vertices[f as usize])).map_or(false, |(q, _)| q.distance(pp) < 14.0);
+                            if near_first { self.draw_close(); } else { self.draw_add_vertex(bi, v); }
+                        }
+                    }
+                    None => self.status = "Click on the part's surface, on the edge of the opening.".into(),
+                }
+            }
+        } else if resp.clicked() && self.tool == Tool::Rim {
             if let Some(pp) = resp.interact_pointer_pos() {
                 match self.pick_body_tri(rect, pp) {
                     Some((bi, ti)) => self.rim_pick(bi, ti),
@@ -1619,6 +1750,12 @@ fn draw_tool_icon(p: &egui::Painter, r: Rect, t: Tool) {
             let pts: Vec<Pos2> = (0..=24).map(|k| { let a = k as f32 / 24.0 * std::f32::consts::TAU; c + Vec2::new(8.5 * a.cos(), 5.5 * a.sin() + 2.5 * (2.0 * a).cos()) }).collect();
             p.add(Shape::line(pts, s));
         }
+        Tool::Draw => {
+            // a pen drawing a loop
+            let pts: Vec<Pos2> = (0..=18).map(|k| { let a = k as f32 / 18.0 * std::f32::consts::TAU * 0.92; c + Vec2::new(8.0 * a.cos(), 6.5 * a.sin()) }).collect();
+            p.add(Shape::line(pts, s));
+            p.circle_filled(c + Vec2::new(8.0, 0.0), 2.2, Color32::WHITE);
+        }
         Tool::Slice => {
             p.rect_stroke(Rect::from_center_size(c, Vec2::splat(16.0)), 0.0, s, egui::StrokeKind::Inside);
             p.line_segment([c - Vec2::new(8.0, -3.0), c + Vec2::new(8.0, 3.0)], s);
@@ -1687,6 +1824,9 @@ impl App {
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.draw_close_requested) { self.draw_close(); }
+        if std::mem::take(&mut self.draw_undo_requested) { self.draw_undo(); }
+        if std::mem::take(&mut self.draw_clear_requested) { self.draw_clear(); }
         ctx.input(|i| {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::T) { self.cmds.push(ShellCmd::New); }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::W) { self.cmds.push(ShellCmd::Close(self.tab_active)); }
@@ -1697,6 +1837,12 @@ impl App {
             if i.key_pressed(egui::Key::P) { self.tool = Tool::PickPort; }
             if i.key_pressed(egui::Key::S) { self.tool = Tool::Slice; }
             if i.key_pressed(egui::Key::R) { self.tool = Tool::Rim; }
+            if i.key_pressed(egui::Key::L) { self.tool = Tool::Draw; }
+            if self.tool == Tool::Draw {
+                if i.key_pressed(egui::Key::Enter) { self.draw_close_requested = true; }
+                if i.key_pressed(egui::Key::Backspace) { self.draw_undo_requested = true; }
+                if i.key_pressed(egui::Key::Escape) { self.draw_clear_requested = true; }
+            }
             if i.key_pressed(egui::Key::M) {
                 self.mesh_mode = match self.mesh_mode { MeshMode::Shaded => MeshMode::Ghost, MeshMode::Ghost => MeshMode::Hidden, MeshMode::Hidden => MeshMode::Shaded };
             }

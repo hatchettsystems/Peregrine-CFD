@@ -89,3 +89,41 @@ fn visibility_and_clearance_tell_real_openings_from_internal_loops() {
     };
     assert!(inward_clearance(&pocket, &grid, 5.0) < 0.2, "pocket clearance {}", inward_clearance(&pocket, &grid, 5.0));
 }
+
+#[test]
+fn manual_loop_follows_the_rim_between_clicked_points() {
+    use peregrine_core::{cap_from_loop, EdgeGraph};
+    let m = tube();
+    let g = EdgeGraph::new(&m, 25.0);
+    // four vertices spread around the inner rim (radius 4, far end), as a user would click them
+    let on_rim = |angle_deg: f64| -> u32 {
+        let (s, c) = angle_deg.to_radians().sin_cos();
+        let want = [0.0, 4.0 * c, 4.0 * s];
+        (0..m.vertices.len() as u32)
+            .filter(|&i| m.vertices[i as usize][0] > 27.0)
+            .min_by(|&a, &b| {
+                let da = (m.vertices[a as usize][1] - want[1]).hypot(m.vertices[a as usize][2] - want[2]) + (4.0 - (m.vertices[a as usize][1].hypot(m.vertices[a as usize][2]))).abs();
+                let db = (m.vertices[b as usize][1] - want[1]).hypot(m.vertices[b as usize][2] - want[2]) + (4.0 - (m.vertices[b as usize][1].hypot(m.vertices[b as usize][2]))).abs();
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap()
+    };
+    let picks = [on_rim(0.0), on_rim(90.0), on_rim(180.0), on_rim(270.0)];
+    let mut loop_pts: Vec<[f64; 3]> = vec![];
+    for k in 0..4 {
+        let path = g.path(picks[k], picks[(k + 1) % 4], 4.0).expect("path");
+        for &v in &path[..path.len() - 1] {
+            loop_pts.push(m.vertices[v as usize]);
+        }
+    }
+    let perim: f64 = (0..loop_pts.len()).map(|i| len(sub(loop_pts[(i + 1) % loop_pts.len()], loop_pts[i]))).sum();
+    // the rim is a saddle curve, so compare with the true 3D rim length found automatically
+    let seed = (0..m.triangles.len()).find(|&i| { let [a, b, c] = m.tri(i); let ctr = scale(add(add(a, b), c), 1.0 / 3.0); let r = ctr[1].hypot(ctr[2]); ctr[0] > 27.0 && r > 4.3 && r < 5.7 }).unwrap();
+    let auto = smooth_region_loops(&m, seed, 25.0);
+    let expect = auto.iter().map(|l| l.perimeter).fold(f64::INFINITY, f64::min);
+    assert!((perim - expect).abs() / expect < 0.03, "hand-traced loop length {perim} vs rim {expect}");
+    // every traced point sits on the inner rim, not cutting across the wall or the rim band
+    assert!(loop_pts.iter().all(|p| (p[1].hypot(p[2]) - 4.0).abs() < 0.05), "path left the inner rim");
+    let cap = cap_from_loop(&loop_pts, &m).expect("cap from a hand-drawn loop");
+    assert!(cap.normal[0] > 0.9);
+}
