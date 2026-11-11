@@ -3,6 +3,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: write
 jobs:
   build:
     runs-on: windows-2022
@@ -33,7 +39,23 @@ jobs:
       - name: Package
         shell: pwsh
         run: ./scripts/package-windows.ps1
+      # Only the newest build is kept: each zip is large, and old ones fill the repository's artifact storage,
+      # which makes the upload hang and fail.
+      - name: Delete older Windows artifacts
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const arts = await github.paginate(github.rest.actions.listArtifactsForRepo, { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 });
+            for (const a of arts) {
+              if (a.name === 'peregrine-windows-x64') {
+                await github.rest.actions.deleteArtifact({ owner: context.repo.owner, repo: context.repo.repo, artifact_id: a.id });
+              }
+            }
       - uses: actions/upload-artifact@v4
         with:
           name: peregrine-windows-x64
           path: dist/peregrine-windows-x64.zip
+          retention-days: 7
+          compression-level: 0
