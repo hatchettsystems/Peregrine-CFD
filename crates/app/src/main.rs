@@ -2537,6 +2537,30 @@ fn probe_cell(s: &Snapshot, p: [f64; 3]) -> Option<(f32, f32)> {
     Some((s.pressure[i], s.speed[i]))
 }
 
+/// True when a fluid cell is enclosed by walls (inside a duct) rather than in the open air around it:
+/// walls are met within reach in at least four of the six axis directions.
+fn inside_duct(s: &Snapshot, p: [f64; 3]) -> bool {
+    let mut c = [0usize; 3];
+    for k in 0..3 {
+        let g = ((p[k] - s.origin[k]) / s.dx).floor();
+        if g < 0.0 || g >= s.dims[k] as f64 { return false; }
+        c[k] = g as usize;
+    }
+    let reach = ((40.0 / s.dx) as usize).clamp(20, 400); // look up to about 40 mm each way
+    let mut walls = 0;
+    for axis in 0..3 {
+        for dir in [-1i64, 1] {
+            let mut q = [c[0] as i64, c[1] as i64, c[2] as i64];
+            for _ in 0..reach {
+                q[axis] += dir;
+                if q[axis] < 0 || q[axis] >= s.dims[axis] as i64 { break; }
+                if s.cells[q[0] as usize + s.dims[0] * (q[1] as usize + s.dims[1] * q[2] as usize)] == 1 { walls += 1; break; }
+            }
+        }
+    }
+    walls >= 4
+}
+
 /// The first fluid cell along the view ray through a screen point: the point (mm), its pressure (Pa) and speed (m/s).
 fn probe_ray(s: &Snapshot, cam: &Camera, rect: Rect, pos: Pos2) -> Option<([f64; 3], f32, f32)> {
     let (o, d) = cam.ray(rect, pos);
@@ -2557,7 +2581,9 @@ fn probe_ray(s: &Snapshot, cam: &Camera, rect: Rect, pos: Pos2) -> Option<([f64;
     let mut t = t0 + 1e-6;
     while t < t1 {
         let pt = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
-        if let Some((pr, sp)) = probe_cell(s, pt) { return Some((pt, pr, sp)); }
+        if let Some((pr, sp)) = probe_cell(s, pt) {
+            if inside_duct(s, pt) { return Some((pt, pr, sp)); }
+        }
         t += step;
     }
     None
