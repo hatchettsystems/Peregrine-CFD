@@ -86,7 +86,7 @@ fn real_main() -> Result<()> {
             let (zp, notes) = peregrine_geom::zoom::zoom_project(&project, &coarse, &spec)?;
             for n in &notes { println!("{n}"); }
             let n_cells: f64 = [bx[2] - bx[0] + 6.0, bx[3] - bx[1] + 6.0, plane - zmin + 6.0].iter().map(|l| l / dx).product();
-            println!("box {:.0} x {:.0} x {:.0} mm at {dx} mm = about {:.1} M cells, about {:.1} GB of graphics memory", bx[2] - bx[0], bx[3] - bx[1], plane - zmin, n_cells / 1e6, n_cells * 77.0 / 1e9);
+            println!("box {:.0} x {:.0} x {:.0} mm at {dx} mm = about {:.1} M cells, about {:.1} GB of graphics memory", bx[2] - bx[0], bx[3] - bx[1], plane - zmin, n_cells / 1e6, n_cells * 172.0 / 1e9);
             zp.save(&out)?;
             println!("wrote {}", out.display());
             Ok(())

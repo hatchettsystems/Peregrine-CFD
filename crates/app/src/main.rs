@@ -46,6 +46,8 @@ fn classify_issue(msg: &str) -> Issue {
         (Sev::Warning, "Air leaks out of the duct".to_string())
     } else if msg.starts_with("Reference speed raised") {
         (Sev::Info, "Reference speed raised".to_string())
+    } else if msg.starts_with("The graphics card was NOT used") {
+        (Sev::Error, "Running on the CPU: the GPU was not used".to_string())
     } else if msg.contains("coarser than some walls") {
         (Sev::Warning, "Cells coarser than the thinnest walls".to_string())
     } else if msg.starts_with("Possible intentional") {
@@ -840,7 +842,7 @@ impl App {
             let b = project_bounds(&self.project, &self.bodies);
             let dx = self.project.solver.cell_size_mm;
             let n: f64 = (0..3).map(|i| ((b.max[i] - b.min[i]) / dx).ceil().max(1.0)).product();
-            let gpu_gb = n * 77.0 / 1e9;
+            let gpu_gb = n * 172.0 / 1e9;
             if gpu_gb > 7.0 {
                 let ok_dx = dx * (gpu_gb / 6.5).cbrt();
                 return Err(format!("a {dx:.2} mm grid is {:.0} M cells and needs about {gpu_gb:.1} GB of graphics memory (an 8 GB card has about 7 GB free). Use a cell size of {ok_dx:.2} mm or larger, or crop the model.", n / 1e6));
@@ -896,6 +898,9 @@ impl App {
                             s.warnings.push(format!("Reference speed raised to {:.1} m/s: the estimated peak flow speed is higher than the project setting.", sim.ref_speed));
                         }
                         s.warnings.extend(sim.units.warnings());
+                        if let Some(why) = &sim.gpu_fallback {
+                            s.warnings.push(format!("The graphics card was NOT used: {why}. This run is on the CPU, which is far slower and needs system memory (about 170 bytes per cell). Use a larger cell size or a smaller box so the grid fits on the card."));
+                        }
                     }
                     let mut done = 0;
                     // Steps between display updates. Each update reads the field back and rebuilds the speed / pressure /
@@ -1983,7 +1988,7 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.zoom_dx).speed(0.01).range(0.05..=1.0).suffix(" mm"));
             });
             let n: f64 = [self.zoom_box[2] - self.zoom_box[0] + 6.0, self.zoom_box[3] - self.zoom_box[1] + 6.0, self.zoom_plane - self.zoom_zmin + 6.0].iter().map(|l| l.max(1.0) / self.zoom_dx).product();
-            ui.label(egui::RichText::new(format!("about {:.1} M cells, {:.1} GB of graphics memory", n / 1e6, n * 77.0 / 1e9)).color(theme::TEXT_DIM));
+            ui.label(egui::RichText::new(format!("about {:.1} M cells, {:.1} GB of graphics memory", n / 1e6, n * 172.0 / 1e9)).color(theme::TEXT_DIM));
             let ready = !s.vel.is_empty() && !s.cells.is_empty();
             if ui.add_enabled(ready, egui::Button::new("Create zoom simulation (new tab)")).on_hover_text("Needs a finished or running coarse simulation in this tab").clicked() {
                 let coarse = peregrine_geom::zoom::CoarseField { dims: s.dims, origin: s.origin, dx: s.dx, cells: s.cells.to_vec(), vel: s.vel.to_vec() };

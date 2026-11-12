@@ -40,7 +40,8 @@ impl Grid {
     /// Rough memory (bytes) of a D3Q19 f32 solver: single-buffer GPU layout and double-buffer CPU layout.
     pub fn memory_estimate(&self) -> (u64, u64) {
         let n = self.len() as u64;
-        (n * 19 * 4 + n, n * 19 * 4 * 2 + n * 17)
+        // GPU: two distribution buffers (19 floats each), the velocity/density field (16 bytes), the cell codes (4)
+        (n * (2 * 19 * 4 + 16 + 4), n * 19 * 4 * 2 + n * 17)
     }
 }
 

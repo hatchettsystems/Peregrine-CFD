@@ -70,6 +70,8 @@ const CHUNK: usize = 25;
 
 pub struct Simulation {
     engine: Box<dyn Engine>,
+    /// Why the run is on the CPU although a GPU was wanted (Auto backend), if it is.
+    pub gpu_fallback: Option<String>,
     pub units: Units,
     /// Reference speed (m/s) that fixed the time step; may be higher than the project's setting.
     pub ref_speed: f64,
@@ -201,6 +203,7 @@ impl Simulation {
             _ => None,
         }).collect();
         let port_cells = port_cell_list(&cfg);
+        let mut gpu_fallback: Option<String> = None;
         let engine: Box<dyn Engine> = match backend {
             Backend::Cpu => Box::new(Lbm::new(cfg)),
             #[cfg(feature = "gpu")]
@@ -208,7 +211,7 @@ impl Simulation {
             #[cfg(feature = "gpu")]
             Backend::Auto => match crate::gpu::GpuLbm::new(&cfg) {
                 Ok(g) => Box::new(g),
-                Err(_) => Box::new(Lbm::new(cfg.clone())),
+                Err(e) => { gpu_fallback = Some(format!("{e:#}")); Box::new(Lbm::new(cfg.clone())) }
             },
             #[cfg(not(feature = "gpu"))]
             Backend::Gpu => anyhow::bail!("built without the gpu feature"),
@@ -234,7 +237,7 @@ impl Simulation {
             };
             sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, gain: vec![1.0; members.len()], members, weights, areas, q_cmd, p_cmd });
         }
-        let mut sim = Simulation { engine, units, ref_speed, dims: g.dims, origin_mm: g.origin, dx_mm: g.dx, face_open: project.domain.faces.map(|f| f == FaceBc::Open), cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
+        let mut sim = Simulation { engine, gpu_fallback, units, ref_speed, dims: g.dims, origin_mm: g.origin, dx_mm: g.dx, face_open: project.domain.faces.map(|f| f == FaceBc::Open), cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
         sim.apply_sources();
         Ok(sim)
