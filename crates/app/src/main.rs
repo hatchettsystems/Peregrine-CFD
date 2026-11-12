@@ -820,6 +820,35 @@ impl App {
         self.status = "Demo loaded: straight duct with a nozzle block. Press Simulation > Run.".into();
     }
 
+    /// A duct whose exit (4 mm) is much smaller than its inlet (10 mm), fed by a small blower: the restriction chokes the
+    /// source, so the pressure inside rises, the exit jet is fast, and the delivered flow drops.
+    fn load_restriction_sample(&mut self) {
+        self.reset_history();
+        self.project = Project::new("restriction sample");
+        self.project.solver.cell_size_mm = 0.4;
+        self.project.solver.reference_speed = 0.0;
+        self.project.solver.max_steps = 5000;
+        self.project.domain.padding_mm = 4.0;
+        let main = shapes::hollow_tube(14.0, 10.0, 30.0);
+        let mut tip = shapes::hollow_tube(14.0, 4.0, 10.0);
+        tip.translate([30.0, 0.0, 0.0]);
+        self.set_bodies(vec![
+            Body { name: "duct_main (10 mm bore)".into(), role: BodyRole::Duct, mesh: main },
+            Body { name: "exit_tip (4 mm bore)".into(), role: BodyRole::Duct, mesh: tip },
+        ]);
+        self.define_duct_from(&[0, 1], "duct");
+        let curve = vec![(0.0, 300.0), (5.0, 280.0), (10.0, 230.0), (15.0, 150.0), (20.0, 0.0)];
+        self.project.sources.push(Source { name: "blower".into(), kind: SourceKind::Fan { curve }, split: SplitMode::ByArea, preset: None, streamlines: 60 });
+        // the end openings: the far-left facing one and the far-right facing one (not the joint between the parts)
+        let ends = |sign: f64| self.candidates.iter().enumerate().filter(|(_, (_, c))| c.cap.normal[0] * sign > 0.5).min_by(|a, b| (sign * -a.1 .1.cap.origin[0]).total_cmp(&(sign * -b.1 .1.cap.origin[0]))).map(|(i, _)| i);
+        let inlet = ends(-1.0);
+        let outlet = ends(1.0);
+        if let Some(i) = inlet { self.add_port_from(i, "inlet_1", PortKind::SourceInlet { source: "blower".into(), weight: 1.0 }); }
+        if let Some(o) = outlet { self.add_port_from(o, "outlet_1", PortKind::PressureOutlet { pressure: 0.0 }); }
+        self.mesh_mode = MeshMode::Ghost;
+        self.status = "Restriction sample loaded: 10 mm duct into a 4 mm exit. Run it, then colour the streamlines by Pressure and compare with a wider exit.".into();
+    }
+
     fn open_geometry(&mut self, path: PathBuf) {
         match load_bodies(&path, &self.project) {
             Ok(b) => {
@@ -1112,6 +1141,7 @@ impl App {
                 if ui.button("Save Project").clicked() { self.save_project(); ui.close_menu(); }
                 ui.separator();
                 if ui.button("Load Demo").clicked() { self.load_demo(); ui.close_menu(); }
+                if ui.button("Load Restriction Sample").on_hover_text("A duct that narrows to a small exit, to see pressure build up and flow drop").clicked() { self.load_restriction_sample(); ui.close_menu(); }
                 if ui.button("Quit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             });
             ui.menu_button("Edit", |ui| {
