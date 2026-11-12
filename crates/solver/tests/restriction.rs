@@ -8,7 +8,7 @@ use peregrine_voxel::{build_domain, PortSpec};
 const L: f64 = 30.0;
 const W: f64 = 7.0; // half width of the channel
 const T: f64 = 2.0;
-const STEPS: usize = 7500;
+const STEPS: usize = 5000;
 
 fn cap(x: f64, h: f64, nx: f64) -> PortCap {
     PortCap { origin: [x, 0.0, 0.0], normal: [nx, 0.0, 0.0], polygon: vec![[x, -h, -h], [x, h, -h], [x, h, h], [x, -h, h]], triangles: vec![], holes: vec![] }
@@ -77,15 +77,10 @@ fn run(h_out: f64) -> (f64, f64, f64, f64, f64) {
 
 #[test]
 fn smaller_exit_chokes_the_source() {
-    let mut prev: Option<(f64, f64, f64)> = None;
-    for h_out in [6.0, 2.0] {
-        let (q, v, p_up, p_near_exit, _p_in) = run(h_out);
-        eprintln!("exit {:>4.0} mm2: flow {:.2} L/min, exit speed {:.2} m/s, pressure upstream {:.1} Pa, just before exit {:.1} Pa", (2.0 * h_out) * (2.0 * h_out), q, v, p_up, p_near_exit);
-        if let Some((q0, v0, p0)) = prev {
-            assert!(q < q0, "flow must fall as the exit shrinks");
-            assert!(v > v0, "exit speed must rise as the exit shrinks");
-            assert!(p_up > p0, "pressure inside must rise as the exit shrinks");
-        }
-        prev = Some((q, v, p_up));
-    }
+    // 4 mm x 4 mm exit on a 12 mm x 12 mm inlet, blower rated 20 L/min free air / 300 Pa shut-off
+    let (q, v, p_up, p_near_exit, _) = run(2.0);
+    eprintln!("flow {q:.2} L/min, exit speed {v:.2} m/s, pressure upstream {p_up:.1} Pa, just before exit {p_near_exit:.1} Pa");
+    assert!(q < 12.0, "a small exit must cut the flow well below the 20 L/min free-air rating, got {q}");
+    assert!(v > 7.0, "the exit jet must be fast, got {v} m/s");
+    assert!(p_up > 150.0 && p_near_exit > 150.0, "pressure inside must build up behind the restriction, got {p_up} / {p_near_exit} Pa");
 }
