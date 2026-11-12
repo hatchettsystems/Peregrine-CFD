@@ -50,6 +50,22 @@ impl Camera {
         let (r, u, f) = self.axes();
         Projector { r, u, f, eye: self.eye(), focal: rect.height() as f64 * 0.5 / (35f64.to_radians() * 0.5).tan(), center: rect.center() }
     }
+    /// Camera data for the graphics-card renderer (same projection as [`Camera::project`]).
+    pub fn gl_uniform(&self, rect: Rect) -> crate::viewport_gl::CamUniform {
+        let (r, u, f) = self.axes();
+        let eye = self.eye();
+        let l = self.light();
+        let focal = rect.height() as f64 * 0.5 / (35f64.to_radians() * 0.5).tan();
+        let c = |v: V3| [v[0] as f32, v[1] as f32, v[2] as f32];
+        crate::viewport_gl::CamUniform { eye: c(eye), r: c(r), u: c(u), f: c(f), focal: focal as f32, half: [rect.width() * 0.5, rect.height() * 0.5], near: (self.dist * 0.01).max(0.05) as f32, far: (self.dist * 30.0 + 1000.0) as f32, light: c(l) }
+    }
+    /// Eye ray through a screen point: (origin, unit direction).
+    pub fn ray(&self, rect: Rect, p: Pos2) -> (V3, V3) {
+        let (r, u, f) = self.axes();
+        let focal = rect.height() as f64 * 0.5 / (35f64.to_radians() * 0.5).tan();
+        let (x, y) = ((p.x - rect.center().x) as f64 / focal, (rect.center().y - p.y) as f64 / focal);
+        (self.eye(), normalize(add(add(f, scale(r, x)), scale(u, y))))
+    }
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx as f64 * 0.008;
         self.pitch = (self.pitch + dy as f64 * 0.008).clamp(-1.5, 1.5);
@@ -66,6 +82,23 @@ impl Camera {
         let (r, u, f) = self.axes();
         normalize(add(add(scale(f, -1.0), scale(u, 0.6)), scale(r, -0.4)))
     }
+}
+
+/// Distance along the ray `o + t d` to triangle `abc` (Moller-Trumbore), if it hits it in front of the eye.
+pub fn ray_triangle(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f64> {
+    let (e1, e2) = (sub(b, a), sub(c, a));
+    let p = cross(d, e2);
+    let det = dot(e1, p);
+    if det.abs() < 1e-14 { return None; }
+    let inv = 1.0 / det;
+    let s = sub(o, a);
+    let u = dot(s, p) * inv;
+    if !(0.0..=1.0).contains(&u) { return None; }
+    let q = cross(s, e1);
+    let v = dot(d, q) * inv;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    let t = dot(e2, q) * inv;
+    (t > 1e-9).then_some(t)
 }
 
 /// Draw a shaded closed mesh with back-face culling, depth-sorted triangles.

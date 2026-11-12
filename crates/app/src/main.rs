@@ -4,6 +4,7 @@
 mod theme;
 mod tutorial;
 mod viewport;
+mod viewport_gl;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use peregrine_core::port_cap::point_in_polygon;
@@ -197,6 +198,8 @@ struct App {
     project_path: Option<PathBuf>,
     bodies: Vec<Body>,
     visible: Vec<bool>,
+    gl_bodies: Vec<Option<std::sync::Arc<viewport_gl::GlBody>>>,
+    pick_cache: std::cell::RefCell<Option<([i32; 2], [u64; 4], Option<(usize, usize)>)>>,
     candidates: Vec<(String, PortCandidate)>,
     cam: Camera,
     tool: Tool,
@@ -268,12 +271,33 @@ struct App {
     cmds: Vec<ShellCmd>,
 }
 
+// Ask hybrid-graphics laptops (NVIDIA Optimus, AMD PowerXpress) to run this program on the discrete graphics card.
+#[cfg(windows)]
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+/// The graphics card the solver will use, found once in the background at start-up.
+static GPU: std::sync::OnceLock<Option<peregrine_solver::gpu::GpuInfo>> = std::sync::OnceLock::new();
+
+/// Usable graphics memory in GB: 90 % of the card's dedicated memory when it is known, otherwise a safe 7 GB.
+fn gpu_budget_gb() -> f64 {
+    match GPU.get() {
+        Some(Some(g)) => g.vram_bytes.map_or(7.0, |b| b as f64 * 0.9 / 1e9),
+        _ => 7.0,
+    }
+}
+
 fn main() -> eframe::Result {
+    std::thread::spawn(|| { let _ = GPU.set(peregrine_solver::gpu::query_gpu()); });
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1360.0, 820.0]).with_title("Peregrine CFD");
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon256.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    let opts = eframe::NativeOptions { viewport, ..Default::default() };
+    // depth buffer for the graphics-card mesh renderer, and smooth edges
+    let opts = eframe::NativeOptions { viewport, depth_buffer: 24, ..Default::default() };
     eframe::run_native("Peregrine CFD", opts, Box::new(|cc| {
         theme::apply(&cc.egui_ctx);
         let mut app = App::new();
@@ -340,6 +364,8 @@ impl App {
             project_path: None,
             bodies: vec![],
             visible: vec![],
+            gl_bodies: vec![],
+            pick_cache: std::cell::RefCell::new(None),
             candidates: vec![],
             cam: Camera::new(),
             tool: Tool::Orbit,
@@ -412,6 +438,8 @@ impl App {
 
     fn set_bodies(&mut self, bodies: Vec<Body>) {
         self.visible = vec![true; bodies.len()];
+        self.gl_bodies.clear();
+        self.pick_cache.replace(None);
         self.bodies = bodies;
         self.sel_bodies.clear();
         self.manual_openings.clear();
@@ -843,9 +871,10 @@ impl App {
             let dx = self.project.solver.cell_size_mm;
             let n: f64 = (0..3).map(|i| ((b.max[i] - b.min[i]) / dx).ceil().max(1.0)).product();
             let gpu_gb = n * 172.0 / 1e9;
-            if gpu_gb > 7.0 {
-                let ok_dx = dx * (gpu_gb / 6.5).cbrt();
-                return Err(format!("a {dx:.2} mm grid is {:.0} M cells and needs about {gpu_gb:.1} GB of graphics memory (an 8 GB card has about 7 GB free). Use a cell size of {ok_dx:.2} mm or larger, or crop the model.", n / 1e6));
+            let budget = gpu_budget_gb();
+            if gpu_gb > budget {
+                let ok_dx = dx * (gpu_gb / (budget * 0.93)).cbrt();
+                return Err(format!("a {dx:.2} mm grid is {:.0} M cells and needs about {gpu_gb:.1} GB of graphics memory (your card allows about {budget:.1} GB). Use a cell size of {ok_dx:.2} mm or larger, or crop the model.", n / 1e6));
             }
         }
         Ok(())
@@ -1355,33 +1384,38 @@ impl App {
         self.pick_body_tri(rect, pos).map(|x| x.0)
     }
 
+    /// The body and triangle under a screen point: a ray from the eye against the visible meshes (the nearest hit).
+    /// The answer is remembered while neither the pointer nor the camera moves, so hovering costs nothing.
     fn pick_body_tri(&self, rect: Rect, pos: Pos2) -> Option<(usize, usize)> {
-        let proj = self.cam.projector(rect);
+        let key_cam = [self.cam.target[0].to_bits() ^ self.cam.target[1].to_bits().rotate_left(13) ^ self.cam.target[2].to_bits().rotate_left(27), self.cam.dist.to_bits(), self.cam.yaw.to_bits(), self.cam.pitch.to_bits() ^ (self.visible.iter().filter(|v| **v).count() as u64)];
+        let key_pos = [pos.x.round() as i32, pos.y.round() as i32];
+        if let Some((kp, kc, res)) = &*self.pick_cache.borrow() {
+            if *kp == key_pos && *kc == key_cam { return *res; }
+        }
+        let (o, d) = self.cam.ray(rect, pos);
+        let inv = [1.0 / if d[0].abs() < 1e-12 { 1e-12 } else { d[0] }, 1.0 / if d[1].abs() < 1e-12 { 1e-12 } else { d[1] }, 1.0 / if d[2].abs() < 1e-12 { 1e-12 } else { d[2] }];
         let mut best: Option<(f64, usize, usize)> = None;
         for (bi, b) in self.bodies.iter().enumerate() {
             if !self.visible[bi] || b.role == BodyRole::Ignore { continue; }
+            // ray against the body's bounding box first
             let bb = b.mesh.bounds();
-            // cheap reject: screen box of the bounding box
-            let corners = [[bb.min[0], bb.min[1], bb.min[2]], [bb.max[0], bb.min[1], bb.min[2]], [bb.min[0], bb.max[1], bb.min[2]], [bb.max[0], bb.max[1], bb.min[2]], [bb.min[0], bb.min[1], bb.max[2]], [bb.max[0], bb.min[1], bb.max[2]], [bb.min[0], bb.max[1], bb.max[2]], [bb.max[0], bb.max[1], bb.max[2]]];
-            let pc: Vec<Pos2> = corners.iter().filter_map(|c| proj.project(*c).map(|x| x.0)).collect();
-            if pc.len() == 8 {
-                let (mut lo, mut hi) = (Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN));
-                for q in &pc { lo.x = lo.x.min(q.x); lo.y = lo.y.min(q.y); hi.x = hi.x.max(q.x); hi.y = hi.y.max(q.y); }
-                if pos.x < lo.x - 2.0 || pos.x > hi.x + 2.0 || pos.y < lo.y - 2.0 || pos.y > hi.y + 2.0 { continue; }
+            let (mut t0, mut t1) = (0.0f64, f64::MAX);
+            for k in 0..3 {
+                let (a, c) = ((bb.min[k] - o[k]) * inv[k], (bb.max[k] - o[k]) * inv[k]);
+                t0 = t0.max(a.min(c));
+                t1 = t1.min(a.max(c));
             }
+            if t0 > t1 || best.map_or(false, |x| t0 > x.0) { continue; }
             for ti in 0..b.mesh.triangles.len() {
-                let [a, bb2, c] = b.mesh.tri(ti);
-                let (Some((pa, da)), Some((pb, _)), Some((pc2, _))) = (proj.project(a), proj.project(bb2), proj.project(c)) else { continue };
-                // point in 2D triangle
-                let sign = |p1: Pos2, p2: Pos2, p3: Pos2| (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
-                let (d1, d2, d3) = (sign(pos, pa, pb), sign(pos, pb, pc2), sign(pos, pc2, pa));
-                let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-                let posv = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-                if neg && posv { continue; }
-                if best.map_or(true, |x| da < x.0) { best = Some((da, bi, ti)); }
+                let [a, b2, c] = b.mesh.tri(ti);
+                if let Some(t) = viewport::ray_triangle(o, d, a, b2, c) {
+                    if best.map_or(true, |x| t < x.0) { best = Some((t, bi, ti)); }
+                }
             }
         }
-        best.map(|x| (x.1, x.2))
+        let res = best.map(|x| (x.1, x.2));
+        *self.pick_cache.borrow_mut() = Some((key_pos, key_cam, res));
+        res
     }
 
     fn body_context_menu_ui(&mut self, ui: &mut egui::Ui, bi: usize) {
@@ -2032,25 +2066,35 @@ impl App {
         if pan { self.cam.pan(rect, d.x, d.y); } else if resp.dragged_by(egui::PointerButton::Primary) { self.cam.orbit(d.x, d.y); }
         if resp.hovered() { self.cam.zoom(ui.input(|i| i.smooth_scroll_delta.y)); }
 
-        // geometry
-        for (i, b) in self.bodies.iter().enumerate() {
-            if self.mesh_mode == MeshMode::Hidden || !self.visible[i] || b.role == BodyRole::Ignore { continue; }
-            let selected = self.sel_bodies.contains(&i);
-            let suggested = self.project.is_suggested(&b.name);
-            let ghost = self.mesh_mode == MeshMode::Ghost;
-            let (col, alpha) = if selected {
-                (Color32::from_rgb(0x4D, 0xA3, 0xFF), if ghost { 90 } else { 210 })
-            } else if suggested {
-                (Color32::from_rgb(0xE8, 0xB8, 0x4A), if ghost { 70 } else { 200 })
-            } else {
-                match (b.role, ghost) {
-                    (BodyRole::Duct, true) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
-                    (_, true) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
-                    (BodyRole::Duct, false) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 255),
-                    _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
-                }
-            };
-            viewport::draw_mesh(&painter, rect, &self.cam, &b.mesh, col, alpha, false);
+        // geometry: drawn by the graphics card (uploaded once, projected and depth-tested there)
+        {
+            if self.gl_bodies.len() != self.bodies.len() {
+                self.gl_bodies = vec![None; self.bodies.len()];
+            }
+            let mut items: Vec<viewport_gl::DrawItem> = vec![];
+            for i in 0..self.bodies.len() {
+                let b = &self.bodies[i];
+                if self.mesh_mode == MeshMode::Hidden || !self.visible[i] || b.role == BodyRole::Ignore { continue; }
+                let selected = self.sel_bodies.contains(&i);
+                let suggested = self.project.is_suggested(&b.name);
+                let ghost = self.mesh_mode == MeshMode::Ghost;
+                let (col, alpha) = if selected {
+                    (Color32::from_rgb(0x4D, 0xA3, 0xFF), if ghost { 90 } else { 210 })
+                } else if suggested {
+                    (Color32::from_rgb(0xE8, 0xB8, 0x4A), if ghost { 70 } else { 200 })
+                } else {
+                    match (b.role, ghost) {
+                        (BodyRole::Duct, true) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 28),
+                        (_, true) => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 40),
+                        (BodyRole::Duct, false) => (Color32::from_rgb(0x8F, 0xB4, 0xD9), 255),
+                        _ => (Color32::from_rgb(0xB0, 0xB0, 0xB0), 255),
+                    }
+                };
+                if self.gl_bodies[i].is_none() { self.gl_bodies[i] = Some(std::sync::Arc::new(viewport_gl::GlBody::new(&b.mesh))); }
+                let body = self.gl_bodies[i].clone().unwrap();
+                items.push(viewport_gl::DrawItem { body, color: [col.r() as f32 / 255.0, col.g() as f32 / 255.0, col.b() as f32 / 255.0, alpha as f32 / 255.0] });
+            }
+            painter.add(viewport_gl::callback(rect, self.cam.gl_uniform(rect), items));
         }
         // slice
         if let (true, Some(snap)) = (self.show_slice, &self.last) {
@@ -2284,6 +2328,10 @@ impl App {
                     let (gpu, _) = peregrine_voxel::Grid { origin: [0.0; 3], dx, dims: [n as usize, 1, 1] }.memory_estimate();
                     ui.label(egui::RichText::new(format!("{:.2} M cells  |  ~{} MB GPU", n / 1e6, gpu >> 20)).color(theme::TEXT_DIM));
                 }
+                if let Some(Some(g)) = GPU.get() {
+                    let v = g.vram_bytes.map_or(String::new(), |b| format!(", {:.1} GB", b as f64 / 1073741824.0));
+                    ui.label(egui::RichText::new(format!("{}{}", g.name, v)).color(theme::TEXT_DIM));
+                }
                 if let Some(l) = &self.last {
                     let s = l.lock().unwrap();
                     if s.finished && s.error.is_none() { ui.label("Done"); }
@@ -2492,6 +2540,7 @@ impl App {
         a.project.name = format!("{} copy", self.project.name);
         a.bodies = self.bodies.clone();
         a.visible = self.visible.clone();
+        a.gl_bodies = self.gl_bodies.clone();
         a.candidates = self.candidates.clone();
         a.cam = self.cam.clone();
         a.backend = self.backend;

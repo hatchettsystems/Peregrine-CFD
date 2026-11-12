@@ -302,3 +302,38 @@ impl Engine for GpuLbm {
     fn steps(&self) -> usize { self.steps }
     fn name(&self) -> String { format!("GPU {}", self.adapter_name) }
 }
+
+/// The graphics card the solver will use: its name and how much dedicated memory it has.
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub name: String,
+    pub backend: String,
+    /// Dedicated video memory in bytes, if the driver reports it.
+    pub vram_bytes: Option<u64>,
+}
+
+/// Ask the system which graphics card would be used (the same pick the solver makes) and how much memory it has.
+pub fn query_gpu() -> Option<GpuInfo> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))?;
+    let info = adapter.get_info();
+    let mut vram: Option<u64> = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe {
+        vram = adapter.as_hal::<wgpu::hal::api::Vulkan, _, _>(|hal| {
+            let hal = hal?;
+            let props = hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device());
+            let mut best = 0u64;
+            for i in 0..props.memory_heap_count as usize {
+                let h = props.memory_heaps[i];
+                // bit 0 = DEVICE_LOCAL
+                if h.flags.as_raw() & 1 != 0 { best = best.max(h.size); }
+            }
+            (best > 0).then_some(best)
+        });
+    }
+    Some(GpuInfo { name: info.name, backend: format!("{:?}", info.backend), vram_bytes: vram })
+}
