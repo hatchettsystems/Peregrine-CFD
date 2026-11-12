@@ -277,7 +277,9 @@ impl Simulation {
     pub fn advance(&mut self, n: usize) {
         let mut left = n;
         while left > 0 {
-            let c = CHUNK.min(left);
+            // chunks end on multiples of CHUNK in absolute steps, whatever size the caller asks for, so the fan and
+            // source controllers (every 100 steps) run on the same schedule however the run is paced
+            let c = (CHUNK - self.engine.steps() % CHUNK).min(left);
             if self.engine.steps() <= RAMP_STEPS {
                 self.apply_ramp();
             }
@@ -393,9 +395,9 @@ impl Simulation {
                 (SourceKind::Fan { curve }, SplitMode::ByArea | SplitMode::Weights) => {
                     // smooth the (noisy) pressure reading, then relax the commanded flow towards the flow the fan
                     // delivers at that pressure; the fixed point is where the fan curve meets the duct's resistance
-                    g.p_ema = if g.p_ema.is_nan() { p_in } else { g.p_ema + 0.3 * (p_in - g.p_ema) };
+                    g.p_ema = if g.p_ema.is_nan() { p_in } else { g.p_ema + 0.15 * (p_in - g.p_ema) };
                     let q_fan = curve_flow_at(curve, g.p_ema);
-                    g.q_cmd = (g.q_cmd + 0.12 * (q_fan - g.q_cmd)).max(0.01);
+                    g.q_cmd = (g.q_cmd + 0.04 * (q_fan - g.q_cmd)).max(0.01);
                 }
                 (SourceKind::Fan { curve }, SplitMode::Plenum) => {
                     let target = curve_at(curve, q.max(0.0));

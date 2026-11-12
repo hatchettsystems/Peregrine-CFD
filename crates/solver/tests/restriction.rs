@@ -45,7 +45,7 @@ fn run(h_out: f64) -> (f64, f64, f64, f64, f64) {
     for m in &solids { bounds.union(&m.bounds()); }
     let refs: Vec<&TriMesh> = solids.iter().collect();
     let d = build_domain(&refs, &specs, &bounds.expanded(4.0), 0.5);
-    let mut sim = Simulation::new(&project, &d, Backend::Cpu).unwrap();
+    let mut sim = Simulation::new(&project, &d, if std::env::var("PEREGRINE_GPU").is_ok() { Backend::Gpu } else { Backend::Cpu }).unwrap();
     let mut outs: Vec<f64> = vec![];
     for chunk in 0..STEPS / 2500 {
         sim.advance(2500);

@@ -825,9 +825,9 @@ impl App {
     fn load_restriction_sample(&mut self) {
         self.reset_history();
         self.project = Project::new("restriction sample");
-        self.project.solver.cell_size_mm = 0.4;
+        self.project.solver.cell_size_mm = 0.5;
         self.project.solver.reference_speed = 0.0;
-        self.project.solver.max_steps = 5000;
+        self.project.solver.max_steps = 8000;
         self.project.domain.padding_mm = 4.0;
         let main = shapes::hollow_tube(14.0, 10.0, 30.0);
         let mut tip = shapes::hollow_tube(14.0, 4.0, 10.0);
@@ -2044,8 +2044,8 @@ impl App {
             ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
             ui.checkbox(&mut self.probe_on, "Probe pressure and speed").on_hover_text("Hover anywhere over the duct to read the pressure and air speed at that point. Click to pin a reading.");
             if self.probe_on {
-                if let Some(snap) = self.last.clone() {
-                    let s = snap.lock().unwrap();
+                {
+                    // `s` is the run snapshot this panel already holds locked: locking it again would hang the app
                     let mut del = None;
                     for (k, pt) in self.probe_pins.iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -2938,6 +2938,31 @@ mod tests {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    #[test]
+    fn probe_finds_the_inside_of_a_duct_not_the_air_around_it() {
+        // a 40^3 grid of 1 mm cells with a hollow square tube along x (outer 20, inner 10)
+        let n = 40usize;
+        let mut cells = vec![0u8; n * n * n];
+        let mut pressure = vec![0f32; n * n * n];
+        for z in 0..n { for y in 0..n { for x in 0..n {
+            let (dy, dz) = ((y as f64 - 19.5).abs(), (z as f64 - 19.5).abs());
+            let i = x + n * (y + n * z);
+            if dy.max(dz) < 10.0 && dy.max(dz) >= 5.0 { cells[i] = 1; }
+            if dy.max(dz) < 5.0 { pressure[i] = 7.0; }
+        } } }
+        let s = Snapshot { dims: [n; 3], origin: [0.0; 3], dx: 1.0, cells: Arc::new(cells), speed: vec![1.0; n * n * n], pressure, ..Default::default() };
+        assert!(inside_duct(&s, [20.0, 19.9, 19.9]));
+        assert!(!inside_duct(&s, [20.0, 30.0, 19.9]));
+        let mut cam = Camera::new();
+        cam.target = [20.0, 20.0, 20.0];
+        cam.dist = 120.0;
+        cam.yaw = 0.6;
+        cam.pitch = 0.5;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let hit = probe_ray(&s, &cam, rect, Pos2::new(400.0, 300.0)).expect("the centre of the view looks at the tube");
+        assert!((hit.1 - 7.0).abs() < 1e-6, "{hit:?}");
+    }
+
     #[test]
     fn display_units() {
         assert!((cfm(28.3168) - 1.0).abs() < 1e-9);
