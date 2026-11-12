@@ -898,8 +898,13 @@ impl App {
                         s.warnings.extend(sim.units.warnings());
                     }
                     let mut done = 0;
+                    // Steps between display updates. Each update reads the field back and rebuilds the speed / pressure /
+                    // velocity arrays on the CPU, which leaves the graphics card idle: when that takes a big share of the
+                    // time, update less often (and more often again if the updates become too sparse).
+                    let mut per = 250usize;
                     while done < total && !stop2.load(Ordering::Relaxed) {
-                        let n = 250.min(total - done);
+                        let t_iter = std::time::Instant::now();
+                        let n = per.min(total - done);
                         sim.advance(n);
                         done += n;
                         if sim.unstable() {
@@ -914,6 +919,7 @@ impl App {
                         }
                         let u = sim.units;
                         let mac: Vec<[f32; 4]> = sim.mac().to_vec();
+                        let t_post = std::time::Instant::now();
                         let solid = |i: usize| cells[i] == 1;
                         let speed: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
                         let pressure: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
@@ -928,6 +934,10 @@ impl App {
                         s.vel = Arc::new(vel);
                         s.report = report;
                         s.version += 1;
+                        drop(s);
+                        let total_t = t_iter.elapsed().as_secs_f64();
+                        let post_t = t_post.elapsed().as_secs_f64();
+                        if post_t > 0.15 * total_t && per < 4000 { per *= 2; } else if total_t > 8.0 && per > 250 { per /= 2; }
                     }
                     break;
                 }

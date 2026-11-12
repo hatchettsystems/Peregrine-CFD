@@ -278,10 +278,9 @@ impl Simulation {
     fn port_stats(&mut self, k: usize) -> (f32, f32, usize) {
         let inw = self.ports[k].inward_unit();
         let list: Vec<usize> = self.port_cells.iter().filter(|c| c.1 == k).map(|c| c.2).collect();
-        let mac = self.engine.mac();
+        let vals = self.engine.read_cells(&list);
         let (mut r, mut u) = (0.0, 0.0);
-        for &nb in &list {
-            let m = mac[nb];
+        for m in vals.iter().copied() {
             r += m[0];
             u += m[1] * inw[0] + m[2] * inw[1] + m[3] * inw[2];
         }
@@ -476,10 +475,10 @@ impl Simulation {
     fn port_mean_velocity(&mut self, k: usize) -> [f64; 3] {
         let idxs: Vec<usize> = self.port_cells.iter().filter(|c| c.1 == k).map(|c| c.0).collect();
         let u = self.units;
-        let mac = self.engine.mac();
+        let vals = self.engine.read_cells(&idxs);
         let mut v = [0.0f64; 3];
-        for &i in &idxs {
-            for a in 0..3 { v[a] += u.vel_to_phys(mac[i][a + 1] as f64); }
+        for m in &vals {
+            for a in 0..3 { v[a] += u.vel_to_phys(m[a + 1] as f64); }
         }
         let n = idxs.len().max(1) as f64;
         [v[0] / n, v[1] / n, v[2] / n]

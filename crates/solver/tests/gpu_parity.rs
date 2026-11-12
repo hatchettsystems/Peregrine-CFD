@@ -65,4 +65,18 @@ fn check(regularized: bool) {
         }
     }
     assert!(worst < 2e-4, "max |cpu-gpu| = {worst}");
+    // reading just some cells (what the control loops do) must match the full read-back exactly
+    let want: Vec<usize> = (0..b.len()).step_by(37).chain([0usize, b.len() - 1]).collect();
+    let got = gpu.read_cells(&want);
+    assert_eq!(got.len(), want.len());
+    for (g, &i) in got.iter().zip(&want) {
+        assert_eq!(*g, b[i], "cell {i}");
+    }
+    // the same request again after more steps still follows the field
+    gpu.step_n(20);
+    let full = gpu.mac().to_vec();
+    let again = gpu.read_cells(&want);
+    for (g, &i) in again.iter().zip(&want) {
+        assert_eq!(*g, full[i], "cell {i} after 20 more steps");
+    }
 }

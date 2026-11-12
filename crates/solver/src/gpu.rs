@@ -39,6 +39,11 @@ pub struct GpuLbm {
     ports_buf: wgpu::Buffer,
     mac_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
+    gather: wgpu::ComputePipeline,
+    gidx: wgpu::Buffer,
+    gout: wgpu::Buffer,
+    gstaging: wgpu::Buffer,
+    gcap: usize,
     ports: Vec<PortGpu>,
     n: usize,
     n_port_cells: u32,
@@ -107,6 +112,12 @@ impl GpuLbm {
         let mac_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mac"), contents: bytemuck::cast_slice(&mac0), usage: storage });
         let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("staging"), size: (n * 16) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
+        // small gather buffers for the control loops (port cells), a multiple of 64 entries
+        let gcap = ((cfg.cells.len().min(1 << 20)).max(4096) + 63) / 64 * 64;
+        let gcap = gcap.min((n + 63) / 64 * 64).max(64);
+        let gidx = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gather idx"), size: (gcap * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let gout = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gather out"), size: (gcap * 16) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let gstaging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gather staging"), size: (gcap * 16) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let ports: Vec<PortGpu> = cfg.ports.iter().map(|p| port_to_gpu(p.bc)).collect();
         let ports_init: Vec<PortGpu> = if ports.is_empty() { vec![PortGpu::zeroed()] } else { ports.clone() };
         let ports_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ports"), contents: bytemuck::cast_slice(&ports_init), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
@@ -139,7 +150,7 @@ impl GpuLbm {
         let rw = wgpu::BufferBindingType::Storage { read_only: false };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lbm layout"),
-            entries: &[entry(0, wgpu::BufferBindingType::Uniform), entry(1, ro), entry(2, ro), entry(3, ro), entry(4, rw), entry(5, ro), entry(6, rw)],
+            entries: &[entry(0, wgpu::BufferBindingType::Uniform), entry(1, ro), entry(2, ro), entry(3, ro), entry(4, rw), entry(5, ro), entry(6, rw), entry(7, ro), entry(8, rw)],
         });
         let make_bind = |fin: &wgpu::Buffer, fout: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -153,6 +164,8 @@ impl GpuLbm {
                     wgpu::BindGroupEntry { binding: 4, resource: mac_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: fin.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: fout.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: gidx.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: gout.as_entire_binding() },
                 ],
             })
         };
@@ -168,12 +181,13 @@ impl GpuLbm {
         });
         let collide = mk("collide_stream");
         let port_update = mk("port_update");
+        let gather = mk("gather");
         // dispatch in 2D so very large grids exceed neither the 65535 group limit
         let total_groups = (n as u32 + 63) / 64;
         let gx = total_groups.min(65535);
         let gy = (total_groups + gx - 1) / gx;
         Ok(GpuLbm {
-            device, queue, adapter_name: format!("{} ({:?})", info.name, info.backend), collide, port_update, bind, ports_buf, mac_buf, staging,
+            device, queue, adapter_name: format!("{} ({:?})", info.name, info.backend), collide, port_update, bind, ports_buf, mac_buf, staging, gather, gidx, gout, gstaging, gcap,
             ports, n, n_port_cells, flip: 0, steps: 0, mac_cache: vec![[1.0, 0.0, 0.0, 0.0]; n], cache_valid: true,
             groups: (gx, gy), port_groups: (n_port_cells + 63) / 64,
         })
@@ -224,6 +238,40 @@ impl Engine for GpuLbm {
             self.cache_valid = true;
         }
         &self.mac_cache
+    }
+
+    fn read_cells(&mut self, idx: &[usize]) -> Vec<[f32; 4]> {
+        if idx.is_empty() {
+            return vec![];
+        }
+        if idx.len() > self.gcap {
+            let m = self.mac();
+            return idx.iter().map(|&i| m[i]).collect();
+        }
+        let list: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+        self.queue.write_buffer(&self.gidx, 0, bytemuck::cast_slice(&list));
+        let groups = ((idx.len() + 63) / 64) as u32;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_bind_group(0, &self.bind[0], &[]);
+            pass.set_pipeline(&self.gather);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let bytes = (idx.len() * 16) as u64;
+        enc.copy_buffer_to_buffer(&self.gout, 0, &self.gstaging, 0, bytes);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.gstaging.slice(..bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().expect("map failed");
+        let out: Vec<[f32; 4]> = {
+            let data = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, [f32; 4]>(&data).to_vec()
+        };
+        self.gstaging.unmap();
+        out
     }
 
     fn steps(&self) -> usize { self.steps }

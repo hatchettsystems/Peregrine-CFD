@@ -18,6 +18,8 @@ struct PortCell { idx: u32, k: u32, nb: u32, pad: u32 };
 @group(0) @binding(4) var<storage, read_write> mac: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> f_in: array<f32>;
 @group(0) @binding(6) var<storage, read_write> f_out: array<f32>;
+@group(0) @binding(7) var<storage, read> gather_idx: array<u32>;
+@group(0) @binding(8) var<storage, read_write> gather_out: array<vec4<f32>>;
 
 const Q: u32 = 19u;
 var<private> CX: array<i32, 19> = array<i32, 19>(0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0);
@@ -178,4 +180,11 @@ fn port_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         f_out[i * n + pc.idx] = feq(i, rho, u) + neq;
     }
     mac[pc.idx] = vec4<f32>(rho, u);
+}
+
+// Copies rho/u of the listed cells into a small buffer, so the host reads back a few thousand cells, not the field.
+@compute @workgroup_size(64)
+fn gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    gather_out[t] = mac[gather_idx[t]];
 }

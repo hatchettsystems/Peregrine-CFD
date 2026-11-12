@@ -67,6 +67,12 @@ pub trait Engine {
     fn set_port_bc(&mut self, k: usize, bc: PortBc);
     /// rho, ux, uy, uz per cell (lattice units). The GPU engine reads back on demand.
     fn mac(&mut self) -> &[[f32; 4]];
+    /// rho, ux, uy, uz for just the listed cells. The GPU engine gathers them on the card and reads back only
+    /// those, instead of the whole field (control loops ask for a few thousand port cells, often).
+    fn read_cells(&mut self, idx: &[usize]) -> Vec<[f32; 4]> {
+        let m = self.mac();
+        idx.iter().map(|&i| m[i]).collect()
+    }
     fn steps(&self) -> usize;
     fn name(&self) -> String;
 }
