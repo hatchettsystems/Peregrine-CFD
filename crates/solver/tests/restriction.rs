@@ -8,7 +8,7 @@ use peregrine_voxel::{build_domain, PortSpec};
 const L: f64 = 30.0;
 const W: f64 = 7.0; // half width of the channel
 const T: f64 = 2.0;
-const STEPS: usize = 5000;
+const STEPS: usize = 7500;
 
 fn cap(x: f64, h: f64, nx: f64) -> PortCap {
     PortCap { origin: [x, 0.0, 0.0], normal: [nx, 0.0, 0.0], polygon: vec![[x, -h, -h], [x, h, -h], [x, h, h], [x, -h, h]], triangles: vec![], holes: vec![] }
@@ -46,13 +46,18 @@ fn run(h_out: f64) -> (f64, f64, f64, f64, f64) {
     let refs: Vec<&TriMesh> = solids.iter().collect();
     let d = build_domain(&refs, &specs, &bounds.expanded(4.0), 0.5);
     let mut sim = Simulation::new(&project, &d, Backend::Cpu).unwrap();
+    let mut outs: Vec<f64> = vec![];
     for chunk in 0..STEPS / 2500 {
         sim.advance(2500);
         let r = sim.report();
         let (o, i) = (r.iter().find(|r| r.name == "out").unwrap(), r.iter().find(|r| r.name == "in").unwrap());
+        outs.push(-o.flow_l_min);
         eprintln!("  [exit half {h_out}] step {}: in {:.2} out {:.2} L/min, p_in {:.1} Pa", (chunk + 1) * 2500, i.flow_l_min, -o.flow_l_min, i.pressure_pa);
     }
     assert!(sim.is_finite());
+    // the fan operating point must settle (it used to bounce between 12 and 30 L/min on a free-flowing duct)
+    let (a, b) = (outs[outs.len() - 2], outs[outs.len() - 1]);
+    assert!((a - b).abs() < 0.05 * b.abs().max(1.0), "flow still moving: {a} -> {b}");
     let rep = sim.report();
     let o = rep.iter().find(|r| r.name == "out").unwrap().clone();
     let i = rep.iter().find(|r| r.name == "in").unwrap().clone();
@@ -73,7 +78,7 @@ fn run(h_out: f64) -> (f64, f64, f64, f64, f64) {
 #[test]
 fn smaller_exit_chokes_the_source() {
     let mut prev: Option<(f64, f64, f64)> = None;
-    for h_out in [4.0, 2.0] {
+    for h_out in [6.0, 2.0] {
         let (q, v, p_up, p_near_exit, _p_in) = run(h_out);
         eprintln!("exit {:>4.0} mm2: flow {:.2} L/min, exit speed {:.2} m/s, pressure upstream {:.1} Pa, just before exit {:.1} Pa", (2.0 * h_out) * (2.0 * h_out), q, v, p_up, p_near_exit);
         if let Some((q0, v0, p0)) = prev {
