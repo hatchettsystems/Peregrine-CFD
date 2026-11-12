@@ -94,22 +94,47 @@ impl GpuLbm {
 
         // initial equilibrium at rest, SoA layout f[i*n + idx]
         let w = |i: usize| crate::lbm::W[i];
-        let mut f0 = vec![0f32; n * 19];
+        // The big buffers are filled in slices of at most CHUNK cells, so the host never holds a second full copy of
+        // the field (the distributions alone are 76 bytes per cell: 4.6 GB of host memory for 60 million cells).
+        const CHUNK: usize = 4 << 20;
+        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let mk_big = |label: &str, bytes: u64, usage: wgpu::BufferUsages| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes, usage, mapped_at_creation: false });
+        let fa = mk_big("fa", (n * 19 * 4) as u64, storage);
+        let fb = mk_big("fb", (n * 19 * 4) as u64, storage);
+        let mut slice = vec![0f32; CHUNK];
         for i in 0..19 {
-            for idx in 0..n {
-                if cfg.cells[idx] != 1 {
-                    f0[i * n + idx] = w(i);
+            let mut start = 0;
+            while start < n {
+                let len = CHUNK.min(n - start);
+                for k in 0..len {
+                    slice[k] = if cfg.cells[start + k] != 1 { w(i) } else { 0.0 };
                 }
+                let off = ((i * n + start) * 4) as u64;
+                queue.write_buffer(&fa, off, bytemuck::cast_slice(&slice[..len]));
+                queue.write_buffer(&fb, off, bytemuck::cast_slice(&slice[..len]));
+                start += len;
             }
         }
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-        let fa = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fa"), contents: bytemuck::cast_slice(&f0), usage: storage });
-        let fb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fb"), contents: bytemuck::cast_slice(&f0), usage: storage });
-        drop(f0);
-        let cells_u32: Vec<u32> = cfg.cells.iter().map(|&c| c as u32).collect();
-        let cells_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cells"), contents: bytemuck::cast_slice(&cells_u32), usage: wgpu::BufferUsages::STORAGE });
-        let mac0 = vec![[1.0f32, 0.0, 0.0, 0.0]; n];
-        let mac_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mac"), contents: bytemuck::cast_slice(&mac0), usage: storage });
+        drop(slice);
+        let cells_buf = mk_big("cells", (n * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let mut cslice = vec![0u32; CHUNK];
+        let mut start = 0;
+        while start < n {
+            let len = CHUNK.min(n - start);
+            for k in 0..len { cslice[k] = cfg.cells[start + k] as u32; }
+            queue.write_buffer(&cells_buf, (start * 4) as u64, bytemuck::cast_slice(&cslice[..len]));
+            start += len;
+        }
+        drop(cslice);
+        let mac_buf = mk_big("mac", (n * 16) as u64, storage);
+        let mac_init = vec![[1.0f32, 0.0, 0.0, 0.0]; CHUNK.min(n)];
+        let mut start = 0;
+        while start < n {
+            let len = CHUNK.min(n - start);
+            queue.write_buffer(&mac_buf, (start * 16) as u64, bytemuck::cast_slice(&mac_init[..len]));
+            start += len;
+        }
+        drop(mac_init);
         let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("staging"), size: (n * 16) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         // small gather buffers for the control loops (port cells), a multiple of 64 entries

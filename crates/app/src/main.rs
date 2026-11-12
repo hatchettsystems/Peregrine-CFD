@@ -918,14 +918,15 @@ impl App {
                             continue 'attempts;
                         }
                         let u = sim.units;
-                        let mac: Vec<[f32; 4]> = sim.mac().to_vec();
+                        let report = sim.report();
+                        let sources = sim.source_reports();
+                        // use the read-back field in place: a copy of it would be another full-size array in memory
+                        let mac = sim.mac();
                         let t_post = std::time::Instant::now();
                         let solid = |i: usize| cells[i] == 1;
                         let speed: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
                         let pressure: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
                         let vel: Vec<[f32; 3]> = mac.iter().enumerate().map(|(i, m)| if solid(i) { [0.0; 3] } else { [u.vel_to_phys(m[1] as f64) as f32, u.vel_to_phys(m[2] as f64) as f32, u.vel_to_phys(m[3] as f64) as f32] }).collect();
-                        let report = sim.report();
-                        let sources = sim.source_reports();
                         let mut s = snap2.lock().unwrap();
                         s.sources = sources;
                         s.step = done;
