@@ -34,6 +34,8 @@ pub struct GpuLbm {
     queue: wgpu::Queue,
     adapter_name: String,
     collide: wgpu::ComputePipeline,
+    /// Same as `collide` but without the per-cell rho/u write (used for all but the last step of a batch).
+    collide_quiet: wgpu::ComputePipeline,
     port_update: wgpu::ComputePipeline,
     bind: [wgpu::BindGroup; 2],
     ports_buf: wgpu::Buffer,
@@ -117,11 +119,35 @@ impl GpuLbm {
         }
         drop(slice);
         let cells_buf = mk_big("cells", (n * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        // bit 8 marks interior fluid cells whose 18 neighbours are all inside the grid and not solid: the kernel
+        // streams those without any boundary checks
+        let fast: Vec<u8> = {
+            use rayon::prelude::*;
+            let (nx, ny, nz) = (cfg.dims[0], cfg.dims[1], cfg.dims[2]);
+            let mut f = vec![0u8; n];
+            f.par_chunks_mut(nx * ny).enumerate().for_each(|(z, plane)| {
+                if z == 0 || z + 1 >= nz { return; }
+                for y in 1..ny.saturating_sub(1) {
+                    for x in 1..nx.saturating_sub(1) {
+                        let i = x + nx * (y + ny * z);
+                        if cfg.cells[i] != 0 { continue; }
+                        let mut ok = true;
+                        for q in 1..19 {
+                            let (cx, cy, cz) = (crate::lbm::C[q][0], crate::lbm::C[q][1], crate::lbm::C[q][2]);
+                            let j = (x as i32 + cx) as usize + nx * ((y as i32 + cy) as usize + ny * (z as i32 + cz) as usize);
+                            if cfg.cells[j] == 1 { ok = false; break; }
+                        }
+                        if ok { plane[x + nx * y] = 1; }
+                    }
+                }
+            });
+            f
+        };
         let mut cslice = vec![0u32; CHUNK];
         let mut start = 0;
         while start < n {
             let len = CHUNK.min(n - start);
-            for k in 0..len { cslice[k] = cfg.cells[start + k] as u32; }
+            for k in 0..len { cslice[k] = cfg.cells[start + k] as u32 | if fast[start + k] != 0 { 256 } else { 0 }; }
             queue.write_buffer(&cells_buf, (start * 4) as u64, bytemuck::cast_slice(&cslice[..len]));
             start += len;
         }
@@ -196,23 +222,30 @@ impl GpuLbm {
         };
         let bind = [make_bind(&fa, &fb), make_bind(&fb, &fa)];
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
-        let mk = |name: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(name),
-            layout: Some(&pl),
-            module: &shader,
-            entry_point: Some(name),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let collide = mk("collide_stream");
-        let port_update = mk("port_update");
-        let gather = mk("gather");
+        // With no body force the per-cell rho/u field is written only on the last step of a batch and the port updates
+        // read their neighbours from the distributions; with a body force every step writes it as before.
+        let lazy = cfg.body_force.iter().all(|f| *f == 0.0);
+        let mk = |name: &str, write_mac: bool| {
+            let consts: std::collections::HashMap<String, f64> = [("WRITE_MAC".to_string(), if write_mac { 1.0 } else { 0.0 }), ("LAZY".to_string(), if lazy { 1.0 } else { 0.0 })].into_iter().collect();
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some(name),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: &consts, ..Default::default() },
+                cache: None,
+            })
+        };
+        let collide = mk("collide_stream", true);
+        let collide_quiet = mk("collide_stream", !lazy);
+        let port_update = mk("port_update", true);
+        let gather = mk("gather", true);
         // dispatch in 2D so very large grids exceed neither the 65535 group limit
         let total_groups = (n as u32 + 63) / 64;
         let gx = total_groups.min(65535);
         let gy = (total_groups + gx - 1) / gx;
         Ok(GpuLbm {
-            device, queue, adapter_name: format!("{} ({:?})", info.name, info.backend), collide, port_update, bind, ports_buf, mac_buf, staging, gather, gidx, gout, gstaging, gcap,
+            device, queue, adapter_name: format!("{} ({:?})", info.name, info.backend), collide, collide_quiet, port_update, bind, ports_buf, mac_buf, staging, gather, gidx, gout, gstaging, gcap,
             ports, n, n_port_cells, flip: 0, steps: 0, mac_cache: vec![[1.0, 0.0, 0.0, 0.0]; n], cache_valid: true,
             groups: (gx, gy), port_groups: (n_port_cells + 63) / 64,
         })
@@ -224,9 +257,9 @@ impl Engine for GpuLbm {
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            for _ in 0..count {
+            for step in 0..count {
                 pass.set_bind_group(0, &self.bind[self.flip], &[]);
-                pass.set_pipeline(&self.collide);
+                pass.set_pipeline(if step + 1 == count { &self.collide } else { &self.collide_quiet });
                 pass.dispatch_workgroups(self.groups.0, self.groups.1, 1);
                 if self.n_port_cells > 0 {
                     pass.set_pipeline(&self.port_update);

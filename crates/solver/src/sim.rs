@@ -57,6 +57,8 @@ struct SourceRt {
     p_cmd: f64,      // Pa (plenum)
     /// Smoothed measured inlet pressure (Pa) used by the fan controller; NaN until the first reading.
     p_ema: f64,
+    /// Smoothed measured flow (L/min), likewise.
+    q_ema: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +69,7 @@ pub enum Backend {
     Auto,
 }
 
-const RAMP_STEPS: usize = 1500;
+const RAMP_STEPS: usize = 800;
 const CHUNK: usize = 25;
 
 pub struct Simulation {
@@ -121,6 +123,19 @@ fn curve_flow_at(curve: &[(f64, f64)], p: f64) -> f64 {
     for _ in 0..40 {
         let mid = 0.5 * (lo + hi);
         if curve_at(curve, mid) > p { lo = mid } else { hi = mid }
+    }
+    0.5 * (lo + hi)
+}
+
+/// The flow (L/min) at which the fan curve meets a duct whose pressure drop is `r * q^2`.
+fn curve_meets_resistance(curve: &[(f64, f64)], r: f64) -> f64 {
+    let Some(last) = curve.last() else { return 0.0 };
+    let qmax = last.0;
+    if curve_at(curve, qmax) - r * qmax * qmax >= 0.0 { return qmax; }
+    let (mut lo, mut hi) = (0.0, qmax);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if curve_at(curve, mid) - r * mid * mid > 0.0 { lo = mid } else { hi = mid }
     }
     0.5 * (lo + hi)
 }
@@ -250,7 +265,7 @@ impl Simulation {
                 (_, Some(q)) => 1.5 * 0.5 * project.fluid.density * (q / 60000.0 / sum_a.max(1e-12)).powi(2),
                 _ => 0.0,
             };
-            sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, gain: vec![1.0; members.len()], members, weights, areas, q_cmd, p_cmd, p_ema: f64::NAN });
+            sources.push(SourceRt { name: grp.name.clone(), source: grp.kind.clone(), split: grp.split, gain: vec![1.0; members.len()], members, weights, areas, q_cmd, p_cmd, p_ema: f64::NAN, q_ema: f64::NAN });
         }
         let mut sim = Simulation { engine, gpu_fallback, units, ref_speed, dims: g.dims, origin_mm: g.origin, dx_mm: g.dx, face_open: project.domain.faces.map(|f| f == FaceBc::Open), cells: domain.cells.clone(), ports: infos, port_cells, project_ports: meta, port_dir: dirs, ramp_base, sources };
         sim.apply_ramp();
@@ -395,9 +410,14 @@ impl Simulation {
                 (SourceKind::Fan { curve }, SplitMode::ByArea | SplitMode::Weights) => {
                     // smooth the (noisy) pressure reading, then relax the commanded flow towards the flow the fan
                     // delivers at that pressure; the fixed point is where the fan curve meets the duct's resistance
-                    g.p_ema = if g.p_ema.is_nan() { p_in } else { g.p_ema + 0.15 * (p_in - g.p_ema) };
-                    let q_fan = curve_flow_at(curve, g.p_ema);
-                    g.q_cmd = (g.q_cmd + 0.04 * (q_fan - g.q_cmd)).max(0.01);
+                    g.p_ema = if g.p_ema.is_nan() { p_in } else { g.p_ema + 0.2 * (p_in - g.p_ema) };
+                    g.q_ema = if g.q_ema.is_nan() { q } else { g.q_ema + 0.2 * (q - g.q_ema) };
+                    // model the duct as a resistance p = R q^2 fitted to the current reading, and jump most of the way
+                    // to where the fan curve meets it (the fixed point is the same as relaxing towards the curve at the
+                    // measured pressure, but it converges in a handful of updates instead of dozens)
+                    let r = g.p_ema.max(0.0) / (g.q_ema * g.q_ema).max(1e-9);
+                    let q_star = if g.q_ema > 1e-6 { curve_meets_resistance(curve, r) } else { curve_flow_at(curve, g.p_ema) };
+                    g.q_cmd = (g.q_cmd + 0.3 * (q_star - g.q_cmd)).max(0.01);
                 }
                 (SourceKind::Fan { curve }, SplitMode::Plenum) => {
                     let target = curve_at(curve, q.max(0.0));

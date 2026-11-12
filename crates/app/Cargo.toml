@@ -14,6 +14,7 @@ peregrine-project.workspace = true
 peregrine-geom.workspace = true
 peregrine-voxel.workspace = true
 peregrine-solver.workspace = true
+rayon.workspace = true
 peregrine-post.workspace = true
 anyhow.workspace = true
 eframe = "0.31"

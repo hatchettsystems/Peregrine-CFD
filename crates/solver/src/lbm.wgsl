@@ -21,6 +21,10 @@ struct PortCell { idx: u32, k: u32, nb: u32, pad: u32 };
 @group(0) @binding(7) var<storage, read> gather_idx: array<u32>;
 @group(0) @binding(8) var<storage, read_write> gather_out: array<vec4<f32>>;
 
+// Pipeline-overridable switches (set when the pipelines are built).
+override WRITE_MAC: bool = true;   // write rho/u of every cell this step (otherwise only the port cells do)
+override LAZY: bool = true;        // port updates read their neighbour's rho/u from the distributions, not from `mac`
+
 const Q: u32 = 19u;
 var<private> CX: array<i32, 19> = array<i32, 19>(0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0);
 var<private> CY: array<i32, 19> = array<i32, 19>(0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1);
@@ -47,12 +51,22 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x + gid.y * 65535u * 64u;
     let n = P.dims.w;
     if (idx >= n) { return; }
-    if (cells[idx] != 0u) { return; }
+    let c0 = cells[idx];
+    if ((c0 & 255u) != 0u) { return; }
     let nx = P.dims.x; let ny = P.dims.y; let nz = P.dims.z;
+    var fi: array<f32, 19>;
+    if ((c0 & 256u) != 0u) {
+        // interior fluid cell with no wall or grid face among its neighbours: plain pull, no checks
+        let stride_y = i32(nx);
+        let stride_z = i32(nx * ny);
+        for (var i = 0u; i < Q; i = i + 1u) {
+            let j = u32(i32(idx) - (CX[i] + stride_y * CY[i] + stride_z * CZ[i]));
+            fi[i] = f_in[i * n + j];
+        }
+    } else {
     let x = i32(idx % nx);
     let y = i32((idx / nx) % ny);
     let z = i32(idx / (nx * ny));
-    var fi: array<f32, 19>;
     for (var i = 0u; i < Q; i = i + 1u) {
         let sx = x - CX[i]; let sy = y - CY[i]; let sz = z - CZ[i];
         var face = -1;
@@ -73,7 +87,7 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
                 else { iz = iz + step; }
                 if (ix >= 0 && ix < i32(nx) && iy >= 0 && iy < i32(ny) && iz >= 0 && iz < i32(nz)) {
                     let j = u32(ix) + nx * (u32(iy) + ny * u32(iz));
-                    if (cells[j] == 0u) {
+                    if ((cells[j] & 255u) == 0u) {
                         // pressure boundary: rho = 1 with the neighbour's velocity plus its non-equilibrium part
                         var rj = 0.0;
                         var mj = vec3<f32>(0.0);
@@ -90,9 +104,10 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
             fi[i] = val;
         } else {
             let j = u32(sx) + nx * (u32(sy) + ny * u32(sz));
-            if (cells[j] == 1u) { fi[i] = f_in[opp(i) * n + idx]; }
+            if ((cells[j] & 255u) == 1u) { fi[i] = f_in[opp(i) * n + idx]; }
             else { fi[i] = f_in[i * n + j]; }
         }
+    }
     }
     var rho = 0.0;
     var m = vec3<f32>(0.0);
@@ -121,6 +136,9 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let sponge = i32(P.flags.w);
     if (sponge > 0) {
+        let x = i32(idx % nx);
+        let y = i32((idx / nx) % ny);
+        let z = i32(idx / (nx * ny));
         var dmin = 1000000;
         let dist = array<i32, 6>(x, i32(nx) - 1 - x, y, i32(ny) - 1 - y, z, i32(nz) - 1 - z);
         for (var f = 0u; f < 6u; f = f + 1u) {
@@ -157,7 +175,7 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
             f_out[i * n + idx] = fi[i] - omega * (fp - ep) - omega_m * (fm - em);
         }
     }
-    mac[idx] = vec4<f32>(rho, uphys);
+    if (WRITE_MAC) { mac[idx] = vec4<f32>(rho, uphys); }
 }
 
 @compute @workgroup_size(64)
@@ -167,7 +185,21 @@ fn port_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pc = port_cells[t];
     let n = P.dims.w;
     let pg = ports[pc.k];
-    let mnb = mac[pc.nb];
+    var mnb = vec4<f32>(0.0);
+    if (LAZY && pc.nb != pc.idx) {
+        // collision conserves mass and momentum (no body force in this mode), so the neighbour's rho and u follow
+        // from its freshly written distributions
+        var r = 0.0;
+        var m = vec3<f32>(0.0);
+        for (var k = 0u; k < Q; k = k + 1u) {
+            let fk = f_out[k * n + pc.nb];
+            r = r + fk;
+            m = m + vec3<f32>(f32(CX[k]), f32(CY[k]), f32(CZ[k])) * fk;
+        }
+        mnb = vec4<f32>(r, m / r);
+    } else {
+        mnb = mac[pc.nb];
+    }
     var rho = mnb.x;
     var u = pg.vel.xyz;
     if (pg.prm.x > 0.5) {

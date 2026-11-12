@@ -2364,6 +2364,7 @@ dependencies = [
  "peregrine-project",
  "peregrine-solver",
  "peregrine-voxel",
+ "rayon",
  "rfd",
  "winresource",
 ]

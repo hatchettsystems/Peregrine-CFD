@@ -186,6 +186,12 @@ struct Snapshot {
     finished: bool,
     error: Option<String>,
     version: u64,
+    /// Seconds spent building the grid and the solver before the first step.
+    setup_s: f64,
+    /// Measured solver speed so far (steps per second, wall clock).
+    rate: f64,
+    /// Step at which the run stopped early because the results had stopped changing.
+    converged_at: Option<usize>,
 }
 
 struct RunHandle {
@@ -945,6 +951,7 @@ impl App {
         let (stop2, snap2) = (stop.clone(), snap.clone());
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
+                let t_start = std::time::Instant::now();
                 let domain = build_project_domain(&project, &bodies)?;
                 let cells = Arc::new(domain.cells.clone());
                 let mut base_warnings = presets::preset_warnings(&project);
@@ -987,10 +994,18 @@ impl App {
                         }
                     }
                     let mut done = 0;
-                    // Steps between display updates. Each update reads the field back and rebuilds the speed / pressure /
-                    // velocity arrays on the CPU, which leaves the graphics card idle: when that takes a big share of the
-                    // time, update less often (and more often again if the updates become too sparse).
+                    {
+                        let mut s = snap2.lock().unwrap();
+                        s.setup_s = t_start.elapsed().as_secs_f64();
+                    }
+                    let t_run = std::time::Instant::now();
+                    // Steps between display updates. Each update reads the field back; the speed / pressure / velocity
+                    // arrays are then built on a worker thread (all cores) while the graphics card carries on with the
+                    // next steps. If the hand-over still costs a big share of the time, update less often.
                     let mut per = 250usize;
+                    let mut worker: Option<std::thread::JoinHandle<Vec<[f32; 4]>>> = None;
+                    let mut spare: Vec<[f32; 4]> = vec![];
+                    let mut history: Vec<(usize, Vec<f64>, Vec<f64>)> = vec![];
                     while done < total && !stop2.load(Ordering::Relaxed) {
                         let t_iter = std::time::Instant::now();
                         let n = per.min(total - done);
@@ -1004,31 +1019,59 @@ impl App {
                             }
                             ref_speed = sim.ref_speed * 1.6;
                             notes.push(format!("Run became unstable at step {done} (fastest cell {spot}); restarted with reference speed {ref_speed:.1} m/s (attempt {attempt})."));
+                            if let Some(w) = worker.take() { let _ = w.join(); }
                             continue 'attempts;
                         }
                         let u = sim.units;
                         let report = sim.report();
                         let sources = sim.source_reports();
-                        // use the read-back field in place: a copy of it would be another full-size array in memory
+                        history.push((done, report.iter().map(|r| r.flow_l_min).collect(), sources.iter().map(|g| g.pressure_pa).collect()));
+                        let converged = project.solver.stop_when_converged && run_converged(&history);
                         let mac = sim.mac();
                         let t_post = std::time::Instant::now();
-                        let solid = |i: usize| cells[i] == 1;
-                        let speed: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.vel_to_phys((m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() as f64) as f32 }).collect();
-                        let pressure: Vec<f32> = mac.iter().enumerate().map(|(i, m)| if solid(i) { 0.0 } else { u.pressure(m[0] as f64) as f32 }).collect();
-                        let vel: Vec<[f32; 3]> = mac.iter().enumerate().map(|(i, m)| if solid(i) { [0.0; 3] } else { [u.vel_to_phys(m[1] as f64) as f32, u.vel_to_phys(m[2] as f64) as f32, u.vel_to_phys(m[3] as f64) as f32] }).collect();
-                        let mut s = snap2.lock().unwrap();
-                        s.sources = sources;
-                        s.step = done;
-                        s.speed = speed;
-                        s.pressure = pressure;
-                        s.vel = Arc::new(vel);
-                        s.report = report;
-                        s.version += 1;
-                        drop(s);
+                        // the previous hand-over must be finished before its buffer is reused
+                        if let Some(w) = worker.take() { spare = w.join().unwrap_or_default(); }
+                        spare.clear();
+                        spare.extend_from_slice(mac);
+                        let (cells_w, snap_w, buf) = (cells.clone(), snap2.clone(), std::mem::take(&mut spare));
+                        let rate = done as f64 / t_run.elapsed().as_secs_f64().max(1e-9);
+                        worker = Some(std::thread::spawn(move || {
+                            use rayon::prelude::*;
+                            let m = buf;
+                            let nn = m.len();
+                            let mut speed = vec![0f32; nn];
+                            let mut pressure = vec![0f32; nn];
+                            let mut vel = vec![[0f32; 3]; nn];
+                            speed.par_iter_mut().zip(pressure.par_iter_mut()).zip(vel.par_iter_mut()).zip(m.par_iter()).zip(cells_w.par_iter()).for_each(|((((sp, pr), ve), mc), c)| {
+                                if *c != 1 {
+                                    let v = [u.vel_to_phys(mc[1] as f64) as f32, u.vel_to_phys(mc[2] as f64) as f32, u.vel_to_phys(mc[3] as f64) as f32];
+                                    *sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                                    *pr = u.pressure(mc[0] as f64) as f32;
+                                    *ve = v;
+                                }
+                            });
+                            let mut s = snap_w.lock().unwrap();
+                            s.sources = sources;
+                            s.step = done;
+                            s.speed = speed;
+                            s.pressure = pressure;
+                            s.vel = Arc::new(vel);
+                            s.report = report;
+                            s.rate = rate;
+                            s.version += 1;
+                            drop(s);
+                            m
+                        }));
                         let total_t = t_iter.elapsed().as_secs_f64();
                         let post_t = t_post.elapsed().as_secs_f64();
                         if post_t > 0.15 * total_t && per < 4000 { per *= 2; } else if total_t > 8.0 && per > 250 { per /= 2; }
+                        if converged {
+                            if let Some(w) = worker.take() { let _ = w.join(); }
+                            snap2.lock().unwrap().converged_at = Some(done);
+                            break;
+                        }
                     }
+                    if let Some(w) = worker.take() { let _ = w.join(); }
                     break;
                 }
                 Ok(())
@@ -1198,6 +1241,7 @@ impl App {
             ui.add(egui::DragValue::new(&mut self.project.solver.reference_speed).speed(0.1).range(0.0..=100.0).suffix(" m/s").custom_formatter(|v, _| if v <= 0.0 { "auto".to_string() } else { format!("{v:.1}") }).custom_parser(|t| if t.trim().eq_ignore_ascii_case("auto") { Some(0.0) } else { t.trim().trim_end_matches("m/s").trim().parse().ok() })).on_hover_text("Largest expected air speed. 'auto' picks it from your sources; lower values reduce artificial viscosity but need a stable run.");
             ui.label("Steps");
             ui.add(egui::DragValue::new(&mut self.project.solver.max_steps).speed(50.0).range(250..=500_000));
+            ui.checkbox(&mut self.project.solver.stop_when_converged, "Stop early").on_hover_text("End the run before the step limit once every port flow and source pressure has stayed within 0.3% for 2,000 steps (never before step 3,000).");
             ui.label("Padding");
             ui.add(egui::DragValue::new(&mut self.project.domain.padding_mm).speed(0.2).range(0.0..=100.0).suffix(" mm"));
             ui.label("Outlet room");
@@ -1991,6 +2035,13 @@ impl App {
         theme::section(ui, "Run", |ui| {
             ui.add(egui::ProgressBar::new(if s.total > 0 { s.step as f32 / s.total as f32 } else { 0.0 }).text(format!("{} / {}", s.step, s.total)).fill(theme::ACCENT));
             ui.label(format!("Engine: {}", s.engine));
+            if s.rate > 0.0 {
+                let cells = (s.dims[0] * s.dims[1] * s.dims[2]) as f64;
+                ui.label(egui::RichText::new(format!("{:.0} steps/s  ({:.0} M cell-updates/s)  |  set-up {:.1} s", s.rate, s.rate * cells / 1e6, s.setup_s)).color(theme::TEXT_DIM));
+            }
+            if let Some(c) = s.converged_at {
+                ui.label(egui::RichText::new(format!("Converged: flows and pressures stopped changing, run ended at step {c}.")).color(theme::INLET));
+            }
             let iss = issues_of(&s, &self.project);
             if !iss.is_empty() {
                 let (e, w) = (iss.iter().filter(|i| i.sev == Sev::Error).count(), iss.iter().filter(|i| i.sev == Sev::Warning).count());
@@ -2552,6 +2603,28 @@ fn fan_library_menu(ui: &mut egui::Ui) -> Option<FanPreset> {
         if ui.button(label).on_hover_text(p.note).clicked() { chosen = Some(p); }
     }
     chosen
+}
+
+/// True when a run has stopped changing: after at least 3000 steps, over the last 2000 steps (and at least three
+/// readings) no port flow has moved by more than 0.3 % of the total inflow and no source pressure by more than 0.3 %.
+fn run_converged(hist: &[(usize, Vec<f64>, Vec<f64>)]) -> bool {
+    let Some(last) = hist.last() else { return false };
+    let step = last.0;
+    if step < 3000 { return false; }
+    let window: Vec<&(usize, Vec<f64>, Vec<f64>)> = hist.iter().filter(|h| h.0 + 2000 >= step).collect();
+    if window.len() < 3 || window[0].0 + 2250 < step { return false; }
+    let qin: f64 = last.1.iter().map(|q| q.abs()).fold(0.0, f64::max).max(1e-9);
+    let tol = 0.003;
+    for k in 0..last.1.len() {
+        let (lo, hi) = window.iter().fold((f64::MAX, f64::MIN), |a, h| (a.0.min(h.1[k]), a.1.max(h.1[k])));
+        if hi - lo > tol * qin { return false; }
+    }
+    for k in 0..last.2.len() {
+        let (lo, hi) = window.iter().fold((f64::MAX, f64::MIN), |a, h| (a.0.min(h.2[k]), a.1.max(h.2[k])));
+        let scale = window.iter().map(|h| h.2[k].abs()).fold(0.0, f64::max).max(1.0);
+        if hi - lo > tol * scale { return false; }
+    }
+    true
 }
 
 /// Gauge pressure (Pa) and speed (m/s) in the fluid cell containing `p` (mm), if it is in fluid.

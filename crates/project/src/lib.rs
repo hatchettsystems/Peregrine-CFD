@@ -215,10 +215,12 @@ pub struct SolverSettings {
     /// Lowest relaxation time the solver will use. Lower = less artificial viscosity but less stable.
     #[serde(default = "default_min_tau")]
     pub min_tau: f64,
+    /// End the run early once flows and pressures have stopped changing.
+    pub stop_when_converged: bool,
 }
 impl Default for SolverSettings {
     fn default() -> Self {
-        SolverSettings { cell_size_mm: 0.5, reference_speed: 0.0, max_steps: 20000, smagorinsky: 0.12, min_tau: 0.51 }
+        SolverSettings { cell_size_mm: 0.5, reference_speed: 0.0, max_steps: 20000, smagorinsky: 0.12, min_tau: 0.51, stop_when_converged: true }
     }
 }
 
