@@ -2,7 +2,7 @@
 //! cell size, fed by the flow a coarse run of the whole duct measured where its channels cross the top of the box.
 use anyhow::{bail, Context, Result};
 use peregrine_core::PortCap;
-use peregrine_project::{Port, PortKind, Project};
+use peregrine_project::{Port, PortKind, Project, Source, SourceKind, SplitMode};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -155,9 +155,13 @@ pub fn zoom_project(project: &Project, coarse: &CoarseField, spec: &ZoomSpec) ->
     out.ports.retain(|p| !p.kind.is_inlet() && inside(p.cap.centroid()));
     out.blockers.retain(|b| inside(b.cap.centroid()));
     out.plugs.retain(|p| inside(p.center));
+    // the fan is outside the box: its flow is replaced by one source feeding the cut channels, so the lines-per-source
+    // setting (and the per-source streamline colour) keep working
+    let lines = project.sources.first().map_or(40, |s| s.streamlines);
     out.sources.clear();
     let body = project.ducts.first().map(|d| d.name.clone()).unwrap_or_else(|| "duct".into());
     let mut notes = vec![];
+    let mut total_q = 0.0;
     let cell_area = (dx * 1e-3) * (dx * 1e-3);
     for (gi, g) in groups.iter().enumerate() {
         let q: f64 = g.iter().map(|&(x, y)| down(x, y).max(0.0)).sum::<f64>() * cell_area * 60000.0; // L/min
@@ -170,9 +174,11 @@ pub fn zoom_project(project: &Project, coarse: &CoarseField, spec: &ZoomSpec) ->
         let cap = PortCap { origin: c, normal: [0.0, 0.0, 1.0], polygon, triangles: vec![], holes: vec![] };
         let name = format!("zoom_in_{}", gi + 1);
         notes.push(format!("{name}: {:.1} L/min through {:.0} mm² at ({:.1}, {:.1}, {:.1})", q, cap.area(), c[0], c[1], c[2]));
-        out.ports.push(Port { name, body: body.clone(), kind: PortKind::FlowInlet { l_per_min: q }, cap });
+        out.ports.push(Port { name, body: body.clone(), kind: PortKind::SourceInlet { source: "zoom_feed".into(), weight: q }, cap });
+        total_q += q;
     }
     if notes.is_empty() { bail!("the channels at z = {} mm carry too little flow", spec.plane_z); }
+    out.sources.push(Source { name: "zoom_feed".into(), kind: SourceKind::Flow { l_per_min: total_q }, split: SplitMode::Weights, preset: None, streamlines: lines });
     out.name = format!("{} zoom", project.name);
     out.solver.cell_size_mm = spec.fine_dx;
     out.solver.reference_speed = 0.0;
