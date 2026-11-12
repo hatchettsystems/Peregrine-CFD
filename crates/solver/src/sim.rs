@@ -190,7 +190,9 @@ impl Simulation {
     pub fn new_with_ref(project: &Project, domain: &Domain, backend: Backend, ref_speed: f64) -> anyhow::Result<Simulation> {
         let g = &domain.grid;
         let auto = (2.5 * Self::estimate_peak_speed(project, domain)).max(3.0);
-        let ref_speed = if ref_speed <= 0.0 { auto } else { ref_speed.max(auto.min(2.5 * Self::estimate_peak_speed(project, domain))) };
+        // An explicit reference speed is honoured as given (the run restarts at a higher one if it turns unstable);
+        // 'auto' is 2.5x the estimated peak, which for a fan is its free-air flow and so usually far above the real speeds.
+        let ref_speed = if ref_speed <= 0.0 { auto } else { ref_speed.max(1.0) };
         let units = Units::new(g.dx * 1e-3, ref_speed, 0.08, project.fluid.density, project.fluid.kinematic_viscosity).with_tau_floor(project.solver.min_tau);
         let mut infos = vec![];
         let mut meta = vec![];
