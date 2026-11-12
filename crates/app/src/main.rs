@@ -78,7 +78,7 @@ fn issues_of(s: &Snapshot, project: &Project) -> Vec<Issue> {
     let q_in: f64 = s.report.iter().filter(|r| r.inlet).map(|r| r.flow_l_min).sum();
     let net: f64 = s.report.iter().map(|r| r.flow_l_min).sum();
     if q_in > 1e-6 && net.abs() > 0.08 * q_in && s.step > 2000 {
-        let msg = format!("{:.1} L/min of the {:.1} L/min going in ({:.0}%) is not accounted for by your outlets. Air is leaving through something that is not a defined port (a gap, or an opening that is not a port), or the run has not settled yet. Check the leak warning, define the missing openings as ports, or block them.", net.abs(), q_in, 100.0 * net.abs() / q_in);
+        let msg = format!("{:.2} CFM of the {:.2} CFM going in ({:.0}%) is not accounted for by your outlets. Air is leaving through something that is not a defined port (a gap, or an opening that is not a port), or the run has not settled yet. Check the leak warning, define the missing openings as ports, or block them.", cfm(net.abs()), cfm(q_in), 100.0 * net.abs() / q_in);
         let severe = net.abs() > 0.25 * q_in;
         v.push(Issue { sev: if severe { Sev::Error } else { Sev::Warning }, title: if severe { "Major leak: most of the air is not leaving through the outlets".into() } else { "Flow does not balance".into() }, detail: msg });
     }
@@ -91,7 +91,7 @@ fn issues_of(s: &Snapshot, project: &Project) -> Vec<Issue> {
             for (r, a) in &outs {
                 let (ash, fsh) = (a / total_area, (-r.flow_l_min).max(0.0) / total_out.max(1e-9));
                 if ash > 0.2 && fsh < 0.25 * ash {
-                    v.push(Issue { sev: Sev::Warning, title: format!("Outlet '{}' is starved", r.name), detail: format!("'{}' is {:.0}% of the outlet area ({:.0} mm²) but carries only {:.1}% of the outflow ({:.2} L/min). A large opening that passes almost no air is usually cut off from the duct (a pocket, a closed-off passage or a part in the way), or air is escaping elsewhere before it gets there. Check the flow path in the streamlines and the leak warning.", r.name, 100.0 * ash, a, 100.0 * fsh, -r.flow_l_min) });
+                    v.push(Issue { sev: Sev::Warning, title: format!("Outlet '{}' is starved", r.name), detail: format!("'{}' is {:.0}% of the outlet area ({:.0} mm²) but carries only {:.1}% of the outflow ({:.2} CFM). A large opening that passes almost no air is usually cut off from the duct (a pocket, a closed-off passage or a part in the way), or air is escaping elsewhere before it gets there. Check the flow path in the streamlines and the leak warning.", r.name, 100.0 * ash, a, 100.0 * fsh, cfm(-r.flow_l_min)) });
                 }
             }
         }
@@ -103,7 +103,7 @@ fn issues_of(s: &Snapshot, project: &Project) -> Vec<Issue> {
                 if qmax > 0.0 && pmax > 0.0 {
                     let (fq, fp) = (g.total_flow_l_min / qmax, g.pressure_pa / pmax);
                     if fq < 0.35 {
-                        v.push(Issue { sev: if fq < 0.1 { Sev::Error } else { Sev::Warning }, title: format!("Major flow restriction at '{}'", g.name), detail: format!("The duct lets '{}' deliver only {:.0}% of its free-air flow ({:.1} of {:.0} L/min) while working at {:.0}% of its maximum pressure ({:.0} of {:.0} Pa). The duct is a severe restriction for this fan.", g.name, 100.0 * fq, g.total_flow_l_min, qmax, 100.0 * fp, g.pressure_pa, pmax) });
+                        v.push(Issue { sev: if fq < 0.1 { Sev::Error } else { Sev::Warning }, title: format!("Major flow restriction at '{}'", g.name), detail: format!("The duct lets '{}' deliver only {:.0}% of its free-air flow ({:.2} of {:.1} CFM) while working at {:.0}% of its maximum pressure ({:.3} of {:.3} psi). The duct is a severe restriction for this fan.", g.name, 100.0 * fq, cfm(g.total_flow_l_min), cfm(qmax), 100.0 * fp, psi(g.pressure_pa), psi(pmax)) });
                     } else if fq > 0.85 && fp < 0.15 {
                         v.push(Issue { sev: Sev::Warning, title: format!("'{}' is barely loaded", g.name), detail: format!("'{}' delivers {:.0}% of its free-air flow at only {:.0}% of its maximum pressure. A real duct usually pressurises noticeably; this suggests air is escaping (a leak) or the run has not settled.", g.name, 100.0 * fq, 100.0 * fp) });
                     }
@@ -159,7 +159,7 @@ struct TabInfo { title: String, running: bool }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MeshMode { Shaded, Ghost, Hidden }
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LineColor { Speed, Source }
+enum LineColor { Speed, Source, Pressure }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field { Speed, Pressure }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -263,6 +263,9 @@ struct App {
     line_width: f32,
     lines: Vec<Streamline>,
     lines_vmax: f32,
+    lines_prange: (f32, f32),
+    probe_on: bool,
+    probe_pins: Vec<[f64; 3]>,
     lines_request_sig: u64,
     lines_job: Option<std::sync::mpsc::Receiver<(u64, Vec<Streamline>)>>,
     // tab shell plumbing
@@ -278,6 +281,26 @@ pub static NvOptimusEnablement: u32 = 1;
 #[cfg(windows)]
 #[no_mangle]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+/// Display units: the solver works in L/min and Pa; the interface shows CFM and PSI.
+const CFM_LPM: f64 = 28.3168;
+const PSI_PA: f64 = 6894.757;
+fn cfm(lpm: f64) -> f64 { lpm / CFM_LPM }
+fn psi(pa: f64) -> f64 { pa / PSI_PA }
+
+/// A number box that stores L/min but shows and accepts CFM.
+fn flow_drag(ui: &mut egui::Ui, v: &mut f64, speed: f64) -> egui::Response {
+    ui.add(egui::DragValue::new(v).speed(speed)
+        .custom_formatter(|x, _| format!("{:.2} CFM", cfm(x)))
+        .custom_parser(|t| t.trim().to_lowercase().trim_end_matches("cfm").trim().parse::<f64>().ok().map(|c| c * CFM_LPM)))
+}
+
+/// A number box that stores Pa but shows and accepts PSI.
+fn pressure_drag(ui: &mut egui::Ui, v: &mut f64, speed: f64) -> egui::Response {
+    ui.add(egui::DragValue::new(v).speed(speed)
+        .custom_formatter(|x, _| format!("{:.4} psi", psi(x)))
+        .custom_parser(|t| t.trim().to_lowercase().trim_end_matches("psi").trim().parse::<f64>().ok().map(|c| c * PSI_PA)))
+}
 
 /// The graphics card the solver will use, found once in the background at start-up.
 static GPU: std::sync::OnceLock<Option<peregrine_solver::gpu::GpuInfo>> = std::sync::OnceLock::new();
@@ -428,6 +451,9 @@ impl App {
             line_width: 1.6,
             lines: vec![],
             lines_vmax: 1.0,
+            lines_prange: (0.0, 1.0),
+            probe_on: false,
+            probe_pins: vec![],
             lines_request_sig: 0,
             lines_job: None,
             tab_infos: vec![],
@@ -1011,6 +1037,12 @@ impl App {
                 let mut speeds: Vec<f32> = lines.iter().flat_map(|l| l.speed.iter().copied()).collect();
                 speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 self.lines_vmax = speeds.get(speeds.len().saturating_sub(1) * 98 / 100).copied().unwrap_or(1.0).max(0.1);
+                let mut pr: Vec<f32> = lines.iter().flat_map(|l| l.pressure.iter().copied()).collect();
+                pr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if pr.len() > 10 {
+                    let n = pr.len() - 1;
+                    self.lines_prange = (pr[n * 2 / 100], pr[n * 98 / 100].max(pr[n * 2 / 100] + 1e-3));
+                }
                 self.lines = lines;
                 self.lines_job = None;
             }
@@ -1040,9 +1072,16 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.lines_job = Some(rx);
         std::thread::spawn(move || {
-            let (dims, origin, dx, cells, vel) = { let s = snap.lock().unwrap(); (s.dims, s.origin, s.dx, s.cells.clone(), s.vel.clone()) };
+            let (dims, origin, dx, cells, vel, pressure) = { let s = snap.lock().unwrap(); (s.dims, s.origin, s.dx, s.cells.clone(), s.vel.clone(), s.pressure.clone()) };
             let field = VelocityField { dims, origin, dx, cells: &cells, vel: &vel };
-            let lines = sl::streamlines(&field, &specs, 600.0);
+            let mut lines = sl::streamlines(&field, &specs, 600.0);
+            // pressure (gauge, Pa) in the cell each point sits in
+            for l in &mut lines {
+                l.pressure = l.pts.iter().map(|p| {
+                    let c: Vec<usize> = (0..3).map(|k| (((p[k] as f64 - origin[k]) / dx).floor().max(0.0) as usize).min(dims[k] - 1)).collect();
+                    pressure.get(c[0] + dims[0] * (c[1] + dims[1] * c[2])).copied().unwrap_or(0.0)
+                }).collect();
+            }
             let _ = tx.send((sig, lines));
         });
     }
@@ -1646,7 +1685,7 @@ impl App {
                 let src = &mut self.project.sources[si];
                 let Source { kind, split, preset, streamlines, .. } = src;
                 match kind {
-                    SourceKind::Flow { l_per_min } => { ui.horizontal(|ui| { ui.label("Total flow"); ui.add(egui::DragValue::new(l_per_min).speed(0.1).range(0.0..=2000.0).suffix(" L/min")); }); }
+                    SourceKind::Flow { l_per_min } => { ui.horizontal(|ui| { ui.label("Total flow"); flow_drag(ui, l_per_min, 0.5); }); }
                     SourceKind::Velocity { speed } => { ui.horizontal(|ui| { ui.label("Mean speed"); ui.add(egui::DragValue::new(speed).speed(0.1).range(0.0..=200.0).suffix(" m/s")); }); }
                     SourceKind::Fan { curve } => {
                         if let Some(pn) = preset.as_ref() {
@@ -1663,8 +1702,8 @@ impl App {
                         let mut edited = false;
                         for (j, (q, dp)) in curve.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
-                                edited |= ui.add(egui::DragValue::new(q).speed(0.5).suffix(" L/min")).changed();
-                                edited |= ui.add(egui::DragValue::new(dp).speed(1.0).suffix(" Pa")).changed();
+                                edited |= flow_drag(ui, q, 0.5).changed();
+                                edited |= pressure_drag(ui, dp, 5.0).changed();
                                 if ui.small_button("-").clicked() { del = Some(j); }
                             });
                         }
@@ -1815,7 +1854,7 @@ impl App {
                     if eye_button(ui, vis) { eye_key = Some(key); }
                     ui.label(egui::RichText::new("■").color(theme::OUTLET));
                     if ui.selectable_label(sel, &p.name).clicked() { self.sel_port = Some(i); }
-                    ui.add(egui::DragValue::new(pressure).speed(1.0).suffix(" Pa"));
+                    pressure_drag(ui, pressure, 5.0);
                     if ui.small_button("x").clicked() { remove = Some(i); }
                 });
             }
@@ -1934,19 +1973,19 @@ impl App {
         });
         theme::section(ui, "Flow report", |ui| {
             egui::Grid::new("rep").striped(true).show(ui, |ui| {
-                for h in ["Port", "Flow L/min", "Pressure Pa", "Share", "Exit speed / angle"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
+                for h in ["Port", "Flow CFM", "Pressure psi", "Share", "Exit speed / angle"] { ui.label(egui::RichText::new(h).color(theme::TEXT_DIM)); }
                 ui.end_row();
                 for g in &s.sources {
                     ui.label(egui::RichText::new(&g.name).strong().color(theme::INLET));
-                    ui.label(format!("{:.2}", g.total_flow_l_min));
-                    ui.label(format!("{:.1}", g.pressure_pa));
-                    ui.label(match g.split { SplitMode::Plenum => format!("plenum {:.0} Pa", g.commanded), _ => format!("cmd {:.1}", g.commanded) });
+                    ui.label(format!("{:.3}", cfm(g.total_flow_l_min)));
+                    ui.label(format!("{:.4}", psi(g.pressure_pa)));
+                    ui.label(match g.split { SplitMode::Plenum => format!("plenum {:.4} psi", psi(g.commanded)), _ => format!("cmd {:.2} CFM", cfm(g.commanded)) });
                     ui.label("");
                     ui.end_row();
                     for r in s.report.iter().filter(|r| r.source.as_deref() == Some(g.name.as_str())) {
                         ui.label(format!("   {}", r.name));
-                        ui.label(format!("{:.2}", r.flow_l_min));
-                        ui.label(format!("{:.1}", r.pressure_pa));
+                        ui.label(format!("{:.3}", cfm(r.flow_l_min)));
+                        ui.label(format!("{:.4}", psi(r.pressure_pa)));
                         ui.label(format!("{:.0}%", 100.0 * r.flow_l_min / g.total_flow_l_min.abs().max(1e-9)));
                         ui.label("");
                         ui.end_row();
@@ -1954,8 +1993,8 @@ impl App {
                 }
                 for r in s.report.iter().filter(|r| r.source.is_none()) {
                     ui.label(egui::RichText::new(&r.name).color(if r.inlet { theme::INLET } else { theme::OUTLET }));
-                    ui.label(format!("{:.2}", r.flow_l_min));
-                    ui.label(format!("{:.1}", r.pressure_pa));
+                    ui.label(format!("{:.3}", cfm(r.flow_l_min)));
+                    ui.label(format!("{:.4}", psi(r.pressure_pa)));
                     ui.label("");
                     ui.label(if r.inlet { String::new() } else { format!("{:.1} m/s  {:.0}° from normal", r.mean_speed, r.angle_deg) });
                     ui.end_row();
@@ -1973,11 +2012,28 @@ impl App {
             ui.checkbox(&mut self.show_markers, "Show warning markers").on_hover_text("A clickable marker in the 3D view wherever a warning or error points at a place.");
             ui.checkbox(&mut self.show_ports, "Show ports, openings and blockers").on_hover_text("Turn off to see only the geometry and the flow.");
             ui.checkbox(&mut self.show_lines, "Flow trajectories (streamlines)");
+            ui.checkbox(&mut self.probe_on, "Probe pressure and speed").on_hover_text("Hover anywhere over the duct to read the pressure and air speed at that point. Click to pin a reading.");
+            if self.probe_on {
+                if let Some(snap) = self.last.clone() {
+                    let s = snap.lock().unwrap();
+                    let mut del = None;
+                    for (k, pt) in self.probe_pins.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let txt = probe_cell(&s, *pt).map_or("outside".to_string(), |(pr, sp)| format!("{:.4} psi   {:.1} m/s", psi(pr as f64), sp));
+                            ui.label(format!("{}: ({:.1}, {:.1}, {:.1}) mm  {}", k + 1, pt[0], pt[1], pt[2], txt));
+                            if ui.small_button("x").clicked() { del = Some(k); }
+                        });
+                    }
+                    if let Some(k) = del { self.probe_pins.remove(k); }
+                }
+                if !self.probe_pins.is_empty() && ui.small_button("Clear pins").clicked() { self.probe_pins.clear(); }
+            }
             if self.show_lines {
                 ui.horizontal(|ui| {
                     ui.label("Colour by");
                     ui.selectable_value(&mut self.line_color, LineColor::Speed, "Speed");
                     ui.selectable_value(&mut self.line_color, LineColor::Source, "Source");
+                    ui.selectable_value(&mut self.line_color, LineColor::Pressure, "Pressure");
                 });
                 ui.add(egui::Slider::new(&mut self.line_width, 0.5..=5.0).text("width"));
                 ui.add(egui::Slider::new(&mut self.line_cutoff, 0.0..=self.lines_vmax.max(0.5)).text("cutoff m/s")).on_hover_text("Hide every part of a streamline slower than this. 0 shows everything.");
@@ -1996,6 +2052,14 @@ impl App {
                         ui.painter().rect_filled(r, 0.0, theme::ramp(k as f32 / 59.0));
                     }
                     ui.horizontal(|ui| { ui.label("0"); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(format!("{:.1} m/s", self.lines_vmax))); });
+                }
+                if self.line_color == LineColor::Pressure {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(240.0), 10.0), Sense::hover());
+                    for k in 0..60 {
+                        let r = Rect::from_min_max(Pos2::new(rect.min.x + rect.width() * k as f32 / 60.0, rect.min.y), Pos2::new(rect.min.x + rect.width() * (k + 1) as f32 / 60.0, rect.max.y));
+                        ui.painter().rect_filled(r, 0.0, theme::ramp(k as f32 / 59.0));
+                    }
+                    ui.horizontal(|ui| { ui.label(format!("{:.4}", psi(self.lines_prange.0 as f64))); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(format!("{:.4} psi", psi(self.lines_prange.1 as f64)))); });
                 }
                 ui.label(egui::RichText::new(format!("{} lines drawn{}", self.lines.len(), if self.lines_job.is_some() { " (updating...)" } else { "" })).color(theme::TEXT_DIM));
             }
@@ -2051,7 +2115,10 @@ impl App {
                     let r = Rect::from_min_max(Pos2::new(rect.min.x + rect.width() * k as f32 / 60.0, rect.min.y), Pos2::new(rect.min.x + rect.width() * (k + 1) as f32 / 60.0, rect.max.y));
                     ui.painter().rect_filled(r, 0.0, theme::ramp(k as f32 / 59.0));
                 }
-                ui.horizontal(|ui| { ui.label(format!("{lo:.1}")); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(format!("{hi:.1} {}", if self.field == Field::Speed { "m/s" } else { "Pa" }))); });
+                ui.horizontal(|ui| {
+                    if self.field == Field::Speed { ui.label(format!("{lo:.1}")); } else { ui.label(format!("{:.4}", psi(lo as f64))); }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(if self.field == Field::Speed { format!("{hi:.1} m/s") } else { format!("{:.4} psi", psi(hi as f64)) }));
+                });
             }
         }); }
     }
@@ -2102,7 +2169,7 @@ impl App {
             if !s.speed.is_empty() { draw_slice(&painter, rect, &self.cam, &s, self.field, self.slice_axis, self.slice_pos); }
         }
         if self.show_lines && !self.lines.is_empty() {
-            draw_streamlines(&painter, rect, &self.cam, &self.lines, self.line_color, self.lines_vmax, self.line_width, self.line_cutoff);
+            draw_streamlines(&painter, rect, &self.cam, &self.lines, self.line_color, self.lines_vmax, self.lines_prange, self.line_width, self.line_cutoff);
         }
         // port caps: unassigned openings in grey, assigned ports coloured
         let show_ports = self.show_ports;
@@ -2188,6 +2255,32 @@ impl App {
                 let r = Rect::from_min_size(*q + Vec2::new(14.0, -8.0), galley.size() + Vec2::new(10.0, 6.0));
                 painter.rect_filled(r, 2.0, Color32::from_black_alpha(220));
                 painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
+            }
+        }
+        // probe: hover anywhere in the duct to read the pressure and speed there, click to pin the reading
+        if self.probe_on && self.last.is_some() {
+            let snap = self.last.clone().unwrap();
+            let s = snap.lock().unwrap();
+            if !s.speed.is_empty() {
+                if self.tool == Tool::Orbit && resp.clicked() {
+                    if let Some(pp) = resp.interact_pointer_pos() {
+                        if let Some((pt, _, _)) = probe_ray(&s, &self.cam, rect, pp) { self.probe_pins.push(pt); }
+                    }
+                }
+                let mut tags: Vec<([f64; 3], bool)> = self.probe_pins.iter().map(|p| (*p, true)).collect();
+                if let Some(hp) = resp.hover_pos() {
+                    if let Some((pt, _, _)) = probe_ray(&s, &self.cam, rect, hp) { tags.push((pt, false)); }
+                }
+                for (pt, pinned) in tags {
+                    let Some((q, _)) = self.cam.project(rect, pt) else { continue };
+                    let Some((pr, sp)) = probe_cell(&s, pt) else { continue };
+                    painter.circle_filled(q, 4.5, if pinned { Color32::from_rgb(0xFF, 0xD0, 0x40) } else { Color32::WHITE });
+                    painter.circle_stroke(q, 4.5, Stroke::new(1.0, Color32::BLACK));
+                    let galley = painter.layout_no_wrap(format!("{:.4} psi   {:.1} m/s", psi(pr as f64), sp), FontId::proportional(12.0), Color32::WHITE);
+                    let r = Rect::from_min_size(q + Vec2::new(10.0, -22.0), galley.size() + Vec2::new(10.0, 6.0));
+                    painter.rect_filled(r, 2.0, Color32::from_black_alpha(215));
+                    painter.galley(r.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
+                }
             }
         }
         let clicked_marker = if resp.clicked() { resp.interact_pointer_pos().and_then(|pp| markers.iter().find(|(q, _)| q.distance(pp) < 12.0).map(|(_, it)| it.title.clone())) } else { None };
@@ -2284,7 +2377,7 @@ impl App {
                     None => self.status = "Click on a part's surface near the curved opening.".into(),
                 }
             }
-        } else if resp.clicked() {
+        } else if resp.clicked() && !self.probe_on {
             if let Some(pp) = resp.interact_pointer_pos() {
                 if let Some(t) = self.hit_test(rect, pp) {
                     self.select_target(t);
@@ -2363,7 +2456,7 @@ fn source_color(i: usize) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
 }
 
-fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[Streamline], mode: LineColor, vmax: f32, width: f32, cutoff: f32) {
+fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[Streamline], mode: LineColor, vmax: f32, prange: (f32, f32), width: f32, cutoff: f32) {
     let mut shapes: Vec<Shape> = Vec::with_capacity(lines.len() * 8);
     for l in lines {
         // parts of the line that are fast enough to show (the whole line when there is no cutoff)
@@ -2391,6 +2484,19 @@ fn draw_streamlines(painter: &egui::Painter, rect: Rect, cam: &Camera, lines: &[
                         }
                     }
                 }
+                LineColor::Pressure => {
+                    let prs = &l.pressure[a..b];
+                    let mut i = 0;
+                    while i + 1 < n {
+                        let j = (i + 4).min(n - 1);
+                        let seg: Vec<Pos2> = pts[i..=j].iter().flatten().copied().collect();
+                        if seg.len() == j - i + 1 {
+                            let v = prs[i..=j].iter().sum::<f32>() / (j - i + 1) as f32;
+                            shapes.push(Shape::line(seg, Stroke::new(width, theme::ramp((v - prange.0) / (prange.1 - prange.0).max(1e-6)))));
+                        }
+                        i = j;
+                    }
+                }
                 LineColor::Speed => {
                     let mut i = 0;
                     while i + 1 < n {
@@ -2416,6 +2522,45 @@ fn fan_library_menu(ui: &mut egui::Ui) -> Option<FanPreset> {
         if ui.button(label).on_hover_text(p.note).clicked() { chosen = Some(p); }
     }
     chosen
+}
+
+/// Gauge pressure (Pa) and speed (m/s) in the fluid cell containing `p` (mm), if it is in fluid.
+fn probe_cell(s: &Snapshot, p: [f64; 3]) -> Option<(f32, f32)> {
+    let mut c = [0usize; 3];
+    for k in 0..3 {
+        let g = ((p[k] - s.origin[k]) / s.dx).floor();
+        if g < 0.0 || g >= s.dims[k] as f64 { return None; }
+        c[k] = g as usize;
+    }
+    let i = c[0] + s.dims[0] * (c[1] + s.dims[1] * c[2]);
+    if s.cells[i] == 1 { return None; }
+    Some((s.pressure[i], s.speed[i]))
+}
+
+/// The first fluid cell along the view ray through a screen point: the point (mm), its pressure (Pa) and speed (m/s).
+fn probe_ray(s: &Snapshot, cam: &Camera, rect: Rect, pos: Pos2) -> Option<([f64; 3], f32, f32)> {
+    let (o, d) = cam.ray(rect, pos);
+    let (mut t0, mut t1) = (0.0f64, f64::MAX);
+    for k in 0..3 {
+        let lo = s.origin[k];
+        let hi = s.origin[k] + s.dims[k] as f64 * s.dx;
+        if d[k].abs() < 1e-12 {
+            if o[k] < lo || o[k] > hi { return None; }
+        } else {
+            let (a, b) = ((lo - o[k]) / d[k], (hi - o[k]) / d[k]);
+            t0 = t0.max(a.min(b));
+            t1 = t1.min(a.max(b));
+        }
+    }
+    if t0 > t1 { return None; }
+    let step = s.dx * 0.5;
+    let mut t = t0 + 1e-6;
+    while t < t1 {
+        let pt = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+        if let Some((pr, sp)) = probe_cell(s, pt) { return Some((pt, pr, sp)); }
+        t += step;
+    }
+    None
 }
 
 fn field_range(s: &Snapshot, f: Field) -> (f32, f32) {
@@ -2731,5 +2876,16 @@ mod tests {
         let all = vec![leak.clone(), major.clone()];
         assert_eq!(issue_point(&leak, &all, &p), Some([3.1, 13.8, 79.8]));
         assert_eq!(issue_point(&major, &all, &p), Some([3.1, 13.8, 79.8]));
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    #[test]
+    fn display_units() {
+        assert!((cfm(28.3168) - 1.0).abs() < 1e-9);
+        assert!((psi(6894.757) - 1.0).abs() < 1e-9);
+        assert!((psi(12500.0) - 1.813).abs() < 1e-3); // WS9290 maximum static pressure
     }
 }

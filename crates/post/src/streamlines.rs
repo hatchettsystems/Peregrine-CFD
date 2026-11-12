@@ -21,6 +21,8 @@ pub struct Streamline {
     pub pts: Vec<[f32; 3]>,
     /// Speed (m/s) at each point.
     pub speed: Vec<f32>,
+    /// Gauge pressure (Pa) at each point; filled in by the caller that owns the pressure field (empty otherwise).
+    pub pressure: Vec<f32>,
 }
 
 /// Seeds requested on one source: openings and how many lines start on each.
@@ -201,7 +203,7 @@ pub fn trace(f: &VelocityField, seed: V3, source: usize, max_len: f64) -> Option
         if s < vmin { None } else { Some(scale(v, 1.0 / s)) }
     };
     let mut p = seed;
-    let mut line = Streamline { source, pts: vec![], speed: vec![] };
+    let mut line = Streamline { source, pts: vec![], speed: vec![], pressure: vec![] };
     for step in 0..max_steps {
         let Some(idx) = cell_index(f, p) else { break };
         if f.cells[idx] == 1 {
